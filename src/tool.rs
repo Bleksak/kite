@@ -207,4 +207,113 @@ version: 3"#);
         assert!(message.contains("bash exited with 1"));
         assert!(message.contains("oops"));
     }
+
+    #[test]
+    fn bash_missing_command_is_error_127() {
+        let error = Tool::Bash("definitely-not-a-command".into()).invoke().unwrap_err();
+
+        let ToolError::NonZeroExit { status, stderr, .. } = error else {
+            panic!("expected NonZeroExit, got {error:?}");
+        };
+
+        assert_eq!(status, 127);
+        assert!(stderr.contains("not found"));
+    }
+
+    #[test]
+    fn bash_empty_output_is_ok() {
+        let tool = Tool::Bash("true".into());
+
+        assert_eq!(tool.invoke().unwrap(), "");
+    }
+
+    #[test]
+    fn bash_stderr_on_success_is_ignored() {
+        let tool = Tool::Bash(r#"echo "out"; echo "warn" 1>&2"#.into());
+
+        assert_eq!(tool.invoke().unwrap(), "out\n");
+    }
+
+    #[test]
+    fn bash_stdout_non_ascii_roundtrip() {
+        let tool = Tool::Bash("printf 'héllo 🚀'".into());
+
+        assert_eq!(tool.invoke().unwrap(), "héllo 🚀");
+    }
+
+    #[test]
+    fn read_file_missing_is_error() {
+        let tool = Tool::ReadFile("/nonexistent/nope.txt".into());
+
+        let error = tool.invoke().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::Io(e) if e.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn read_file_non_utf8_is_error() {
+        let temp_dir = TestFiles::new();
+        let file = temp_dir.path().join("binary.bin");
+        std::fs::write(&file, [0xff, 0xfe, 0x00]).unwrap();
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into());
+
+        let error = tool.invoke().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn write_file_overwrites_existing() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "old");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::WriteFile(file.to_string_lossy().into(), "new".into());
+
+        tool.invoke().unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "new");
+    }
+
+    #[test]
+    fn edit_file_delete_text() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "hello world");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::EditFile(file.to_string_lossy().into(), "hello ".into(), "".into());
+
+        tool.invoke().unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "world");
+    }
+
+    #[test]
+    fn edit_file_matches_literally_not_regex() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "a.b and aXb");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::EditFile(file.to_string_lossy().into(), "a.b".into(), "a_b".into());
+
+        tool.invoke().unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "a_b and aXb");
+    }
+
+    #[test]
+    fn edit_file_multiline_and_non_ascii() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "héllo line1\nline2\nline3");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::EditFile(file.to_string_lossy().into(), "héllo line1\nline2".into(), "hej X".into());
+
+        tool.invoke().unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "hej X\nline3");
+    }
 }
