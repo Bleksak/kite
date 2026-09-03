@@ -1,5 +1,9 @@
 use std::process::Command;
 
+use serde::Deserialize;
+
+use crate::message::ToolCall;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error(transparent)]
@@ -13,13 +17,20 @@ pub enum ToolError {
     },
 
     #[error("expected exactly one occurrence of old content in {path}, found {occurrences}")]
-    AmbiguousEdit {
-        path: String,
-        occurrences: usize,
+    AmbiguousEdit { path: String, occurrences: usize },
+
+    #[error("invalid arguments for {name}: {source}\n{raw}")]
+    InvalidArguments {
+        name: String,
+        raw: String,
+        source: serde_json::Error,
     },
+
+    #[error("unknown tool {name}")]
+    UnknownTool { name: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Tool {
     Bash(String),
     ReadFile(String, Option<usize>, Option<usize>),
@@ -40,7 +51,9 @@ impl Tool {
     pub fn description(&self) -> &'static str {
         match &self {
             Tool::Bash(_) => "Run a bash script",
-            Tool::ReadFile(_, _, _) => "Read a file, optionally a line range (1-based start and end line, both inclusive)",
+            Tool::ReadFile(_, _, _) => {
+                "Read a file, optionally a line range (1-based start and end line, both inclusive)"
+            }
             Tool::WriteFile(_, _) => "Write a file",
             Tool::EditFile(_, _, _) => "Edit a file",
         }
@@ -69,13 +82,15 @@ impl Tool {
                 let contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
                 let lines: Vec<&str> = contents.lines().collect();
                 let start = start.unwrap_or(1).saturating_sub(1).min(lines.len());
-                let end = end.map_or(lines.len(), |end| end.min(lines.len())).max(start);
+                let end = end
+                    .map_or(lines.len(), |end| end.min(lines.len()))
+                    .max(start);
                 Ok(lines[start..end].join("\n"))
-            },
+            }
             Tool::WriteFile(file, content) => {
                 std::fs::write(file, content).map_err(ToolError::Io)?;
                 Ok(String::new())
-            },
+            }
             Tool::EditFile(file, old_content, new_content) => {
                 let mut contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
                 let occurrences = contents.matches(old_content).count();
@@ -91,15 +106,84 @@ impl Tool {
 
                 std::fs::write(file, contents).map_err(ToolError::Io)?;
                 Ok(String::new())
-            },
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BashArgs {
+    command: String,
+}
+
+#[derive(Deserialize)]
+struct ReadFileArgs {
+    path: String,
+    #[serde(default)]
+    start: Option<usize>,
+    #[serde(default)]
+    end: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct WriteFileArgs {
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct EditFileArgs {
+    path: String,
+    old_content: String,
+    new_content: String,
+}
+
+fn parse_args<A: serde::de::DeserializeOwned>(name: &str, arguments: &str) -> Result<A, ToolError> {
+    serde_json::from_str(arguments).map_err(|source| ToolError::InvalidArguments {
+        name: name.to_string(),
+        raw: arguments.to_string(),
+        source,
+    })
+}
+
+impl TryFrom<ToolCall> for Tool {
+    type Error = ToolError;
+
+    fn try_from(call: ToolCall) -> Result<Tool, ToolError> {
+        let ToolCall {
+            id: _,
+            name,
+            arguments,
+        } = call;
+
+        match name.as_str() {
+            "bash" => parse_args::<BashArgs>(&name, &arguments).map(|a| Tool::Bash(a.command)),
+            "read_file" => parse_args::<ReadFileArgs>(&name, &arguments)
+                .map(|a| Tool::ReadFile(a.path, a.start, a.end)),
+            "write_file" => parse_args::<WriteFileArgs>(&name, &arguments)
+                .map(|a| Tool::WriteFile(a.path, a.content)),
+            "edit_file" => parse_args::<EditFileArgs>(&name, &arguments)
+                .map(|a| Tool::EditFile(a.path, a.old_content, a.new_content)),
+            other => Err(ToolError::UnknownTool {
+                name: other.to_string(),
+            }),
         }
     }
 }
 
 #[cfg(test)]
 mod test {
+    use crate::message::ToolCall;
     use crate::tool::{Tool, ToolError};
     use test_files::TestFiles;
+
+    fn call(name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
 
     #[test]
     fn bash_hello_world() {
@@ -224,14 +308,21 @@ mod test {
     #[test]
     fn edit_file() {
         let temp_dir = TestFiles::new();
-        temp_dir.file("hello.txt", r#"---
-version: 3"#);
+        temp_dir.file(
+            "hello.txt",
+            r#"---
+version: 3"#,
+        );
 
         let file = temp_dir.path().join("hello.txt");
 
         assert!(file.exists());
 
-        let tool = Tool::EditFile(file.to_string_lossy().into(), "---\nver".into(), "test".into());
+        let tool = Tool::EditFile(
+            file.to_string_lossy().into(),
+            "---\nver".into(),
+            "test".into(),
+        );
 
         let result = tool.invoke().unwrap();
 
@@ -250,7 +341,10 @@ version: 3"#);
 
         let result = tool.invoke().unwrap_err();
 
-        assert!(matches!(result, ToolError::AmbiguousEdit { occurrences: 2, .. }));
+        assert!(matches!(
+            result,
+            ToolError::AmbiguousEdit { occurrences: 2, .. }
+        ));
         assert_eq!(std::fs::read_to_string(file).unwrap(), "a b a");
     }
 
@@ -264,7 +358,10 @@ version: 3"#);
 
         let result = tool.invoke().unwrap_err();
 
-        assert!(matches!(result, ToolError::AmbiguousEdit { occurrences: 0, .. }));
+        assert!(matches!(
+            result,
+            ToolError::AmbiguousEdit { occurrences: 0, .. }
+        ));
         assert_eq!(std::fs::read_to_string(file).unwrap(), "hello world");
     }
 
@@ -290,7 +387,9 @@ version: 3"#);
 
     #[test]
     fn bash_missing_command_is_error_127() {
-        let error = Tool::Bash("definitely-not-a-command".into()).invoke().unwrap_err();
+        let error = Tool::Bash("definitely-not-a-command".into())
+            .invoke()
+            .unwrap_err();
 
         let ToolError::NonZeroExit { status, stderr, .. } = error else {
             panic!("expected NonZeroExit, got {error:?}");
@@ -391,9 +490,90 @@ version: 3"#);
         temp_dir.file("a.txt", "héllo line1\nline2\nline3");
         let file = temp_dir.path().join("a.txt");
 
-        let tool = Tool::EditFile(file.to_string_lossy().into(), "héllo line1\nline2".into(), "hej X".into());
+        let tool = Tool::EditFile(
+            file.to_string_lossy().into(),
+            "héllo line1\nline2".into(),
+            "hej X".into(),
+        );
 
         tool.invoke().unwrap();
         assert_eq!(std::fs::read_to_string(file).unwrap(), "hej X\nline3");
+    }
+
+    #[test]
+    fn try_from_bash() {
+        let tool = Tool::try_from(call("bash", r#"{"command":"ls -la"}"#)).unwrap();
+        assert_eq!(tool, Tool::Bash("ls -la".into()));
+    }
+
+    #[test]
+    fn try_from_read_file_full() {
+        let tool = Tool::try_from(call("read_file", r#"{"path":"a.txt"}"#)).unwrap();
+        assert_eq!(tool, Tool::ReadFile("a.txt".into(), None, None));
+    }
+
+    #[test]
+    fn try_from_read_file_with_range() {
+        let tool =
+            Tool::try_from(call("read_file", r#"{"path":"a.txt","start":2,"end":4}"#)).unwrap();
+        assert_eq!(tool, Tool::ReadFile("a.txt".into(), Some(2), Some(4)));
+    }
+
+    #[test]
+    fn try_from_write_file() {
+        let tool =
+            Tool::try_from(call("write_file", r#"{"path":"a.txt","content":"hi"}"#)).unwrap();
+        assert_eq!(tool, Tool::WriteFile("a.txt".into(), "hi".into()));
+    }
+
+    #[test]
+    fn try_from_edit_file() {
+        let tool = Tool::try_from(call(
+            "edit_file",
+            r#"{"path":"a.txt","old_content":"a","new_content":"b"}"#,
+        ))
+        .unwrap();
+        assert_eq!(tool, Tool::EditFile("a.txt".into(), "a".into(), "b".into()));
+    }
+
+    #[test]
+    fn try_from_invalid_json_is_error_with_raw() {
+        let error = Tool::try_from(call("bash", r#"{"command":"ls""#)).unwrap_err();
+        let message = error.to_string();
+
+        let ToolError::InvalidArguments { name, raw, .. } = error else {
+            panic!("expected InvalidArguments, got {message:?}");
+        };
+        assert_eq!(name, "bash");
+        assert_eq!(raw, r#"{"command":"ls""#);
+        assert!(message.contains("bash"));
+    }
+
+    #[test]
+    fn try_from_missing_field_is_error() {
+        let error = Tool::try_from(call("read_file", r#"{"start":1}"#)).unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn try_from_wrong_type_is_error() {
+        let error =
+            Tool::try_from(call("read_file", r#"{"path":"a.txt","start":"first"}"#)).unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn try_from_unknown_tool_is_error() {
+        let error = Tool::try_from(call("nuke", "{}")).unwrap_err();
+
+        assert!(matches!(error, ToolError::UnknownTool { name } if name == "nuke"));
+    }
+
+    #[test]
+    fn try_from_ignores_hallucinated_fields() {
+        let tool = Tool::try_from(call("bash", r#"{"command":"ls","vibes":42}"#)).unwrap();
+        assert_eq!(tool, Tool::Bash("ls".into()));
     }
 }
