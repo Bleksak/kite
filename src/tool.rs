@@ -1,8 +1,22 @@
 use std::process::Command;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ToolError {
-    Io(std::io::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("{tool} exited with {status}\n{stderr}")]
+    NonZeroExit {
+        tool: &'static str,
+        status: i32,
+        stderr: String,
+    },
+
+    #[error("expected exactly one occurrence of old content in {path}, found {occurrences}")]
+    AmbiguousEdit {
+        path: String,
+        occurrences: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -65,10 +79,17 @@ impl Tool {
             Tool::EditFile(file, old_content, new_content) => {
                 let mut contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
                 
-                // find the old content
-                let old_index = contents.find(old_content).ok_or(ToolError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "old content not found")))?;
-                
-                // replace the old content with the new content
+                // require exactly one occurrence of the old content
+                let occurrences = contents.matches(old_content).count();
+                if occurrences != 1 {
+                    return Err(ToolError::AmbiguousEdit {
+                        path: file.clone(),
+                        occurrences,
+                    });
+                }
+
+                // replace the (unique) old content with the new content
+                let old_index = contents.find(old_content).unwrap();
                 contents.replace_range(old_index..old_index + old_content.len(), new_content);
                 
                 std::fs::write(file, contents).map_err(ToolError::Io)?;
@@ -80,7 +101,7 @@ impl Tool {
 
 #[cfg(test)]
 mod test {
-    use crate::tool::Tool;
+    use crate::tool::{Tool, ToolError};
     use test_files::TestFiles;
 
     #[test]
@@ -158,5 +179,33 @@ version: 3"#);
         assert_eq!(result, "");
         assert!(file.exists());
         assert_eq!(std::fs::read_to_string(file).unwrap(), "testsion: 3");
+    }
+
+    #[test]
+    fn edit_file_ambiguous_old_content_is_error() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "a b a");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::EditFile(file.to_string_lossy().into(), "a".into(), "c".into());
+
+        let result = tool.invoke().unwrap_err();
+
+        assert!(matches!(result, ToolError::AmbiguousEdit { occurrences: 2, .. }));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "a b a");
+    }
+
+    #[test]
+    fn edit_file_missing_old_content_is_error() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "hello world");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::EditFile(file.to_string_lossy().into(), "nope".into(), "x".into());
+
+        let result = tool.invoke().unwrap_err();
+
+        assert!(matches!(result, ToolError::AmbiguousEdit { occurrences: 0, .. }));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "hello world");
     }
 }
