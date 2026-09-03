@@ -22,7 +22,7 @@ pub enum ToolError {
 #[derive(Debug)]
 pub enum Tool {
     Bash(String),
-    ReadFile(String),
+    ReadFile(String, Option<usize>, Option<usize>),
     WriteFile(String, String),
     EditFile(String, String, String),
 }
@@ -31,7 +31,7 @@ impl Tool {
     pub fn label(&self) -> &'static str {
         match &self {
             Tool::Bash(_) => "bash",
-            Tool::ReadFile(_) => "read_file",
+            Tool::ReadFile(..) => "read_file",
             Tool::WriteFile(_, _) => "write_file",
             Tool::EditFile(_, _, _) => "edit_file",
         }
@@ -40,7 +40,7 @@ impl Tool {
     pub fn description(&self) -> &'static str {
         match &self {
             Tool::Bash(_) => "Run a bash script",
-            Tool::ReadFile(_) => "Read a file",
+            Tool::ReadFile(_, _, _) => "Read a file, optionally a line range (1-based start and end line, both inclusive)",
             Tool::WriteFile(_, _) => "Write a file",
             Tool::EditFile(_, _, _) => "Edit a file",
         }
@@ -65,9 +65,12 @@ impl Tool {
 
                 Ok(String::from_utf8_lossy_owned(output.stdout))
             }
-            Tool::ReadFile(file) => {
+            Tool::ReadFile(file, start, end) => {
                 let contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
-                Ok(contents)
+                let lines: Vec<&str> = contents.lines().collect();
+                let start = start.unwrap_or(1).saturating_sub(1).min(lines.len());
+                let end = end.map_or(lines.len(), |end| end.min(lines.len())).max(start);
+                Ok(lines[start..end].join("\n"))
             },
             Tool::WriteFile(file, content) => {
                 std::fs::write(file, content).map_err(ToolError::Io)?;
@@ -119,11 +122,88 @@ mod test {
 
         assert!(file.exists());
 
-        let tool = Tool::ReadFile(file.to_string_lossy().into());
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
 
         let result = tool.invoke().unwrap();
 
         assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn read_file_full_multiline_strips_trailing_newline() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\ntwo\nthree\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
+
+        assert_eq!(tool.invoke().unwrap(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn read_file_start_line_is_one_based() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\ntwo\nthree\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(2), None);
+
+        assert_eq!(tool.invoke().unwrap(), "two\nthree");
+    }
+
+    #[test]
+    fn read_file_start_and_end_are_inclusive() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\ntwo\nthree\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(2), Some(3));
+
+        assert_eq!(tool.invoke().unwrap(), "two\nthree");
+    }
+
+    #[test]
+    fn read_file_single_line() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\ntwo\nthree\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(1), Some(1));
+
+        assert_eq!(tool.invoke().unwrap(), "one");
+    }
+
+    #[test]
+    fn read_file_end_beyond_eof_returns_rest() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\ntwo\nthree\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(2), Some(10));
+
+        assert_eq!(tool.invoke().unwrap(), "two\nthree");
+    }
+
+    #[test]
+    fn read_file_start_beyond_eof_is_empty() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(99), None);
+
+        assert_eq!(tool.invoke().unwrap(), "");
+    }
+
+    #[test]
+    fn read_file_start_after_end_is_empty() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\ntwo\nthree\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(5), Some(2));
+
+        assert_eq!(tool.invoke().unwrap(), "");
     }
 
     #[test]
@@ -243,7 +323,7 @@ version: 3"#);
 
     #[test]
     fn read_file_missing_is_error() {
-        let tool = Tool::ReadFile("/nonexistent/nope.txt".into());
+        let tool = Tool::ReadFile("/nonexistent/nope.txt".into(), None, None);
 
         let error = tool.invoke().unwrap_err();
 
@@ -259,7 +339,7 @@ version: 3"#);
         let file = temp_dir.path().join("binary.bin");
         std::fs::write(&file, [0xff, 0xfe, 0x00]).unwrap();
 
-        let tool = Tool::ReadFile(file.to_string_lossy().into());
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
 
         let error = tool.invoke().unwrap_err();
 
