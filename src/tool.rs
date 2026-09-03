@@ -21,7 +21,6 @@ pub enum ToolError {
 
 #[derive(Debug)]
 pub enum Tool {
-    Python(String),
     Bash(String),
     ReadFile(String),
     WriteFile(String, String),
@@ -31,7 +30,6 @@ pub enum Tool {
 impl Tool {
     pub fn label(&self) -> &'static str {
         match &self {
-            Tool::Python(_) => "python",
             Tool::Bash(_) => "bash",
             Tool::ReadFile(_) => "read_file",
             Tool::WriteFile(_, _) => "write_file",
@@ -41,7 +39,6 @@ impl Tool {
 
     pub fn description(&self) -> &'static str {
         match &self {
-            Tool::Python(_) => "Run a python script",
             Tool::Bash(_) => "Run a bash script",
             Tool::ReadFile(_) => "Read a file",
             Tool::WriteFile(_, _) => "Write a file",
@@ -51,23 +48,23 @@ impl Tool {
 
     pub fn invoke(&self) -> Result<String, ToolError> {
         match &self {
-            Tool::Python(file) => {
-                let command = Command::new("python3")
-                    .arg(file)
-                    .output()
-                    .map_err(ToolError::Io)?;
-
-                Ok(String::from_utf8_lossy_owned(command.stdout))
-            }
             Tool::Bash(script) => {
-                let command = Command::new("bash")
+                let output = Command::new("bash")
                     .arg("-c")
                     .arg(script)
                     .output()
                     .map_err(ToolError::Io)?;
 
-                Ok(String::from_utf8_lossy_owned(command.stdout))
-            },
+                if !output.status.success() {
+                    return Err(ToolError::NonZeroExit {
+                        tool: self.label(),
+                        status: output.status.code().unwrap_or(-1),
+                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    });
+                }
+
+                Ok(String::from_utf8_lossy_owned(output.stdout))
+            }
             Tool::ReadFile(file) => {
                 let contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
                 Ok(contents)
@@ -78,8 +75,6 @@ impl Tool {
             },
             Tool::EditFile(file, old_content, new_content) => {
                 let mut contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
-                
-                // require exactly one occurrence of the old content
                 let occurrences = contents.matches(old_content).count();
                 if occurrences != 1 {
                     return Err(ToolError::AmbiguousEdit {
@@ -88,10 +83,9 @@ impl Tool {
                     });
                 }
 
-                // replace the (unique) old content with the new content
                 let old_index = contents.find(old_content).unwrap();
                 contents.replace_range(old_index..old_index + old_content.len(), new_content);
-                
+
                 std::fs::write(file, contents).map_err(ToolError::Io)?;
                 Ok(String::new())
             },
@@ -103,21 +97,6 @@ impl Tool {
 mod test {
     use crate::tool::{Tool, ToolError};
     use test_files::TestFiles;
-
-    #[test]
-    fn python_hello_world() {
-        let temp_dir = TestFiles::new();
-        temp_dir.file("hello.py", "print('hello world')");
-        let file = temp_dir.path().join("hello.py");
-
-        assert!(file.exists());
-
-        let tool = Tool::Python(file.to_string_lossy().into());
-
-        let result = tool.invoke().unwrap();
-
-        assert_eq!(result, "hello world\n");
-    }
 
     #[test]
     fn bash_hello_world() {
@@ -207,5 +186,25 @@ version: 3"#);
 
         assert!(matches!(result, ToolError::AmbiguousEdit { occurrences: 0, .. }));
         assert_eq!(std::fs::read_to_string(file).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn bash_nonzero_exit_is_error() {
+        let tool = Tool::Bash("exit 3".into());
+
+        let result = tool.invoke().unwrap_err();
+
+        assert!(matches!(result, ToolError::NonZeroExit { status: 3, .. }));
+    }
+
+    #[test]
+    fn bash_stderr_is_collected_in_error() {
+        let tool = Tool::Bash(r#"echo "oops" 1>&2; exit 1"#.into());
+
+        let error = tool.invoke().unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("bash exited with 1"));
+        assert!(message.contains("oops"));
     }
 }
