@@ -1,5 +1,5 @@
 use openai_oxide::types::chat::{
-    ChatCompletionMessage, ChatCompletionMessageParam, Role, ToolCall, UserContent,
+    ChatCompletionMessageParam, ToolCall, UserContent,
 };
 
 #[derive(Debug, Clone)]
@@ -51,21 +51,6 @@ impl Message {
         }
     }
 
-    pub fn from_response(message: ChatCompletionMessage) -> Message {
-        match message.role {
-            Role::System | Role::Developer => Message::System {
-                content: message.content.unwrap_or_default(),
-            },
-            Role::User => Message::User {
-                content: message.content.unwrap_or_default(),
-            },
-            Role::Assistant => Message::Assistant {
-                content: message.content,
-                tool_calls: message.tool_calls.unwrap_or_default(),
-            },
-            other => panic!("unexpected role in response: {other:?}"),
-        }
-    }
 }
 
 impl PartialEq for Message {
@@ -109,7 +94,6 @@ impl PartialEq for Message {
 mod test {
     use super::*;
     use openai_oxide::types::chat::FunctionCall;
-    use serde_json::json;
 
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
@@ -185,68 +169,5 @@ mod test {
         );
     }
 
-    #[test]
-    fn from_response_parses_assistant_tool_calls() {
-        let value = json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{
-                "id": "call_123",
-                "type": "function",
-                "function": { "name": "read_file", "arguments": "{\"path\":\"a.txt\"}" }
-            }]
-        });
-        let wire: ChatCompletionMessage = serde_json::from_value(value).unwrap();
 
-        let message = Message::from_response(wire);
-
-        assert_eq!(
-            message,
-            Message::Assistant {
-                content: None,
-                tool_calls: vec![tool_call("call_123", "read_file", "{\"path\":\"a.txt\"}")],
-            }
-        );
-    }
-
-    #[test]
-    fn from_response_missing_content_is_empty() {
-        let value = json!({ "role": "user" });
-        let wire: ChatCompletionMessage = serde_json::from_value(value).unwrap();
-
-        assert_eq!(Message::from_response(wire), Message::User { content: String::new() });
-    }
-
-    #[test]
-    fn roundtrip_preserves_every_message_kind() {
-        let messages = vec![
-            Message::System {
-                content: "sys".into(),
-            },
-            Message::User {
-                content: "hi".into(),
-            },
-            Message::Assistant {
-                content: Some("hello".into()),
-                tool_calls: vec![],
-            },
-            Message::Assistant {
-                content: None,
-                tool_calls: vec![
-                    tool_call("call_1", "bash", "{}"),
-                    tool_call(
-                        "call_2",
-                        "write_file",
-                        "{\"path\":\"a.txt\",\"content\":\"x\"}",
-                    ),
-                ],
-            },
-        ];
-
-        for message in messages {
-            let wire: ChatCompletionMessage =
-                serde_json::from_str(&serde_json::to_string(&message.to_request()).unwrap()).unwrap();
-            assert_eq!(Message::from_response(wire), message);
-        }
-    }
 }

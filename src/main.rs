@@ -3,9 +3,9 @@ mod context;
 mod message;
 mod tool;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
-use agent::Agent;
+use agent::{Agent, Token};
 use openai_oxide::client::OpenAI;
 use tokio::io::AsyncBufReadExt;
 
@@ -19,7 +19,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(api_url));
     let mut agent = Agent::new(client, model, SYSTEM_PROMPT);
+    if let Ok(value) = std::env::var("KITE_THINKING") {
+        let enabled = value != "0";
+        agent = agent.with_extra_body(serde_json::json!({
+            "chat_template_kwargs": { "enable_thinking": enabled }
+        }));
+    }
 
+    let tty = std::io::stdout().is_terminal();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut line = String::new();
 
@@ -35,17 +42,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        let mut thinking_open = false;
         match agent
-            .chat(
-                &input,
-                &mut |token: &str| {
-                    print!("{token}");
+            .chat(&input, &mut |token| match token {
+                Token::Thinking(text) => {
+                    if !thinking_open {
+                        eprint!("{}", if tty { "\x1b[2m" } else { "[thinking] " });
+                        thinking_open = true;
+                    }
+                    eprint!("{text}");
+                    let _ = std::io::stderr().flush();
+                }
+                Token::Text(text) => {
+                    if thinking_open {
+                        eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
+                        thinking_open = false;
+                    }
+                    print!("{text}");
                     let _ = std::io::stdout().flush();
-                },
-            )
+                }
+            })
             .await
         {
-            Ok(_) => println!(),
+            Ok(_) => {
+                if thinking_open {
+                    eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
+                }
+                println!();
+            }
             Err(error) => eprintln!("error: {error}"),
         }
     }

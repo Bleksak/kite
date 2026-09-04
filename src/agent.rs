@@ -1,11 +1,148 @@
 use futures_util::StreamExt;
 use openai_oxide::client::OpenAI;
 use openai_oxide::error::OpenAIError;
-use openai_oxide::stream_helpers::ChatStreamEvent;
-use openai_oxide::types::chat::{ChatCompletionRequest, FunctionCall, ToolCall};
+use openai_oxide::types::chat::{
+    ChatCompletionRequest, DeltaToolCall, FunctionCall, ToolCall,
+};
+use serde::Deserialize;
 
 use crate::message::Message;
 use crate::tool::{tool_definitions, Tool};
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum Token {
+    Thinking(String),
+    Text(String),
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+struct ToolSlot {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl Default for ToolSlot {
+    fn default() -> Self {
+        ToolSlot {
+            id: String::new(),
+            name: String::new(),
+            arguments: String::new(),
+        }
+    }
+}
+
+struct StreamAccumulator {
+    content: String,
+    tool_slots: Vec<ToolSlot>,
+    finished: bool,
+}
+
+impl StreamAccumulator {
+    fn new() -> StreamAccumulator {
+        StreamAccumulator {
+            content: String::new(),
+            tool_slots: Vec::new(),
+            finished: false,
+        }
+    }
+
+    fn feed(&mut self, chunk: StreamChunk) -> Vec<Token> {
+        let mut tokens = Vec::new();
+
+        for choice in chunk.choices {
+            if choice.finish_reason.is_some() {
+                self.finished = true;
+            }
+
+            if let Some(text) = choice.delta.content
+                && !text.is_empty()
+            {
+                self.content.push_str(&text);
+                tokens.push(Token::Text(text));
+            }
+
+            if let Some(reasoning) = choice.delta.reasoning
+                && !reasoning.is_empty()
+            {
+                tokens.push(Token::Thinking(reasoning));
+            }
+
+            if let Some(tool_calls) = choice.delta.tool_calls {
+                for call in tool_calls {
+                    let index = call.index as usize;
+                    while self.tool_slots.len() <= index {
+                        self.tool_slots.push(ToolSlot::default());
+                    }
+
+                    let slot = &mut self.tool_slots[index];
+                    if let Some(id) = call.id {
+                        slot.id = id;
+                    }
+                    if let Some(function) = call.function {
+                        if let Some(name) = function.name {
+                            slot.name = name;
+                        }
+                        if let Some(arguments) = function.arguments {
+                            slot.arguments.push_str(&arguments);
+                        }
+                    }
+                }
+            }
+        }
+
+        tokens
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn into_message(self) -> Message {
+        Message::Assistant {
+            content: if self.content.is_empty() {
+                None
+            } else {
+                Some(self.content)
+            },
+            tool_calls: self
+                .tool_slots
+                .into_iter()
+                .filter(|slot| !slot.id.is_empty() || !slot.name.is_empty() || !slot.arguments.is_empty())
+                .map(|slot| ToolCall {
+                    id: slot.id,
+                    type_: "function".into(),
+                    function: FunctionCall {
+                        name: slot.name,
+                        arguments: slot.arguments,
+                    },
+                })
+                .collect(),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 enum Step {
@@ -18,6 +155,7 @@ pub struct Agent {
     model: String,
     system_prompt: String,
     messages: Vec<Message>,
+    extra_body: Option<serde_json::Value>,
 }
 
 impl Agent {
@@ -27,7 +165,13 @@ impl Agent {
             model: model.into(),
             system_prompt: system_prompt.into(),
             messages: Vec::new(),
+            extra_body: None,
         }
+    }
+
+    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Agent {
+        self.extra_body = Some(extra);
+        self
     }
 
     pub fn history(&self) -> &[Message] {
@@ -37,7 +181,7 @@ impl Agent {
     pub async fn chat(
         &mut self,
         user_message: &str,
-        on_token: &mut impl FnMut(&str),
+        on_token: &mut impl FnMut(Token),
     ) -> Result<String, OpenAIError> {
         self.messages.push(Message::User {
             content: user_message.to_string(),
@@ -104,43 +248,33 @@ impl Agent {
     async fn stream_completion(
         &self,
         request: ChatCompletionRequest,
-        on_token: &mut impl FnMut(&str),
+        on_token: &mut impl FnMut(Token),
     ) -> Result<Message, OpenAIError> {
-        let mut stream = self
-            .client
-            .chat()
-            .completions()
-            .create_stream_helper(request)
-            .await?;
-
-        let mut content = String::new();
-        let mut tool_calls = Vec::new();
-
-        while let Some(event) = stream.next().await {
-            match event? {
-                ChatStreamEvent::ContentDelta { delta, .. } => {
-                    content.push_str(&delta);
-                    on_token(&delta);
-                }
-                ChatStreamEvent::ToolCallDone { call_id, name, arguments, .. } => {
-                    tool_calls.push((call_id, name, arguments));
-                }
-                ChatStreamEvent::Done { .. } => break,
-                _ => {}
+        let mut body = serde_json::to_value(request)?;
+        body["stream"] = serde_json::Value::Bool(true);
+        if let Some(extra) = &self.extra_body
+            && let (Some(map), Some(extra_map)) = (body.as_object_mut(), extra.as_object())
+        {
+            for (key, value) in extra_map {
+                map.insert(key.clone(), value.clone());
             }
         }
 
-        Ok(Message::Assistant {
-            content: if content.is_empty() { None } else { Some(content) },
-            tool_calls: tool_calls
-                .into_iter()
-                .map(|(id, name, arguments)| ToolCall {
-                    id,
-                    type_: "function".into(),
-                    function: FunctionCall { name, arguments },
-                })
-                .collect(),
-        })
+        let mut stream = self.client.chat().completions().create_stream_raw(&body).await?;
+        let mut accumulator = StreamAccumulator::new();
+
+        while let Some(value) = stream.next().await {
+            let value = value?;
+            let chunk: StreamChunk = serde_json::from_value(value)?;
+            for token in accumulator.feed(chunk) {
+                on_token(token);
+            }
+            if accumulator.is_finished() {
+                break;
+            }
+        }
+
+        Ok(accumulator.into_message())
     }
 }
 
@@ -321,5 +455,124 @@ mod test {
             tools.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>(),
             vec!["bash", "read_file", "write_file", "edit_file"]
         );
+    }
+
+    fn feed_json(acc: &mut StreamAccumulator, json: &str) -> Vec<Token> {
+        let chunk: StreamChunk = serde_json::from_str(json).unwrap();
+        acc.feed(chunk)
+    }
+
+    #[test]
+    fn text_deltas_accumulate_in_order() {
+        let mut acc = StreamAccumulator::new();
+
+        let t1 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"Hello "}}]}"#);
+        let t2 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"world"}}]}"#);
+
+        assert_eq!(t1, vec![Token::Text("Hello ".into())]);
+        assert_eq!(t2, vec![Token::Text("world".into())]);
+        assert_eq!(
+            acc.into_message(),
+            Message::Assistant {
+                content: Some("Hello world".into()),
+                tool_calls: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn empty_content_delta_is_ignored() {
+        let mut acc = StreamAccumulator::new();
+
+        let tokens = feed_json(&mut acc, r#"{"choices":[{"delta":{"role":"assistant","content":""}}]}"#);
+
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn reasoning_deltas_are_emitted_but_not_in_message() {
+        let mut acc = StreamAccumulator::new();
+
+        let t1 = feed_json(&mut acc, r#"{"choices":[{"delta":{"reasoning":"Let me think. "}}]}"#);
+        let t2 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"42"}}]}"#);
+
+        assert_eq!(t1, vec![Token::Thinking("Let me think. ".into())]);
+        assert_eq!(t2, vec![Token::Text("42".into())]);
+        assert_eq!(
+            acc.into_message(),
+            Message::Assistant {
+                content: Some("42".into()),
+                tool_calls: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn tool_call_arguments_reassemble_across_chunks() {
+        let mut acc = StreamAccumulator::new();
+
+        let t1 = feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash"}}]}}]}"#,
+        );
+        let t2 = feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]}"#,
+        );
+        let t3 = feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"echo hi\"}"}}]}}]}"#,
+        );
+
+        assert!(t1.is_empty() && t2.is_empty() && t3.is_empty());
+        let Message::Assistant { content, tool_calls } = acc.into_message() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(content, None);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].function.name, "bash");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"command":"echo hi"}"#);
+    }
+
+    #[test]
+    fn parallel_tool_calls_keep_their_indices() {
+        let mut acc = StreamAccumulator::new();
+
+        feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+        );
+        feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}}]}"#,
+        );
+
+        let Message::Assistant { tool_calls, .. } = acc.into_message() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(
+            tool_calls
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["call_a", "call_b"]
+        );
+        assert_eq!(
+            tool_calls
+                .iter()
+                .map(|c| c.function.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "bash"]
+        );
+    }
+
+    #[test]
+    fn finish_reason_marks_the_stream_finished() {
+        let mut acc = StreamAccumulator::new();
+
+        assert!(!acc.is_finished());
+        feed_json(&mut acc, r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
+        assert!(acc.is_finished());
     }
 }
