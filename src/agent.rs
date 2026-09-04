@@ -9,10 +9,70 @@ use serde::Deserialize;
 use crate::message::Message;
 use crate::tool::{tool_definitions, Tool};
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum Token {
-    Thinking(String),
-    Text(String),
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct ChunkTokens {
+    pub thinking: Option<String>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ThinkingMode {
+    Live,
+    Hidden,
+}
+
+pub struct AnswerGate {
+    answer_started: bool,
+    buffered: String,
+}
+
+impl AnswerGate {
+    pub fn new() -> AnswerGate {
+        AnswerGate {
+            answer_started: false,
+            buffered: String::new(),
+        }
+    }
+
+    pub fn on_chunk(&mut self, chunk: &ChunkTokens) -> (ThinkingMode, Option<String>) {
+        let thinking = &chunk.thinking;
+        let text = &chunk.text;
+
+        let thinking_mode = if thinking.is_some() && !self.answer_started {
+            ThinkingMode::Live
+        } else {
+            ThinkingMode::Hidden
+        };
+
+        let mut out = None;
+        if let Some(t) = text {
+            if self.answer_started {
+                out = Some(t.clone());
+            } else if thinking.is_none() {
+                self.answer_started = true;
+                self.buffered.push_str(t);
+                out = Some(std::mem::take(&mut self.buffered));
+            } else {
+                self.buffered.push_str(t);
+            }
+        }
+
+        (thinking_mode, out)
+    }
+
+    pub fn finish(&mut self) -> Option<String> {
+        if self.answer_started || self.buffered.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.buffered))
+        }
+    }
+}
+
+impl Default for AnswerGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Deserialize)]
@@ -69,25 +129,23 @@ impl StreamAccumulator {
         }
     }
 
-    fn feed(&mut self, chunk: StreamChunk) -> Vec<Token> {
-        let mut tokens = Vec::new();
+    fn feed(&mut self, chunk: StreamChunk) -> Vec<ChunkTokens> {
+        let mut out = Vec::new();
 
         for choice in chunk.choices {
             if choice.finish_reason.is_some() {
                 self.finished = true;
             }
 
-            if let Some(text) = choice.delta.content
-                && !text.is_empty()
-            {
+            let mut tokens = ChunkTokens::default();
+
+            if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
                 self.content.push_str(&text);
-                tokens.push(Token::Text(text));
+                tokens.text = Some(text);
             }
 
-            if let Some(reasoning) = choice.delta.reasoning
-                && !reasoning.is_empty()
-            {
-                tokens.push(Token::Thinking(reasoning));
+            if let Some(reasoning) = choice.delta.reasoning.filter(|r| !r.is_empty()) {
+                tokens.thinking = Some(reasoning);
             }
 
             if let Some(tool_calls) = choice.delta.tool_calls {
@@ -111,9 +169,13 @@ impl StreamAccumulator {
                     }
                 }
             }
+
+            if tokens.thinking.is_some() || tokens.text.is_some() {
+                out.push(tokens);
+            }
         }
 
-        tokens
+        out
     }
 
     fn is_finished(&self) -> bool {
@@ -181,7 +243,7 @@ impl Agent {
     pub async fn chat(
         &mut self,
         user_message: &str,
-        on_token: &mut impl FnMut(Token),
+        on_token: &mut impl FnMut(ChunkTokens),
     ) -> Result<String, OpenAIError> {
         self.messages.push(Message::User {
             content: user_message.to_string(),
@@ -248,7 +310,7 @@ impl Agent {
     async fn stream_completion(
         &self,
         request: ChatCompletionRequest,
-        on_token: &mut impl FnMut(Token),
+        on_token: &mut impl FnMut(ChunkTokens),
     ) -> Result<Message, OpenAIError> {
         let mut body = serde_json::to_value(request)?;
         body["stream"] = serde_json::Value::Bool(true);
@@ -266,8 +328,8 @@ impl Agent {
         while let Some(value) = stream.next().await {
             let value = value?;
             let chunk: StreamChunk = serde_json::from_value(value)?;
-            for token in accumulator.feed(chunk) {
-                on_token(token);
+            for tokens in accumulator.feed(chunk) {
+                on_token(tokens);
             }
             if accumulator.is_finished() {
                 break;
@@ -457,7 +519,7 @@ mod test {
         );
     }
 
-    fn feed_json(acc: &mut StreamAccumulator, json: &str) -> Vec<Token> {
+    fn feed_json(acc: &mut StreamAccumulator, json: &str) -> Vec<ChunkTokens> {
         let chunk: StreamChunk = serde_json::from_str(json).unwrap();
         acc.feed(chunk)
     }
@@ -469,8 +531,8 @@ mod test {
         let t1 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"Hello "}}]}"#);
         let t2 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"world"}}]}"#);
 
-        assert_eq!(t1, vec![Token::Text("Hello ".into())]);
-        assert_eq!(t2, vec![Token::Text("world".into())]);
+        assert_eq!(t1, vec![ChunkTokens { thinking: None, text: Some("Hello ".into()) }]);
+        assert_eq!(t2, vec![ChunkTokens { thinking: None, text: Some("world".into()) }]);
         assert_eq!(
             acc.into_message(),
             Message::Assistant {
@@ -496,8 +558,8 @@ mod test {
         let t1 = feed_json(&mut acc, r#"{"choices":[{"delta":{"reasoning":"Let me think. "}}]}"#);
         let t2 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"42"}}]}"#);
 
-        assert_eq!(t1, vec![Token::Thinking("Let me think. ".into())]);
-        assert_eq!(t2, vec![Token::Text("42".into())]);
+        assert_eq!(t1, vec![ChunkTokens { thinking: Some("Let me think. ".into()), text: None }]);
+        assert_eq!(t2, vec![ChunkTokens { thinking: None, text: Some("42".into()) }]);
         assert_eq!(
             acc.into_message(),
             Message::Assistant {
@@ -574,5 +636,56 @@ mod test {
         assert!(!acc.is_finished());
         feed_json(&mut acc, r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
         assert!(acc.is_finished());
+    }
+
+    fn gate_chunk(thinking: Option<&str>, text: Option<&str>) -> ChunkTokens {
+        ChunkTokens {
+            thinking: thinking.map(String::from),
+            text: text.map(String::from),
+        }
+    }
+
+    #[test]
+    fn gate_streams_thinking_live_until_answer_starts() {
+        let mut gate = AnswerGate::new();
+
+        let (mode, out) = gate.on_chunk(&gate_chunk(Some("thinking "), None));
+        assert_eq!((mode, out), (ThinkingMode::Live, None));
+
+        let (mode, out) = gate.on_chunk(&gate_chunk(None, Some("answer")));
+        assert_eq!((mode, out), (ThinkingMode::Hidden, Some("answer".into())));
+
+        let (mode, out) = gate.on_chunk(&gate_chunk(Some("straggler"), Some(" more")));
+        assert_eq!((mode, out), (ThinkingMode::Hidden, Some(" more".into())));
+    }
+
+    #[test]
+    fn gate_buffers_text_glued_to_reasoning() {
+        let mut gate = AnswerGate::new();
+
+        let (mode, out) = gate.on_chunk(&gate_chunk(Some("reasoning"), Some("Hello")));
+        assert_eq!((mode, out), (ThinkingMode::Live, None));
+
+        let (mode, out) = gate.on_chunk(&gate_chunk(None, Some(" world")));
+        assert_eq!((mode, out), (ThinkingMode::Hidden, Some("Hello world".into())));
+    }
+
+    #[test]
+    fn gate_flushes_buffered_text_when_no_pure_chunk_arrives() {
+        let mut gate = AnswerGate::new();
+
+        gate.on_chunk(&gate_chunk(Some("reasoning"), Some("all")));
+        gate.on_chunk(&gate_chunk(Some("still reasoning"), Some("glued")));
+
+        assert_eq!(gate.finish(), Some("allglued".into()));
+    }
+
+    #[test]
+    fn gate_finish_is_empty_when_answer_started() {
+        let mut gate = AnswerGate::new();
+
+        gate.on_chunk(&gate_chunk(None, Some("hi")));
+
+        assert_eq!(gate.finish(), None);
     }
 }

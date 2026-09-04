@@ -5,7 +5,7 @@ mod tool;
 
 use std::io::{IsTerminal, Write};
 
-use agent::{Agent, Token};
+use agent::{Agent, AnswerGate, ChunkTokens, ThinkingMode};
 use openai_oxide::client::OpenAI;
 use tokio::io::AsyncBufReadExt;
 
@@ -42,29 +42,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        let mut gate = AnswerGate::new();
         let mut thinking_open = false;
         match agent
-            .chat(&input, &mut |token| match token {
-                Token::Thinking(text) => {
-                    if !thinking_open {
-                        eprint!("{}", if tty { "\x1b[2m" } else { "[thinking] " });
-                        thinking_open = true;
+            .chat(
+                &input,
+                &mut |chunk: ChunkTokens| {
+                    let (mode, text) = gate.on_chunk(&chunk);
+
+                    if mode == ThinkingMode::Live
+                        && let Some(t) = &chunk.thinking
+                    {
+                        if !thinking_open {
+                            eprint!("{}", if tty { "\x1b[2m" } else { "[thinking] " });
+                            thinking_open = true;
+                        }
+                        eprint!("{t}");
+                        let _ = std::io::stderr().flush();
                     }
-                    eprint!("{text}");
-                    let _ = std::io::stderr().flush();
-                }
-                Token::Text(text) => {
+
+                    if let Some(text) = text {
+                        if thinking_open {
+                            eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
+                            thinking_open = false;
+                        }
+                        print!("{text}");
+                        let _ = std::io::stdout().flush();
+                    }
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                if let Some(remaining) = gate.finish() {
                     if thinking_open {
                         eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
                         thinking_open = false;
                     }
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
+                    print!("{remaining}");
                 }
-            })
-            .await
-        {
-            Ok(_) => {
                 if thinking_open {
                     eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
                 }
