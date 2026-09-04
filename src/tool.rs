@@ -1,8 +1,10 @@
 use std::process::Command;
 
+use openai_oxide::types::chat::{
+    FunctionDef, Tool as OpenAITool, ToolCall as OpenAIToolCall,
+};
 use serde::Deserialize;
-
-use crate::message::ToolCall;
+use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -146,23 +148,24 @@ fn parse_args<A: serde::de::DeserializeOwned>(name: &str, arguments: &str) -> Re
     })
 }
 
-impl TryFrom<ToolCall> for Tool {
+impl TryFrom<OpenAIToolCall> for Tool {
     type Error = ToolError;
 
-    fn try_from(call: ToolCall) -> Result<Tool, ToolError> {
-        let ToolCall {
+    fn try_from(call: OpenAIToolCall) -> Result<Tool, ToolError> {
+        let OpenAIToolCall {
             id: _,
-            name,
-            arguments,
+            type_: _,
+            function,
         } = call;
 
-        match name.as_str() {
-            "bash" => parse_args::<BashArgs>(&name, &arguments).map(|a| Tool::Bash(a.command)),
-            "read_file" => parse_args::<ReadFileArgs>(&name, &arguments)
+        match function.name.as_str() {
+            "bash" => parse_args::<BashArgs>(&function.name, &function.arguments)
+                .map(|a| Tool::Bash(a.command)),
+            "read_file" => parse_args::<ReadFileArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::ReadFile(a.path, a.start, a.end)),
-            "write_file" => parse_args::<WriteFileArgs>(&name, &arguments)
+            "write_file" => parse_args::<WriteFileArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::WriteFile(a.path, a.content)),
-            "edit_file" => parse_args::<EditFileArgs>(&name, &arguments)
+            "edit_file" => parse_args::<EditFileArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::EditFile(a.path, a.old_content, a.new_content)),
             other => Err(ToolError::UnknownTool {
                 name: other.to_string(),
@@ -171,17 +174,79 @@ impl TryFrom<ToolCall> for Tool {
     }
 }
 
+pub fn tool_definitions() -> Vec<OpenAITool> {
+    let tools = [
+        Tool::Bash(String::new()),
+        Tool::ReadFile(String::new(), None, None),
+        Tool::WriteFile(String::new(), String::new()),
+        Tool::EditFile(String::new(), String::new(), String::new()),
+    ];
+
+    tools
+        .map(|tool| OpenAITool {
+            type_: "function".to_string(),
+            function: FunctionDef {
+                name: tool.label().to_string(),
+                description: Some(tool.description().to_string()),
+                parameters: Some(parameters(&tool)),
+                strict: None,
+            },
+        })
+        .to_vec()
+}
+
+fn parameters(tool: &Tool) -> serde_json::Value {
+    match tool {
+        Tool::Bash(_) => json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "the shell command to run" }
+            },
+            "required": ["command"]
+        }),
+        Tool::ReadFile(..) => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "path of the file to read" },
+                "start": { "type": "integer", "minimum": 1, "description": "1-based start line, inclusive" },
+                "end": { "type": "integer", "minimum": 1, "description": "1-based end line, inclusive" }
+            },
+            "required": ["path"]
+        }),
+        Tool::WriteFile(_, _) => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "path of the file to write" },
+                "content": { "type": "string", "description": "content to write to the file" }
+            },
+            "required": ["path", "content"]
+        }),
+        Tool::EditFile(_, _, _) => json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "path of the file to edit" },
+                "old_content": { "type": "string", "description": "exact text to replace; must occur exactly once in the file" },
+                "new_content": { "type": "string", "description": "replacement text; may be empty to delete" }
+            },
+            "required": ["path", "old_content", "new_content"]
+        }),
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use crate::message::ToolCall;
-    use crate::tool::{Tool, ToolError};
+    use crate::tool::{tool_definitions, Tool, ToolError};
+    use openai_oxide::types::chat::{FunctionCall, ToolCall as OpenAIToolCall};
     use test_files::TestFiles;
 
-    fn call(name: &str, arguments: &str) -> ToolCall {
-        ToolCall {
+    fn call(name: &str, arguments: &str) -> OpenAIToolCall {
+        OpenAIToolCall {
             id: "call_1".into(),
-            name: name.into(),
-            arguments: arguments.into(),
+            type_: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
         }
     }
 
@@ -575,5 +640,31 @@ version: 3"#,
     fn try_from_ignores_hallucinated_fields() {
         let tool = Tool::try_from(call("bash", r#"{"command":"ls","vibes":42}"#)).unwrap();
         assert_eq!(tool, Tool::Bash("ls".into()));
+    }
+
+    #[test]
+    fn schemas_are_consistent_with_parser() {
+        for definition in tool_definitions() {
+            let properties = definition
+                .function
+                .parameters
+                .as_ref()
+                .and_then(|p| p.get("properties"))
+                .and_then(serde_json::Value::as_object)
+                .unwrap();
+
+            let mut document = serde_json::Map::new();
+            for (key, value) in properties {
+                let sample = match value.get("type").and_then(serde_json::Value::as_str).unwrap() {
+                    "string" => serde_json::json!("x"),
+                    "integer" => serde_json::json!(1),
+                    other => panic!("unexpected schema type {other}"),
+                };
+                document.insert(key.clone(), sample);
+            }
+
+            let tool_call = call(&definition.function.name, &serde_json::to_string(&document).unwrap());
+            assert!(Tool::try_from(tool_call).is_ok(), "schema for {} does not parse", definition.function.name);
+        }
     }
 }
