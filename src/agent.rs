@@ -40,13 +40,13 @@ impl Agent {
         loop {
             let mut response = self.complete().await?;
             let message = Message::from_response(response.choices.remove(0).message);
-            if let Step::Done(text) = self.handle_response(message) {
+            if let Step::Done(text) = self.handle_response(message).await {
                 return Ok(text);
             }
         }
     }
 
-    fn handle_response(&mut self, message: Message) -> Step {
+    async fn handle_response(&mut self, message: Message) -> Step {
         let Message::Assistant { content, tool_calls } = message else {
             return Step::Done(String::new());
         };
@@ -67,7 +67,7 @@ impl Agent {
         for call in tool_calls {
             let tool_call_id = call.id.clone();
             let content = match Tool::try_from(call) {
-                Ok(tool) => match tool.invoke() {
+                Ok(tool) => match tool.invoke().await {
                     Ok(output) => output,
                     Err(error) => error.to_string(),
                 },
@@ -125,25 +125,27 @@ mod test {
         Agent::new(OpenAI::new("test-key"), "test-model", "be concise")
     }
 
-    fn run_tool_call(agent: &mut Agent, id: &str, name: &str, arguments: &str) -> Step {
+    async fn run_tool_call(agent: &mut Agent, id: &str, name: &str, arguments: &str) -> Step {
         agent.handle_response(Message::Assistant {
             content: None,
             tool_calls: vec![tool_call(id, name, arguments)],
         })
+        .await
     }
 
-    fn finish(agent: &mut Agent, text: &str) -> Step {
+    async fn finish(agent: &mut Agent, text: &str) -> Step {
         agent.handle_response(Message::Assistant {
             content: Some(text.into()),
             tool_calls: vec![],
         })
+        .await
     }
 
-    #[test]
-    fn simple_answer_returns_text() {
+    #[tokio::test]
+    async fn simple_answer_returns_text() {
         let mut agent = agent();
 
-        let step = finish(&mut agent, "hello");
+        let step = finish(&mut agent, "hello").await;
 
         assert_eq!(step, Step::Done("hello".into()));
         assert_eq!(
@@ -155,11 +157,11 @@ mod test {
         );
     }
 
-    #[test]
-    fn tool_call_executes_and_continues() {
+    #[tokio::test]
+    async fn tool_call_executes_and_continues() {
         let mut agent = agent();
 
-        let step = run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"echo out"}"#);
+        let step = run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"echo out"}"#).await;
 
         assert_eq!(step, Step::Continue);
         assert_eq!(agent.history().len(), 2);
@@ -172,11 +174,11 @@ mod test {
         );
     }
 
-    #[test]
-    fn tool_error_is_returned_to_model() {
+    #[tokio::test]
+    async fn tool_error_is_returned_to_model() {
         let mut agent = agent();
 
-        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"exit 3"}"#);
+        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"exit 3"}"#).await;
 
         assert_eq!(
             agent.history()[1],
@@ -187,11 +189,11 @@ mod test {
         );
     }
 
-    #[test]
-    fn invalid_arguments_are_returned_to_model() {
+    #[tokio::test]
+    async fn invalid_arguments_are_returned_to_model() {
         let mut agent = agent();
 
-        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"ls""#);
+        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"ls""#).await;
 
         let Message::Tool { content, .. } = &agent.history()[1] else {
             panic!("expected tool message");
@@ -200,11 +202,11 @@ mod test {
         assert!(content.contains(r#"{"command":"ls""#));
     }
 
-    #[test]
-    fn unknown_tool_is_returned_to_model() {
+    #[tokio::test]
+    async fn unknown_tool_is_returned_to_model() {
         let mut agent = agent();
 
-        run_tool_call(&mut agent, "call_1", "nuke", "{}");
+        run_tool_call(&mut agent, "call_1", "nuke", "{}").await;
 
         assert_eq!(
             agent.history()[1],
@@ -215,16 +217,18 @@ mod test {
         );
     }
 
-    #[test]
-    fn parallel_tool_calls_all_get_results() {
+    #[tokio::test]
+    async fn parallel_tool_calls_all_get_results() {
         let mut agent = agent();
-        let step = agent.handle_response(Message::Assistant {
-            content: None,
-            tool_calls: vec![
-                tool_call("call_1", "bash", r#"{"command":"echo one"}"#),
-                tool_call("call_2", "bash", r#"{"command":"echo two"}"#),
-            ],
-        });
+        let step = agent
+            .handle_response(Message::Assistant {
+                content: None,
+                tool_calls: vec![
+                    tool_call("call_1", "bash", r#"{"command":"echo one"}"#),
+                    tool_call("call_2", "bash", r#"{"command":"echo two"}"#),
+                ],
+            })
+            .await;
         assert_eq!(step, Step::Continue);
 
         assert_eq!(
