@@ -35,8 +35,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        match agent.chat(&input).await {
-            Ok(text) => println!("{text}"),
+        match agent
+            .chat(
+                &input,
+                &mut |token: &str| {
+                    print!("{token}");
+                    let _ = std::io::stdout().flush();
+                },
+            )
+            .await
+        {
+            Ok(_) => println!(),
             Err(error) => eprintln!("error: {error}"),
         }
     }

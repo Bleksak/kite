@@ -1,6 +1,8 @@
+use futures_util::StreamExt;
 use openai_oxide::client::OpenAI;
 use openai_oxide::error::OpenAIError;
-use openai_oxide::types::chat::{ChatCompletionRequest, ChatCompletionResponse};
+use openai_oxide::stream_helpers::ChatStreamEvent;
+use openai_oxide::types::chat::{ChatCompletionRequest, FunctionCall, ToolCall};
 
 use crate::message::Message;
 use crate::tool::{tool_definitions, Tool};
@@ -32,14 +34,17 @@ impl Agent {
         &self.messages
     }
 
-    pub async fn chat(&mut self, user_message: &str) -> Result<String, OpenAIError> {
+    pub async fn chat(
+        &mut self,
+        user_message: &str,
+        on_token: &mut impl FnMut(&str),
+    ) -> Result<String, OpenAIError> {
         self.messages.push(Message::User {
             content: user_message.to_string(),
         });
 
         loop {
-            let mut response = self.complete().await?;
-            let message = Message::from_response(response.choices.remove(0).message);
+            let message = self.stream_completion(self.build_request(), on_token).await?;
             if let Step::Done(text) = self.handle_response(message).await {
                 return Ok(text);
             }
@@ -96,12 +101,46 @@ impl Agent {
         request
     }
 
-    async fn complete(&self) -> Result<ChatCompletionResponse, OpenAIError> {
-        self.client
+    async fn stream_completion(
+        &self,
+        request: ChatCompletionRequest,
+        on_token: &mut impl FnMut(&str),
+    ) -> Result<Message, OpenAIError> {
+        let mut stream = self
+            .client
             .chat()
             .completions()
-            .create(self.build_request())
-            .await
+            .create_stream_helper(request)
+            .await?;
+
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+
+        while let Some(event) = stream.next().await {
+            match event? {
+                ChatStreamEvent::ContentDelta { delta, .. } => {
+                    content.push_str(&delta);
+                    on_token(&delta);
+                }
+                ChatStreamEvent::ToolCallDone { call_id, name, arguments, .. } => {
+                    tool_calls.push((call_id, name, arguments));
+                }
+                ChatStreamEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+
+        Ok(Message::Assistant {
+            content: if content.is_empty() { None } else { Some(content) },
+            tool_calls: tool_calls
+                .into_iter()
+                .map(|(id, name, arguments)| ToolCall {
+                    id,
+                    type_: "function".into(),
+                    function: FunctionCall { name, arguments },
+                })
+                .collect(),
+        })
     }
 }
 

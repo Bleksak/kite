@@ -601,6 +601,7 @@ dependencies = [
 name = "kite"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "openai-oxide",
  "serde",
  "serde_json",
