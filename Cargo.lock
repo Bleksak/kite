@@ -606,6 +606,7 @@ dependencies = [
  "serde_json",
  "test-files",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
