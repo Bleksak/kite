@@ -6,10 +6,11 @@ use crossterm::event::{self, Event as TermEvent, KeyCode, KeyModifiers};
 use crossterm::terminal;
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Widget};
 use ratatui::{Frame, Terminal};
 
 use tui_markdown::{from_str_with_options, Options, StyleSheet};
@@ -234,6 +235,8 @@ pub struct TuiState {
     pub scroll: usize,
     pub following: bool,
     pub viewport: usize,
+    pub pane_width: usize,
+    tail_cache: (usize, usize, usize, usize),
     pub input: String,
     pub running: bool,
     pub error: Option<String>,
@@ -249,6 +252,8 @@ impl TuiState {
             scroll: 0,
             following: true,
             viewport: 24,
+            pane_width: 118,
+            tail_cache: (0, 0, 0, 0),
             input: String::new(),
             running: false,
             error: None,
@@ -333,12 +338,51 @@ fn page_down(state: &mut TuiState) {
 }
 
 impl TuiState {
-    fn max_scroll(&self) -> usize {
-        self.renderer.scrollback().len().saturating_sub(self.viewport)
+    fn max_scroll(&mut self) -> usize {
+        let len = self.renderer.scrollback().len();
+        let (cl, cw, cv, cs) = self.tail_cache;
+        if cl == len && cw == self.pane_width && cv == self.viewport {
+            return cs;
+        }
+        let result = tail_start(len, self.renderer.scrollback(), self.pane_width as u16, self.viewport);
+        self.tail_cache = (len, self.pane_width, self.viewport, result);
+        result
     }
 }
 
-pub fn draw(frame: &mut Frame, state: &TuiState) {
+fn fits_viewport(lines: &[Line<'static>], width: u16, viewport: usize) -> bool {
+    if lines.is_empty() {
+        return true;
+    }
+    let area = Rect::new(0, 0, width, (viewport + 1) as u16);
+    let mut buffer = Buffer::empty(area);
+    Paragraph::new(lines).wrap(Wrap { trim: false }).render(area, &mut buffer);
+    (0..width).all(|x| {
+        buffer
+            .cell((x, viewport as u16))
+            .map_or(true, |cell| *cell == Cell::default())
+    })
+}
+
+fn tail_start(len: usize, lines: &[Line<'static>], width: u16, viewport: usize) -> usize {
+    let first = len.saturating_sub(viewport);
+    if fits_viewport(&lines[first..], width, viewport) {
+        return first;
+    }
+    let mut lo = first;
+    let mut hi = len;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fits_viewport(&lines[mid..], width, viewport) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let chunks = Layout::new(
         Direction::Vertical,
@@ -359,8 +403,6 @@ pub fn draw(frame: &mut Frame, state: &TuiState) {
     );
 
     let scrollback = state.renderer.scrollback();
-    let viewport = chunks[1].height as usize;
-    let start = state.scroll.min(scrollback.len().saturating_sub(viewport));
     let main = Paragraph::new(&scrollback[start..])
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL));
@@ -438,7 +480,7 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
     });
 
     let mut state = TuiState::new(model);
-    terminal.draw(|frame| draw(frame, &state))?;
+    terminal.draw(|frame| draw(frame, &state, 0))?;
 
     loop {
         tokio::select! {
@@ -484,7 +526,12 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
             .size()
             .map(|size| size.height.saturating_sub(6) as usize)
             .unwrap_or(24);
-        terminal.draw(|frame| draw(frame, &state))?;
+        state.pane_width = terminal
+            .size()
+            .map(|size| size.width.saturating_sub(2) as usize)
+            .unwrap_or(118);
+        let start = state.scroll.min(state.max_scroll());
+        terminal.draw(|frame| draw(frame, &state, start))?;
     }
 
     agent_task.abort();
@@ -774,6 +821,19 @@ mod test {
     }
 
     #[test]
+    fn tail_start_accounts_for_wrapped_lines() {
+        let mut state = TuiState::new("model".into());
+        state.viewport = 4;
+        state.pane_width = 20;
+        for _ in 0..3 {
+            state.renderer.on_event(text(&format!("{}\n", "a".repeat(40))));
+        }
+        state.renderer.finish();
+
+        assert_eq!(state.max_scroll(), 1);
+    }
+
+    #[test]
     fn page_keys_scroll_the_main_pane() {
         let mut state = TuiState::new("model".into());
         for _ in 0..3 {
@@ -920,7 +980,7 @@ mod test {
 
         let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
 
         let buffer = terminal.backend().buffer();
         let joined: String = (0..12)
