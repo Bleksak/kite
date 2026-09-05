@@ -20,6 +20,7 @@ pub struct ChunkTokens {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum AgentEvent {
+    CompletionStarted,
     Tokens(ChunkTokens),
     ToolStarted { header: String, body: Option<String> },
     ToolResult(String),
@@ -292,6 +293,7 @@ impl Agent {
             if self.context.needs_compaction() {
                 self.context.compact();
             }
+            on_event(AgentEvent::CompletionStarted);
 
             let (message, usage) = self
                 .stream_completion(

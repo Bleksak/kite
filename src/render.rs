@@ -25,6 +25,13 @@ impl<W: Write, E: Write> Renderer<W, E> {
 
     pub fn on_event(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::CompletionStarted => {
+                self.close_thinking();
+                if let Some(remaining) = self.gate.finish() {
+                    let _ = writeln!(self.out, "{remaining}");
+                }
+                self.gate = AnswerGate::new();
+            }
             AgentEvent::Tokens(chunk) => {
                 self.close_output();
 
@@ -233,6 +240,47 @@ mod test {
 
         assert_eq!(out, "<output>\nwrite_file: a.txt\ncontent\n</output>\nanswer\n");
         assert_eq!(err, "<thinking>\nnext turn thinking</thinking>\n");
+    }
+
+    #[test]
+    fn thinking_is_live_again_on_the_next_completion() {
+        let (out, err) = render(
+            false,
+            vec![
+                thinking("first round "),
+                text("narration"),
+                AgentEvent::CompletionStarted,
+                thinking("second round "),
+                text("answer"),
+            ],
+        );
+
+        assert_eq!(
+            err,
+            "<thinking>\nfirst round </thinking>\n<thinking>\nsecond round </thinking>\n"
+        );
+        assert_eq!(out, "narrationanswer\n");
+    }
+
+    #[test]
+    fn buffered_text_flushes_at_the_completion_boundary() {
+        let (out, err) = render(
+            false,
+            vec![
+                AgentEvent::Tokens(ChunkTokens {
+                    thinking: Some("glued".into()),
+                    text: Some("narration".into()),
+                }),
+                AgentEvent::CompletionStarted,
+                thinking("next round"),
+            ],
+        );
+
+        assert_eq!(
+            err,
+            "<thinking>\nglued</thinking>\n<thinking>\nnext round</thinking>\n"
+        );
+        assert_eq!(out, "narration\n\n");
     }
 
     #[test]
