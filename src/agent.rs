@@ -24,7 +24,7 @@ pub enum AgentEvent {
     CompletionStarted,
     Tokens(ChunkTokens),
     ToolStarted { header: String, body: Option<String> },
-    ToolResult(String),
+    ToolResult { header: String, body: String },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -350,21 +350,22 @@ impl Agent {
         calls: &[ToolCall],
         on_event: &mut impl FnMut(AgentEvent),
     ) {
-        let mut slots: Vec<Result<(Tool, bool), String>> = Vec::new();
+        let mut slots: Vec<Result<(Tool, bool, String), String>> = Vec::new();
         for call in calls {
             match Tool::try_from(call.clone()) {
                 Ok(tool) => {
-                    let (header, output) = (tool.header(), tool.output());
+                    let header = tool.header();
+                    let output = tool.output();
                     let (body, show_result) = match &output {
                         ToolOutput::Before(body) => (Some(body.to_string()), false),
                         ToolOutput::After => (None, true),
                         ToolOutput::Hidden => (None, false),
                     };
                     on_event(AgentEvent::ToolStarted {
-                        header,
+                        header: header.clone(),
                         body,
                     });
-                    slots.push(Ok((tool, show_result)));
+                    slots.push(Ok((tool, show_result, header)));
                 }
                 Err(error) => slots.push(Err(error.to_string())),
             }
@@ -372,20 +373,23 @@ impl Agent {
 
         let futures: Vec<_> = slots
             .iter()
-            .filter_map(|slot| slot.as_ref().ok().map(|(tool, _)| tool.invoke(self.bash_timeout)))
+            .filter_map(|slot| slot.as_ref().ok().map(|(tool, _, _)| tool.invoke(self.bash_timeout)))
             .collect();
         let outputs = join_all(futures).await;
 
         let mut outputs = outputs.into_iter();
         for (call, slot) in calls.iter().zip(slots) {
             let content = match slot {
-                Ok((_, show_result)) => {
+                Ok((_, show_result, header)) => {
                     let content = match outputs.next().unwrap() {
                         Ok(output) => output,
                         Err(error) => error.to_string(),
                     };
                     if show_result {
-                        on_event(AgentEvent::ToolResult(content.clone()));
+                        on_event(AgentEvent::ToolResult {
+                            header,
+                            body: content.clone(),
+                        });
                     }
                     content
                 }
@@ -692,7 +696,10 @@ mod test {
                     header: format!("read_file: {path}"),
                     body: None,
                 },
-                AgentEvent::ToolResult("line one\nline two".into()),
+                AgentEvent::ToolResult {
+                    header: format!("read_file: {path}"),
+                    body: "line one\nline two".into(),
+                },
             ]
         );
     }

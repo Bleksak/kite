@@ -10,6 +10,7 @@ pub struct Renderer<W: Write, E: Write> {
     gate: AnswerGate,
     thinking_open: bool,
     output_open: bool,
+    output_header: Option<String>,
 }
 
 impl<W: Write, E: Write> Renderer<W, E> {
@@ -22,6 +23,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
             gate: AnswerGate::new(),
             thinking_open: false,
             output_open: false,
+            output_header: None,
         }
     }
 
@@ -57,14 +59,19 @@ impl<W: Write, E: Write> Renderer<W, E> {
             AgentEvent::ToolStarted { header, body } => {
                 self.close_thinking();
                 self.close_output();
-                self.open_output();
+                self.open_output(&header);
                 let _ = writeln!(self.out, "{header}");
                 if let Some(body) = body {
                     let _ = writeln!(self.out, "{body}");
                 }
                 let _ = self.out.flush();
             }
-            AgentEvent::ToolResult(body) => {
+            AgentEvent::ToolResult { header, body } => {
+                if self.output_header.as_deref() != Some(header.as_str()) {
+                    self.close_output();
+                    self.open_output(&header);
+                    let _ = writeln!(self.out, "{header}");
+                }
                 let _ = writeln!(self.out, "{body}");
                 self.close_output();
                 let _ = self.out.flush();
@@ -108,8 +115,9 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = self.err.flush();
     }
 
-    fn open_output(&mut self) {
+    fn open_output(&mut self, header: &str) {
         self.output_open = true;
+        self.output_header = Some(header.to_string());
         let _ = write!(
             self.out,
             "{}",
@@ -123,6 +131,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
             return;
         }
         self.output_open = false;
+        self.output_header = None;
         let _ = write!(
             self.out,
             "{}",
@@ -191,7 +200,10 @@ mod test {
                     header: "read_file: a.txt".into(),
                     body: None,
                 },
-                AgentEvent::ToolResult("line one".into()),
+                AgentEvent::ToolResult {
+                    header: "read_file: a.txt".into(),
+                    body: "line one".into(),
+                },
             ],
         );
 
@@ -315,6 +327,38 @@ mod test {
 
         assert_eq!(out, "<output>\nbash\nls\n</output>\ndone\n");
         assert_eq!(err, "\x1b[2m<thinking>\nthink\x1b[0m</thinking>\n");
+    }
+
+    #[test]
+    fn parallel_tool_results_get_their_own_blocks() {
+        let (out, err) = render(
+            false,
+            false,
+            vec![
+                AgentEvent::ToolStarted {
+                    header: "read_file: a.txt".into(),
+                    body: None,
+                },
+                AgentEvent::ToolStarted {
+                    header: "read_file: b.txt".into(),
+                    body: None,
+                },
+                AgentEvent::ToolResult {
+                    header: "read_file: a.txt".into(),
+                    body: "alpha".into(),
+                },
+                AgentEvent::ToolResult {
+                    header: "read_file: b.txt".into(),
+                    body: "beta".into(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            out,
+            "<output>\nread_file: a.txt\n</output>\n<output>\nread_file: b.txt\n</output>\n<output>\nread_file: a.txt\nalpha\n</output>\n<output>\nread_file: b.txt\nbeta\n</output>\n\n"
+        );
+        assert!(err.is_empty());
     }
 
     #[test]
