@@ -167,7 +167,7 @@ impl StreamAccumulator {
             if let Some(tool_calls) = choice.delta.tool_calls {
                 for call in tool_calls {
                     let index = call.index;
-                    if index < 0 || index > 255 {
+                    if index < 0 || index > 131_071 {
                         continue;
                     }
                     let index = index as usize;
@@ -726,7 +726,7 @@ mod test {
         );
         feed_json(
             &mut acc,
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":256,"id":"call_big","function":{"name":"bash","arguments":"{\"command\":\"x\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":131072,"id":"call_big","function":{"name":"bash","arguments":"{\"command\":\"x\"}"}}]}}]}"#,
         );
         feed_json(
             &mut acc,
