@@ -114,7 +114,7 @@ impl Tool {
                     });
                 }
 
-                Ok(String::from_utf8_lossy_owned(output.stdout))
+                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
             }
             Tool::ReadFile(file, start, end) => {
                 let contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
