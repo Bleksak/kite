@@ -27,9 +27,40 @@ impl Context {
         std::iter::once(Message::System {
             content: self.system_prompt.clone(),
         })
-        .chain(self.messages.iter().cloned())
+        .chain(self.pruned_messages())
         .map(|message| message.to_request())
         .collect()
+    }
+
+    fn pruned_messages(&self) -> Vec<Message> {
+        let in_progress = match self.messages.last() {
+            Some(Message::Assistant { tool_calls, .. }) => !tool_calls.is_empty(),
+            Some(Message::Tool { .. }) => true,
+            _ => false,
+        };
+        let keep_from = if in_progress {
+            self.messages
+                .iter()
+                .rposition(|message| matches!(message, Message::User { .. }))
+                .map(|index| index + 1)
+                .unwrap_or(0)
+        } else {
+            self.messages.len()
+        };
+
+        self.messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| match message {
+                Message::Assistant { tool_calls, .. }
+                    if !tool_calls.is_empty() && index < keep_from =>
+                {
+                    None
+                }
+                Message::Tool { .. } if index < keep_from => None,
+                _ => Some(message.clone()),
+            })
+            .collect()
     }
 
     pub fn record_usage(&mut self, prompt: Option<u64>, completion: Option<u64>) {
@@ -53,9 +84,24 @@ impl Context {
 #[cfg(test)]
 mod test {
     use super::*;
+    use openai_oxide::types::chat::{FunctionCall, ToolCall};
 
     fn context() -> Context {
         Context::new("be concise", 100)
+    }
+
+    fn assistant_call(id: &str, name: &str, content: Option<&str>) -> Message {
+        Message::Assistant {
+            content: content.map(String::from),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                type_: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: "{}".into(),
+                },
+            }],
+        }
     }
 
     #[test]
@@ -114,5 +160,96 @@ mod test {
         context.compact();
 
         assert_eq!(context.messages.len(), 1);
+    }
+
+    #[test]
+    fn completed_turns_drop_their_tool_exchanges() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "make it blue".into(),
+        });
+        context.messages.push(assistant_call("c1", "read_file", Some("let me check")));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "file contents".into(),
+        });
+        context.messages.push(Message::Assistant {
+            content: Some("made it blue".into()),
+            tool_calls: vec![],
+        });
+        context.messages.push(Message::User {
+            content: "now green".into(),
+        });
+        context.messages.push(assistant_call("c2", "bash", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c2".into(),
+            content: "ok".into(),
+        });
+        context.messages.push(Message::Assistant {
+            content: Some("made it green".into()),
+            tool_calls: vec![],
+        });
+
+        let json: Vec<String> = context
+            .build_messages()
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+
+        assert_eq!(
+            json,
+            vec![
+                r#"{"role":"system","content":"be concise"}"#,
+                r#"{"role":"user","content":"make it blue"}"#,
+                r#"{"role":"assistant","content":"made it blue"}"#,
+                r#"{"role":"user","content":"now green"}"#,
+                r#"{"role":"assistant","content":"made it green"}"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn current_turn_keeps_its_tool_exchanges() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "t1".into(),
+        });
+        context.messages.push(assistant_call("c1", "bash", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "out".into(),
+        });
+        context.messages.push(Message::Assistant {
+            content: Some("done".into()),
+            tool_calls: vec![],
+        });
+        context.messages.push(Message::User {
+            content: "t2".into(),
+        });
+        context.messages.push(assistant_call("c2", "read_file", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c2".into(),
+            content: "content".into(),
+        });
+
+        let json: Vec<String> = context
+            .build_messages()
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+
+        assert_eq!(
+            json,
+            vec![
+                r#"{"role":"system","content":"be concise"}"#,
+                r#"{"role":"user","content":"t1"}"#,
+                r#"{"role":"assistant","content":"done"}"#,
+                r#"{"role":"user","content":"t2"}"#,
+                r#"{"role":"assistant","tool_calls":[{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]}"#,
+                r#"{"role":"tool","content":"content","tool_call_id":"c2"}"#,
+            ]
+        );
+
+        assert_eq!(context.messages.len(), 7);
     }
 }
