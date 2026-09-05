@@ -216,9 +216,16 @@ impl StreamAccumulator {
             tool_calls: self
                 .tool_slots
                 .into_iter()
-                .filter(|slot| !slot.id.is_empty() || !slot.name.is_empty() || !slot.arguments.is_empty())
-                .map(|slot| ToolCall {
-                    id: slot.id,
+                .enumerate()
+                .filter(|(_, slot)| {
+                    !slot.id.is_empty() || !slot.name.is_empty() || !slot.arguments.is_empty()
+                })
+                .map(|(position, slot)| ToolCall {
+                    id: if slot.id.is_empty() {
+                        format!("call_{position}")
+                    } else {
+                        slot.id
+                    },
                     type_: "function".into(),
                     function: FunctionCall {
                         name: slot.name,
@@ -815,6 +822,23 @@ mod test {
             panic!("expected assistant message");
         };
         assert_eq!(content, None);
+    }
+
+    #[test]
+    fn missing_tool_call_id_is_synthesized() {
+        let mut acc = StreamAccumulator::new();
+
+        feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+        );
+
+        let Message::Assistant { tool_calls, .. } = acc.into_message() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_0");
+        assert_eq!(tool_calls[0].function.name, "bash");
     }
 
     fn gate_chunk(thinking: Option<&str>, text: Option<&str>) -> ChunkTokens {
