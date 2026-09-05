@@ -58,7 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
-    let tty = std::io::stdout().is_terminal();
+    let out_tty = std::io::stdout().is_terminal();
+    let err_tty = std::io::stderr().is_terminal();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut line = String::new();
 
@@ -74,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let mut renderer = Renderer::new(tty, std::io::stdout(), std::io::stderr());
+        let mut renderer = Renderer::new(out_tty, err_tty, std::io::stdout(), std::io::stderr());
         match agent.chat(&input, &mut |event| renderer.on_event(event)).await {
             Ok(_) => renderer.finish(),
             Err(error) => {

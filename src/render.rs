@@ -3,7 +3,8 @@ use std::io::Write;
 use crate::agent::{AgentEvent, AnswerGate, ThinkingMode};
 
 pub struct Renderer<W: Write, E: Write> {
-    tty: bool,
+    out_tty: bool,
+    err_tty: bool,
     out: W,
     err: E,
     gate: AnswerGate,
@@ -12,9 +13,10 @@ pub struct Renderer<W: Write, E: Write> {
 }
 
 impl<W: Write, E: Write> Renderer<W, E> {
-    pub fn new(tty: bool, out: W, err: E) -> Renderer<W, E> {
+    pub fn new(out_tty: bool, err_tty: bool, out: W, err: E) -> Renderer<W, E> {
         Renderer {
-            tty,
+            out_tty,
+            err_tty,
             out,
             err,
             gate: AnswerGate::new(),
@@ -86,7 +88,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = write!(
             self.err,
             "{}",
-            if self.tty { "\x1b[2m<thinking>\n" } else { "<thinking>\n" }
+            if self.err_tty { "\x1b[2m<thinking>\n" } else { "<thinking>\n" }
         );
     }
 
@@ -98,7 +100,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = write!(
             self.err,
             "{}",
-            if self.tty { "\x1b[0m</thinking>\n" } else { "</thinking>\n" }
+            if self.err_tty { "\x1b[0m</thinking>\n" } else { "</thinking>\n" }
         );
     }
 
@@ -107,7 +109,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = write!(
             self.out,
             "{}",
-            if self.tty { "\x1b[2m<output>\n" } else { "<output>\n" }
+            if self.out_tty { "\x1b[2m<output>\n" } else { "<output>\n" }
         );
     }
 
@@ -119,7 +121,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = write!(
             self.out,
             "{}",
-            if self.tty { "\x1b[0m</output>\n" } else { "</output>\n" }
+            if self.out_tty { "\x1b[0m</output>\n" } else { "</output>\n" }
         );
     }
 }
@@ -129,10 +131,10 @@ mod test {
     use super::*;
     use crate::agent::ChunkTokens;
 
-    fn render(tty: bool, events: Vec<AgentEvent>) -> (String, String) {
+    fn render(out_tty: bool, err_tty: bool, events: Vec<AgentEvent>) -> (String, String) {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let mut renderer = Renderer::new(tty, &mut out, &mut err);
+        let mut renderer = Renderer::new(out_tty, err_tty, &mut out, &mut err);
         for event in events {
             renderer.on_event(event);
         }
@@ -161,6 +163,7 @@ mod test {
     fn thinking_goes_to_err_between_tags() {
         let (out, err) = render(
             false,
+            false,
             vec![thinking("Let me think. "), text("42")],
         );
 
@@ -171,6 +174,7 @@ mod test {
     #[test]
     fn output_block_closes_when_the_next_tool_starts() {
         let (out, err) = render(
+            false,
             false,
             vec![
                 AgentEvent::ToolStarted {
@@ -196,6 +200,7 @@ mod test {
     fn tool_event_closes_an_open_thinking_run() {
         let (out, err) = render(
             false,
+            false,
             vec![
                 thinking("thinking"),
                 AgentEvent::ToolStarted {
@@ -213,6 +218,7 @@ mod test {
     fn straggler_thinking_after_answer_is_hidden() {
         let (out, err) = render(
             false,
+            false,
             vec![
                 thinking("reasoning "),
                 text("answer"),
@@ -227,6 +233,7 @@ mod test {
     #[test]
     fn output_block_closes_when_thinking_resumes() {
         let (out, err) = render(
+            false,
             false,
             vec![
                 AgentEvent::ToolStarted {
@@ -245,6 +252,7 @@ mod test {
     #[test]
     fn thinking_is_live_again_on_the_next_completion() {
         let (out, err) = render(
+            false,
             false,
             vec![
                 thinking("first round "),
@@ -266,6 +274,7 @@ mod test {
     fn buffered_text_flushes_at_the_completion_boundary() {
         let (out, err) = render(
             false,
+            false,
             vec![
                 AgentEvent::Tokens(ChunkTokens {
                     thinking: Some("glued".into()),
@@ -284,8 +293,27 @@ mod test {
     }
 
     #[test]
+    fn dim_codes_follow_each_stream_independently() {
+        let (out, err) = render(
+            false,
+            true,
+            vec![
+                AgentEvent::ToolStarted {
+                    header: "bash".into(),
+                    body: Some("ls".into()),
+                },
+                thinking("think"),
+                text("done"),
+            ],
+        );
+
+        assert_eq!(out, "<output>\nbash\nls\n</output>\ndone\n");
+        assert_eq!(err, "\x1b[2m<thinking>\nthink\x1b[0m</thinking>\n");
+    }
+
+    #[test]
     fn tty_wraps_scopes_in_dim() {
-        let (out, err) = render(true, vec![thinking("think"), text("done")]);
+        let (out, err) = render(true, true, vec![thinking("think"), text("done")]);
 
         assert_eq!(err, "\x1b[2m<thinking>\nthink\x1b[0m</thinking>\n");
         assert_eq!(out, "done\n");
