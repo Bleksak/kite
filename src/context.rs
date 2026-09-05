@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use openai_oxide::types::chat::ChatCompletionMessageParam;
 
 use crate::message::Message;
@@ -24,15 +26,15 @@ impl Context {
     }
 
     pub fn build_messages(&self) -> Vec<ChatCompletionMessageParam> {
-        std::iter::once(Message::System {
+        std::iter::once(Cow::Owned(Message::System {
             content: self.system_prompt.clone(),
-        })
+        }))
         .chain(self.pruned_messages())
         .map(|message| message.to_request())
         .collect()
     }
 
-    fn pruned_messages(&self) -> Vec<Message> {
+    fn pruned_messages(&self) -> Vec<Cow<'_, Message>> {
         let in_progress = match self.messages.last() {
             Some(Message::Assistant { tool_calls, .. }) => !tool_calls.is_empty(),
             Some(Message::Tool { .. }) => true,
@@ -56,15 +58,17 @@ impl Context {
                     if !tool_calls.is_empty() && index < keep_from =>
                 {
                     match content {
-                        Some(text) if !text.is_empty() => Some(Message::Assistant {
-                            content: Some(text.clone()),
-                            tool_calls: vec![],
-                        }),
+                        Some(text) if !text.is_empty() => Some(Cow::Owned(
+                            Message::Assistant {
+                                content: Some(text.clone()),
+                                tool_calls: vec![],
+                            },
+                        )),
                         _ => None,
                     }
                 }
                 Message::Tool { .. } if index < keep_from => None,
-                _ => Some(message.clone()),
+                _ => Some(Cow::Borrowed(message)),
             })
             .collect()
     }
