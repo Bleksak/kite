@@ -3,6 +3,7 @@ mod context;
 mod message;
 mod render;
 mod tool;
+mod tui;
 
 use std::io::{IsTerminal, Write};
 
@@ -30,6 +31,9 @@ struct Cli {
 
     #[arg(long, default_value_t = 300)]
     bash_timeout: u64,
+
+    #[arg(long, value_enum)]
+    ui: Option<Ui>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
@@ -37,6 +41,12 @@ enum Thinking {
     Auto,
     On,
     Off,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Ui {
+    Plain,
+    Tui,
 }
 
 #[tokio::main]
@@ -58,6 +68,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
+    let use_tui = match cli.ui {
+        Some(Ui::Tui) => true,
+        Some(Ui::Plain) => false,
+        None => std::io::stdin().is_terminal(),
+    };
+
+    if use_tui {
+        let model = agent.model.clone();
+        tui::run(agent, model).await
+    } else {
+        run_plain(agent).await
+    }
+}
+
+async fn run_plain(mut agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     let out_tty = std::io::stdout().is_terminal();
     let err_tty = std::io::stderr().is_terminal();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
