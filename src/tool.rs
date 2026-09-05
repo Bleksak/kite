@@ -11,11 +11,11 @@ pub enum ToolError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error("{tool} exited with {status}\n{stderr}")]
+    #[error("{tool} exited with {status}\n{output}")]
     NonZeroExit {
         tool: &'static str,
         status: i32,
-        stderr: String,
+        output: String,
     },
 
     #[error("expected exactly one occurrence of old content in {path}, found {occurrences}")]
@@ -107,10 +107,18 @@ impl Tool {
                     .map_err(ToolError::Io)?;
 
                 if !output.status.success() {
+                    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                    if !stderr.is_empty() {
+                        if !combined.is_empty() {
+                            combined.push('\n');
+                        }
+                        combined.push_str(&stderr);
+                    }
                     return Err(ToolError::NonZeroExit {
                         tool: self.label(),
                         status: output.status.code().unwrap_or(-1),
-                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                        output: combined,
                     });
                 }
 
@@ -507,17 +515,40 @@ version: 3"#,
     }
 
     #[tokio::test]
+    async fn bash_stdout_is_kept_on_failure() {
+        let tool = Tool::Bash(r#"echo "failure detail"; exit 1"#.into());
+
+        let error = tool.invoke().await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("bash exited with 1"));
+        assert!(message.contains("failure detail"));
+    }
+
+    #[tokio::test]
+    async fn bash_failure_combines_stdout_and_stderr() {
+        let tool = Tool::Bash(r#"echo "out-line"; echo "err-line" 1>&2; exit 1"#.into());
+
+        let error = tool.invoke().await.unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("out-line"));
+        assert!(message.contains("err-line"));
+    }
+
+    #[tokio::test]
     async fn bash_missing_command_is_error_127() {
         let error = Tool::Bash("definitely-not-a-command".into())
-            .invoke().await
+            .invoke()
+            .await
             .unwrap_err();
 
-        let ToolError::NonZeroExit { status, stderr, .. } = error else {
+        let ToolError::NonZeroExit { status, output, .. } = error else {
             panic!("expected NonZeroExit, got {error:?}");
         };
 
         assert_eq!(status, 127);
-        assert!(stderr.contains("not found"));
+        assert!(output.contains("not found"));
     }
 
     #[tokio::test]
