@@ -79,7 +79,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = write!(
             self.err,
             "{}",
-            if self.tty { "\x1b[2m<thinking>" } else { "<thinking>" }
+            if self.tty { "\x1b[2m<thinking>\n" } else { "<thinking>\n" }
         );
     }
 
@@ -157,7 +157,7 @@ mod test {
             vec![thinking("Let me think. "), text("42")],
         );
 
-        assert_eq!(err, "<thinking>Let me think. </thinking>\n");
+        assert_eq!(err, "<thinking>\nLet me think. </thinking>\n");
         assert_eq!(out, "42\n");
     }
 
@@ -198,7 +198,7 @@ mod test {
             ],
         );
 
-        assert_eq!(err, "<thinking>thinking</thinking>\n");
+        assert_eq!(err, "<thinking>\nthinking</thinking>\n");
         assert_eq!(out, "<output>\nbash\nls\n</output>\n\n");
     }
 
@@ -213,7 +213,7 @@ mod test {
             ],
         );
 
-        assert_eq!(err, "<thinking>reasoning </thinking>\n");
+        assert_eq!(err, "<thinking>\nreasoning </thinking>\n");
         assert_eq!(out, "answer\n");
     }
 
@@ -232,14 +232,14 @@ mod test {
         );
 
         assert_eq!(out, "<output>\nwrite_file: a.txt\ncontent\n</output>\nanswer\n");
-        assert_eq!(err, "<thinking>next turn thinking</thinking>\n");
+        assert_eq!(err, "<thinking>\nnext turn thinking</thinking>\n");
     }
 
     #[test]
     fn tty_wraps_scopes_in_dim() {
         let (out, err) = render(true, vec![thinking("think"), text("done")]);
 
-        assert_eq!(err, "\x1b[2m<thinking>think\x1b[0m</thinking>\n");
+        assert_eq!(err, "\x1b[2m<thinking>\nthink\x1b[0m</thinking>\n");
         assert_eq!(out, "done\n");
     }
 }
