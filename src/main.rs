@@ -1,12 +1,14 @@
 mod agent;
 mod context;
 mod message;
+mod render;
 mod tool;
 
 use std::io::{IsTerminal, Write};
 
-use agent::{Agent, AgentEvent, AnswerGate, ThinkingMode};
+use agent::Agent;
 use openai_oxide::client::OpenAI;
+use render::Renderer;
 use tokio::io::AsyncBufReadExt;
 
 const SYSTEM_PROMPT: &str = "You are a coding agent. Use the tools to accomplish tasks.";
@@ -46,74 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let mut gate = AnswerGate::new();
-        let mut thinking_open = false;
-        match agent
-            .chat(
-                &input,
-                &mut |event: AgentEvent| match event {
-                    AgentEvent::Tokens(chunk) => {
-                        let (mode, text) = gate.on_chunk(&chunk);
-
-                        if mode == ThinkingMode::Live
-                            && let Some(t) = &chunk.thinking
-                        {
-                            if !thinking_open {
-                                eprint!("{}", if tty { "\x1b[2m" } else { "[thinking] " });
-                                thinking_open = true;
-                            }
-                            eprint!("{t}");
-                            let _ = std::io::stderr().flush();
-                        }
-
-                        if let Some(text) = text {
-                            if thinking_open {
-                                eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
-                                thinking_open = false;
-                            }
-                            print!("{text}");
-                            let _ = std::io::stdout().flush();
-                        }
-                    }
-                    AgentEvent::ToolStarted { header, body } => {
-                        if thinking_open {
-                            eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
-                            thinking_open = false;
-                        }
-                        print!(
-                            "{}",
-                            if tty {
-                                format!("\x1b[2m⚙ {header}\x1b[0m\n")
-                            } else {
-                                format!("[tool] {header}\n")
-                            }
-                        );
-                        if let Some(body) = body {
-                            print!("{body}\n");
-                        }
-                        let _ = std::io::stdout().flush();
-                    }
-                    AgentEvent::ToolResult(body) => {
-                        print!("{body}\n");
-                        let _ = std::io::stdout().flush();
-                    }
-                },
-            )
-            .await
-        {
-            Ok(_) => {
-                if let Some(remaining) = gate.finish() {
-                    if thinking_open {
-                        eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
-                        thinking_open = false;
-                    }
-                    print!("{remaining}");
-                }
-                if thinking_open {
-                    eprint!("{}", if tty { "\x1b[0m\n" } else { "\n" });
-                }
-                println!();
-            }
+        let mut renderer = Renderer::new(tty, std::io::stdout(), std::io::stderr());
+        match agent.chat(&input, &mut |event| renderer.on_event(event)).await {
+            Ok(_) => renderer.finish(),
             Err(error) => eprintln!("error: {error}"),
         }
     }
