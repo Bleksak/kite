@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use futures_util::StreamExt;
 use openai_oxide::client::OpenAI;
 use openai_oxide::error::OpenAIError;
@@ -248,6 +250,7 @@ pub struct Agent {
     pub model: String,
     pub context: Context,
     pub extra_body: Option<serde_json::Value>,
+    pub bash_timeout: Duration,
 }
 
 impl Agent {
@@ -256,12 +259,14 @@ impl Agent {
         model: impl Into<String>,
         system_prompt: impl Into<String>,
         max_tokens: u64,
+        bash_timeout: Duration,
     ) -> Agent {
         Agent {
             client,
             model: model.into(),
             context: Context::new(system_prompt, max_tokens),
             extra_body: None,
+            bash_timeout,
         }
     }
 
@@ -335,7 +340,7 @@ impl Agent {
                         body,
                     });
 
-                    let content = match tool.invoke().await {
+                    let content = match tool.invoke(self.bash_timeout).await {
                         Ok(output) => output,
                         Err(error) => error.to_string(),
                     };
@@ -416,7 +421,7 @@ mod test {
     }
 
     fn agent() -> Agent {
-        Agent::new(OpenAI::new("test-key"), "test-model", "be concise", 10000)
+        Agent::new(OpenAI::new("test-key"), "test-model", "be concise", 10000, Duration::from_secs(30))
     }
 
     async fn run_tool_call(

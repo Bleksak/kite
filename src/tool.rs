@@ -1,3 +1,7 @@
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use openai_oxide::types::chat::{
@@ -16,6 +20,12 @@ pub enum ToolError {
         tool: &'static str,
         status: i32,
         output: String,
+    },
+
+    #[error("{tool} timed out after {seconds}s")]
+    TimedOut {
+        tool: &'static str,
+        seconds: u64,
     },
 
     #[error("expected exactly one occurrence of old content in {path}, found {occurrences}")]
@@ -44,6 +54,19 @@ pub enum ToolOutput {
     Before(String),
     After,
     Hidden,
+}
+
+const OUTPUT_LIMIT: usize = 10_000;
+
+fn cap_output(text: String) -> String {
+    if text.len() <= OUTPUT_LIMIT {
+        return text;
+    }
+    let mut start = text.len() - OUTPUT_LIMIT;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[truncated {start} bytes]\n{}", &text[start..])
 }
 
 impl Tool {
@@ -96,19 +119,49 @@ impl Tool {
         }
     }
 
-    pub async fn invoke(&self) -> Result<String, ToolError> {
+    pub async fn invoke(&self, timeout: Duration) -> Result<String, ToolError> {
         match &self {
             Tool::Bash(script) => {
-                let output = Command::new("bash")
+                let mut child = Command::new("bash")
                     .arg("-c")
                     .arg(script)
-                    .output()
-                    .await
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
                     .map_err(ToolError::Io)?;
 
-                if !output.status.success() {
-                    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-                    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let collected = tokio::time::timeout(timeout, async {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    if let Some(mut out) = child.stdout.take() {
+                        out.read_to_end(&mut stdout).await.map_err(ToolError::Io)?;
+                    }
+                    if let Some(mut err) = child.stderr.take() {
+                        err.read_to_end(&mut stderr).await.map_err(ToolError::Io)?;
+                    }
+                    let status = child.wait().await.map_err(ToolError::Io)?;
+                    Ok::<(std::process::ExitStatus, Vec<u8>, Vec<u8>), ToolError>((
+                        status, stdout, stderr,
+                    ))
+                })
+                .await;
+
+                let (status, stdout, stderr) = match collected {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        return Err(ToolError::TimedOut {
+                            tool: self.label(),
+                            seconds: timeout.as_secs(),
+                        });
+                    }
+                };
+
+                if !status.success() {
+                    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
+                    let stderr = String::from_utf8_lossy(&stderr).into_owned();
                     if !stderr.is_empty() {
                         if !combined.is_empty() {
                             combined.push('\n');
@@ -117,12 +170,14 @@ impl Tool {
                     }
                     return Err(ToolError::NonZeroExit {
                         tool: self.label(),
-                        status: output.status.code().unwrap_or(-1),
-                        output: combined,
+                        status: status.code().unwrap_or(-1),
+                        output: cap_output(combined),
                     });
                 }
 
-                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+                Ok(cap_output(
+                    String::from_utf8_lossy(&stdout).into_owned(),
+                ))
             }
             Tool::ReadFile(file, start, end) => {
                 let contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
@@ -281,7 +336,12 @@ fn parameters(tool: &Tool) -> serde_json::Value {
 mod test {
     use crate::tool::{tool_definitions, Tool, ToolError};
     use openai_oxide::types::chat::{FunctionCall, ToolCall as OpenAIToolCall};
+    use std::time::Duration;
     use test_files::TestFiles;
+
+    fn timeout() -> Duration {
+        Duration::from_secs(30)
+    }
 
     fn call(name: &str, arguments: &str) -> OpenAIToolCall {
         OpenAIToolCall {
@@ -322,7 +382,7 @@ mod test {
 
         let tool = Tool::Bash(script.into());
 
-        let result = tool.invoke().await.unwrap();
+        let result = tool.invoke(timeout()).await.unwrap();
 
         assert_eq!(result, "hello world\n");
     }
@@ -337,7 +397,7 @@ mod test {
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
 
-        let result = tool.invoke().await.unwrap();
+        let result = tool.invoke(timeout()).await.unwrap();
 
         assert_eq!(result, "hello world");
     }
@@ -350,7 +410,7 @@ mod test {
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
 
-        assert_eq!(tool.invoke().await.unwrap(), "one\ntwo\nthree");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "one\ntwo\nthree");
     }
 
     #[tokio::test]
@@ -361,7 +421,7 @@ mod test {
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(2), None);
 
-        assert_eq!(tool.invoke().await.unwrap(), "two\nthree");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "two\nthree");
     }
 
     #[tokio::test]
@@ -372,7 +432,7 @@ mod test {
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(2), Some(3));
 
-        assert_eq!(tool.invoke().await.unwrap(), "two\nthree");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "two\nthree");
     }
 
     #[tokio::test]
@@ -383,7 +443,7 @@ mod test {
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(1), Some(1));
 
-        assert_eq!(tool.invoke().await.unwrap(), "one");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "one");
     }
 
     #[tokio::test]
@@ -394,7 +454,7 @@ mod test {
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(2), Some(10));
 
-        assert_eq!(tool.invoke().await.unwrap(), "two\nthree");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "two\nthree");
     }
 
     #[tokio::test]
@@ -405,7 +465,7 @@ mod test {
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(99), None);
 
-        assert_eq!(tool.invoke().await.unwrap(), "");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "");
     }
 
     #[tokio::test]
@@ -416,7 +476,7 @@ mod test {
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(5), Some(2));
 
-        assert_eq!(tool.invoke().await.unwrap(), "");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "");
     }
 
     #[tokio::test]
@@ -428,7 +488,7 @@ mod test {
 
         let tool = Tool::WriteFile(file.to_string_lossy().into(), "hello world".into());
 
-        let result = tool.invoke().await.unwrap();
+        let result = tool.invoke(timeout()).await.unwrap();
 
         assert_eq!(result, "");
         assert!(file.exists());
@@ -453,7 +513,7 @@ version: 3"#,
             "test".into(),
         );
 
-        let result = tool.invoke().await.unwrap();
+        let result = tool.invoke(timeout()).await.unwrap();
 
         assert_eq!(result, "");
         assert!(file.exists());
@@ -468,7 +528,7 @@ version: 3"#,
 
         let tool = Tool::EditFile(file.to_string_lossy().into(), "a".into(), "c".into());
 
-        let result = tool.invoke().await.unwrap_err();
+        let result = tool.invoke(timeout()).await.unwrap_err();
 
         assert!(matches!(
             result,
@@ -485,7 +545,7 @@ version: 3"#,
 
         let tool = Tool::EditFile(file.to_string_lossy().into(), "nope".into(), "x".into());
 
-        let result = tool.invoke().await.unwrap_err();
+        let result = tool.invoke(timeout()).await.unwrap_err();
 
         assert!(matches!(
             result,
@@ -498,7 +558,7 @@ version: 3"#,
     async fn bash_nonzero_exit_is_error() {
         let tool = Tool::Bash("exit 3".into());
 
-        let result = tool.invoke().await.unwrap_err();
+        let result = tool.invoke(timeout()).await.unwrap_err();
 
         assert!(matches!(result, ToolError::NonZeroExit { status: 3, .. }));
     }
@@ -507,7 +567,7 @@ version: 3"#,
     async fn bash_stderr_is_collected_in_error() {
         let tool = Tool::Bash(r#"echo "oops" 1>&2; exit 1"#.into());
 
-        let error = tool.invoke().await.unwrap_err();
+        let error = tool.invoke(timeout()).await.unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("bash exited with 1"));
@@ -518,7 +578,7 @@ version: 3"#,
     async fn bash_stdout_is_kept_on_failure() {
         let tool = Tool::Bash(r#"echo "failure detail"; exit 1"#.into());
 
-        let error = tool.invoke().await.unwrap_err();
+        let error = tool.invoke(timeout()).await.unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("bash exited with 1"));
@@ -529,7 +589,7 @@ version: 3"#,
     async fn bash_failure_combines_stdout_and_stderr() {
         let tool = Tool::Bash(r#"echo "out-line"; echo "err-line" 1>&2; exit 1"#.into());
 
-        let error = tool.invoke().await.unwrap_err();
+        let error = tool.invoke(timeout()).await.unwrap_err();
         let message = error.to_string();
 
         assert!(message.contains("out-line"));
@@ -537,9 +597,36 @@ version: 3"#,
     }
 
     #[tokio::test]
+    async fn bash_timeout_kills_the_child() {
+        let tool = Tool::Bash("sleep 5".into());
+
+        let error = tool
+            .invoke(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::TimedOut { tool: "bash", seconds: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn bash_output_is_capped_to_the_tail() {
+        let tool = Tool::Bash(r#"head -c 100000 /dev/zero | tr '\0' a"#.into());
+
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        assert!(result.starts_with("[truncated "));
+        assert!(result.contains("bytes]\n"));
+        assert!(result.len() < 11_000);
+        assert!(result.trim_end().ends_with('a'));
+    }
+
+    #[tokio::test]
     async fn bash_missing_command_is_error_127() {
         let error = Tool::Bash("definitely-not-a-command".into())
-            .invoke()
+            .invoke(timeout())
             .await
             .unwrap_err();
 
@@ -555,28 +642,28 @@ version: 3"#,
     async fn bash_empty_output_is_ok() {
         let tool = Tool::Bash("true".into());
 
-        assert_eq!(tool.invoke().await.unwrap(), "");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "");
     }
 
     #[tokio::test]
     async fn bash_stderr_on_success_is_ignored() {
         let tool = Tool::Bash(r#"echo "out"; echo "warn" 1>&2"#.into());
 
-        assert_eq!(tool.invoke().await.unwrap(), "out\n");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "out\n");
     }
 
     #[tokio::test]
     async fn bash_stdout_non_ascii_roundtrip() {
         let tool = Tool::Bash("printf 'héllo 🚀'".into());
 
-        assert_eq!(tool.invoke().await.unwrap(), "héllo 🚀");
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "héllo 🚀");
     }
 
     #[tokio::test]
     async fn read_file_missing_is_error() {
         let tool = Tool::ReadFile("/nonexistent/nope.txt".into(), None, None);
 
-        let error = tool.invoke().await.unwrap_err();
+        let error = tool.invoke(timeout()).await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -592,7 +679,7 @@ version: 3"#,
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
 
-        let error = tool.invoke().await.unwrap_err();
+        let error = tool.invoke(timeout()).await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -608,7 +695,7 @@ version: 3"#,
 
         let tool = Tool::WriteFile(file.to_string_lossy().into(), "new".into());
 
-        tool.invoke().await.unwrap();
+        tool.invoke(timeout()).await.unwrap();
         assert_eq!(std::fs::read_to_string(file).unwrap(), "new");
     }
 
@@ -620,7 +707,7 @@ version: 3"#,
 
         let tool = Tool::EditFile(file.to_string_lossy().into(), "hello ".into(), "".into());
 
-        tool.invoke().await.unwrap();
+        tool.invoke(timeout()).await.unwrap();
         assert_eq!(std::fs::read_to_string(file).unwrap(), "world");
     }
 
@@ -632,7 +719,7 @@ version: 3"#,
 
         let tool = Tool::EditFile(file.to_string_lossy().into(), "a.b".into(), "a_b".into());
 
-        tool.invoke().await.unwrap();
+        tool.invoke(timeout()).await.unwrap();
         assert_eq!(std::fs::read_to_string(file).unwrap(), "a_b and aXb");
     }
 
@@ -648,7 +735,7 @@ version: 3"#,
             "hej X".into(),
         );
 
-        tool.invoke().await.unwrap();
+        tool.invoke(timeout()).await.unwrap();
         assert_eq!(std::fs::read_to_string(file).unwrap(), "hej X\nline3");
     }
 

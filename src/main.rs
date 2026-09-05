@@ -28,7 +28,7 @@ struct Cli {
     #[arg(long, value_enum, default_value = "auto")]
     thinking: Thinking,
 
-    #[arg(long, default_value_t = 120)]
+    #[arg(long, default_value_t = 300)]
     bash_timeout: u64,
 }
 
@@ -44,7 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let client = OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(cli.api_url));
-    let mut agent = Agent::new(client, cli.model, SYSTEM_PROMPT, cli.context_window);
+    let mut agent = Agent::new(
+        client,
+        cli.model,
+        SYSTEM_PROMPT,
+        cli.context_window,
+        std::time::Duration::from_secs(cli.bash_timeout),
+    );
     if cli.thinking != Thinking::Auto {
         let enabled = matches!(cli.thinking, Thinking::On);
         agent = agent.with_extra_body(serde_json::json!({
