@@ -326,11 +326,6 @@ impl TuiState {
     }
 }
 
-fn clamp_scroll(state: &TuiState, viewport: u16) -> usize {
-    let len = state.renderer.scrollback().len();
-    state.scroll.min(len.saturating_sub(viewport as usize))
-}
-
 pub fn draw(frame: &mut Frame, state: &TuiState) {
     let area = frame.area();
     let chunks = Layout::new(
@@ -351,9 +346,11 @@ pub fn draw(frame: &mut Frame, state: &TuiState) {
         chunks[0],
     );
 
-    let main = Paragraph::new(state.renderer.scrollback())
+    let scrollback = state.renderer.scrollback();
+    let viewport = chunks[1].height as usize;
+    let start = state.scroll.min(scrollback.len().saturating_sub(viewport));
+    let main = Paragraph::new(&scrollback[start..])
         .wrap(Wrap { trim: true })
-        .scroll((clamp_scroll(state, chunks[1].height) as u16, 0))
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(main, chunks[1]);
 
