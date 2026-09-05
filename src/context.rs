@@ -52,10 +52,16 @@ impl Context {
             .iter()
             .enumerate()
             .filter_map(|(index, message)| match message {
-                Message::Assistant { tool_calls, .. }
+                Message::Assistant { content, tool_calls }
                     if !tool_calls.is_empty() && index < keep_from =>
                 {
-                    None
+                    match content {
+                        Some(text) if !text.is_empty() => Some(Message::Assistant {
+                            content: Some(text.clone()),
+                            tool_calls: vec![],
+                        }),
+                        _ => None,
+                    }
                 }
                 Message::Tool { .. } if index < keep_from => None,
                 _ => Some(message.clone()),
@@ -201,6 +207,7 @@ mod test {
             vec![
                 r#"{"role":"system","content":"be concise"}"#,
                 r#"{"role":"user","content":"make it blue"}"#,
+                r#"{"role":"assistant","content":"let me check"}"#,
                 r#"{"role":"assistant","content":"made it blue"}"#,
                 r#"{"role":"user","content":"now green"}"#,
                 r#"{"role":"assistant","content":"made it green"}"#,
