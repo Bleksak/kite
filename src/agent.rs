@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use futures_util::StreamExt;
 use openai_oxide::client::OpenAI;
 use openai_oxide::error::OpenAIError;
@@ -334,9 +335,32 @@ impl Agent {
             tool_calls: tool_calls.clone(),
         });
 
-        for call in tool_calls {
-            let tool_call_id = call.id.clone();
-            let content = match Tool::try_from(call) {
+        let mut index = 0;
+        while index < tool_calls.len() {
+            let mut end = index;
+            while end < tool_calls.len()
+                && tool_calls[end].function.name == "read_file"
+            {
+                end += 1;
+            }
+            if end == index {
+                end = index + 1;
+            }
+            self.run_tools(&tool_calls[index..end], on_event).await;
+            index = end;
+        }
+
+        Step::Continue
+    }
+
+    async fn run_tools(
+        &mut self,
+        calls: &[ToolCall],
+        on_event: &mut impl FnMut(AgentEvent),
+    ) {
+        let mut slots: Vec<Result<(Tool, bool), String>> = Vec::new();
+        for call in calls {
+            match Tool::try_from(call.clone()) {
                 Ok(tool) => {
                     let (header, output) = (tool.header(), tool.output());
                     let (body, show_result) = match &output {
@@ -348,27 +372,38 @@ impl Agent {
                         header,
                         body,
                     });
+                    slots.push(Ok((tool, show_result)));
+                }
+                Err(error) => slots.push(Err(error.to_string())),
+            }
+        }
 
-                    let content = match tool.invoke(self.bash_timeout).await {
+        let futures: Vec<_> = slots
+            .iter()
+            .filter_map(|slot| slot.as_ref().ok().map(|(tool, _)| tool.invoke(self.bash_timeout)))
+            .collect();
+        let outputs = join_all(futures).await;
+
+        let mut outputs = outputs.into_iter();
+        for (call, slot) in calls.iter().zip(slots) {
+            let content = match slot {
+                Ok((_, show_result)) => {
+                    let content = match outputs.next().unwrap() {
                         Ok(output) => output,
                         Err(error) => error.to_string(),
                     };
-
                     if show_result {
                         on_event(AgentEvent::ToolResult(content.clone()));
                     }
-
                     content
                 }
-                Err(error) => error.to_string(),
+                Err(error) => error,
             };
             self.context.messages.push(Message::Tool {
-                tool_call_id,
+                tool_call_id: call.id.clone(),
                 content,
             });
         }
-
-        Step::Continue
     }
 
     fn build_request(&self) -> ChatCompletionRequest {
@@ -451,6 +486,22 @@ mod test {
             .await
     }
 
+    async fn run_tool_calls(
+        agent: &mut Agent,
+        calls: Vec<ToolCall>,
+        events: &mut Vec<AgentEvent>,
+    ) -> Step {
+        agent
+            .handle_response(
+                Message::Assistant {
+                    content: None,
+                    tool_calls: calls,
+                },
+                &mut |event| events.push(event),
+            )
+            .await
+    }
+
     async fn finish(agent: &mut Agent, text: &str, events: &mut Vec<AgentEvent>) -> Step {
         agent
             .handle_response(
@@ -522,6 +573,64 @@ mod test {
         };
         assert!(content.contains("invalid arguments for bash"));
         assert!(content.contains(r#"{"command":"ls""#));
+    }
+
+    #[tokio::test]
+    async fn mixed_round_runs_the_read_batch_in_order_with_the_write() {
+        let mut agent = agent();
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\n");
+        temp_dir.file("b.txt", "two\n");
+        let file_a = temp_dir.path().join("a.txt");
+        let file_b = temp_dir.path().join("b.txt");
+        let file_c = temp_dir.path().join("c.txt");
+
+        let step = run_tool_calls(
+            &mut agent,
+            vec![
+                tool_call("c1", "read_file", &format!("{{\"path\":\"{}\"}}", file_a.to_string_lossy())),
+                tool_call("c2", "read_file", &format!("{{\"path\":\"{}\"}}", file_b.to_string_lossy())),
+                tool_call("c3", "write_file", &format!("{{\"path\":\"{}\",\"content\":\"three\"}}", file_c.to_string_lossy())),
+            ],
+            &mut Vec::new(),
+        )
+        .await;
+
+        assert_eq!(step, Step::Continue);
+        assert_eq!(agent.history()[1], Message::Tool { tool_call_id: "c1".into(), content: "one".into() });
+        assert_eq!(agent.history()[2], Message::Tool { tool_call_id: "c2".into(), content: "two".into() });
+        assert_eq!(agent.history()[3], Message::Tool { tool_call_id: "c3".into(), content: format!("wrote 5 bytes to {}", file_c.to_string_lossy()) });
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_in_a_read_batch_keep_their_position() {
+        let mut agent = agent();
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\n");
+        let file = temp_dir.path().join("a.txt");
+
+        run_tool_calls(
+            &mut agent,
+            vec![
+                tool_call("c1", "read_file", r#"{"path":"a.txt","start":"not-a-number"}"#),
+                tool_call("c2", "read_file", &format!("{{\"path\":\"{}\"}}", file.to_string_lossy())),
+            ],
+            &mut Vec::new(),
+        )
+        .await;
+
+        let Message::Tool { tool_call_id, content } = &agent.history()[1] else {
+            panic!("expected tool message");
+        };
+        assert_eq!(tool_call_id, "c1");
+        assert!(content.contains("invalid arguments"));
+        assert_eq!(
+            agent.history()[2],
+            Message::Tool {
+                tool_call_id: "c2".into(),
+                content: "one".into(),
+            }
+        );
     }
 
     #[tokio::test]

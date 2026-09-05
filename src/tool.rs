@@ -119,6 +119,10 @@ impl Tool {
         }
     }
 
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Tool::ReadFile(..))
+    }
+
     pub async fn invoke(&self, timeout: Duration) -> Result<String, ToolError> {
         match &self {
             Tool::Bash(script) => {
