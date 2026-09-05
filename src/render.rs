@@ -31,6 +31,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
                 self.close_thinking();
                 if let Some(remaining) = self.gate.finish() {
                     let _ = writeln!(self.out, "{remaining}");
+                    let _ = self.out.flush();
                 }
                 self.gate = AnswerGate::new();
             }
@@ -44,11 +45,13 @@ impl<W: Write, E: Write> Renderer<W, E> {
                 {
                     self.open_thinking();
                     let _ = write!(self.err, "{text}");
+                    let _ = self.err.flush();
                 }
 
                 if let Some(text) = text {
                     self.close_thinking();
                     let _ = write!(self.out, "{text}");
+                    let _ = self.out.flush();
                 }
             }
             AgentEvent::ToolStarted { header, body } => {
@@ -59,15 +62,14 @@ impl<W: Write, E: Write> Renderer<W, E> {
                 if let Some(body) = body {
                     let _ = writeln!(self.out, "{body}");
                 }
+                let _ = self.out.flush();
             }
             AgentEvent::ToolResult(body) => {
                 let _ = writeln!(self.out, "{body}");
                 self.close_output();
+                let _ = self.out.flush();
             }
         }
-
-        let _ = self.out.flush();
-        let _ = self.err.flush();
     }
 
     pub fn finish(&mut self) {
@@ -90,6 +92,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
             "{}",
             if self.err_tty { "\x1b[2m<thinking>\n" } else { "<thinking>\n" }
         );
+        let _ = self.err.flush();
     }
 
     fn close_thinking(&mut self) {
@@ -102,6 +105,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
             "{}",
             if self.err_tty { "\x1b[0m</thinking>\n" } else { "</thinking>\n" }
         );
+        let _ = self.err.flush();
     }
 
     fn open_output(&mut self) {
@@ -111,6 +115,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
             "{}",
             if self.out_tty { "\x1b[2m<output>\n" } else { "<output>\n" }
         );
+        let _ = self.out.flush();
     }
 
     fn close_output(&mut self) {
@@ -123,6 +128,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
             "{}",
             if self.out_tty { "\x1b[0m</output>\n" } else { "</output>\n" }
         );
+        let _ = self.out.flush();
     }
 }
 
