@@ -110,7 +110,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = write!(
             self.err,
             "{}",
-            if self.err_tty { "\x1b[0m</thinking>\n" } else { "</thinking>\n" }
+            if self.err_tty { "</thinking>\x1b[0m\n" } else { "</thinking>\n" }
         );
         let _ = self.err.flush();
     }
@@ -135,7 +135,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
         let _ = write!(
             self.out,
             "{}",
-            if self.out_tty { "\x1b[0m</output>\n" } else { "</output>\n" }
+            if self.out_tty { "</output>\x1b[0m\n" } else { "</output>\n" }
         );
         let _ = self.out.flush();
     }
@@ -326,7 +326,7 @@ mod test {
         );
 
         assert_eq!(out, "<output>\nbash\nls\n</output>\ndone\n");
-        assert_eq!(err, "\x1b[2m<thinking>\nthink\x1b[0m</thinking>\n");
+        assert_eq!(err, "\x1b[2m<thinking>\nthink</thinking>\x1b[0m\n");
     }
 
     #[test]
@@ -365,7 +365,7 @@ mod test {
     fn tty_wraps_scopes_in_dim() {
         let (out, err) = render(true, true, vec![thinking("think"), text("done")]);
 
-        assert_eq!(err, "\x1b[2m<thinking>\nthink\x1b[0m</thinking>\n");
+        assert_eq!(err, "\x1b[2m<thinking>\nthink</thinking>\x1b[0m\n");
         assert_eq!(out, "done\n");
     }
 }
