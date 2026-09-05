@@ -11,6 +11,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
+use tui_markdown;
+
 use crate::agent::{Agent, AgentEvent, AnswerGate, ThinkingMode};
 
 pub enum TuiEvent {
@@ -24,6 +26,8 @@ pub struct TuiRenderer {
     scrollback: Vec<Line<'static>>,
     thinking: String,
     answer: String,
+    turn_answer: String,
+    answer_start: Option<usize>,
     tool_header: Option<String>,
 }
 
@@ -34,6 +38,8 @@ impl TuiRenderer {
             scrollback: Vec::new(),
             thinking: String::new(),
             answer: String::new(),
+            turn_answer: String::new(),
+            answer_start: None,
             tool_header: None,
         }
     }
@@ -61,8 +67,10 @@ impl TuiRenderer {
                 self.close_thinking();
                 if let Some(remaining) = self.gate.finish() {
                     self.push_answer_text(&remaining);
-                    self.flush_answer();
+                    self.turn_answer.push_str(&remaining);
                 }
+                self.flush_answer();
+                self.render_answer_markdown();
                 self.gate = AnswerGate::new();
             }
             AgentEvent::Tokens(chunk) => {
@@ -76,6 +84,7 @@ impl TuiRenderer {
                 if let Some(text) = text {
                     self.close_thinking();
                     self.push_answer_text(&text);
+                    self.turn_answer.push_str(&text);
                 }
             }
             AgentEvent::ToolStarted { header, body } => {
@@ -106,8 +115,10 @@ impl TuiRenderer {
         self.tool_header = None;
         if let Some(remaining) = self.gate.finish() {
             self.push_answer_text(&remaining);
+            self.turn_answer.push_str(&remaining);
         }
         self.flush_answer();
+        self.render_answer_markdown();
     }
 
     fn close_thinking(&mut self) {
@@ -131,6 +142,7 @@ impl TuiRenderer {
         while let Some(index) = self.answer.find('\n') {
             let line = self.answer[..index].to_string();
             self.answer.drain(..=index);
+            self.mark_answer_start();
             if line.is_empty() {
                 self.scrollback.push(Line::default());
             } else {
@@ -144,7 +156,48 @@ impl TuiRenderer {
             return;
         }
         let line = mem::take(&mut self.answer);
+        self.mark_answer_start();
         self.scrollback.push(Line::from(line));
+    }
+
+    fn mark_answer_start(&mut self) {
+        if self.answer_start.is_none() {
+            self.answer_start = Some(self.scrollback.len());
+        }
+    }
+
+    fn render_answer_markdown(&mut self) {
+        if self.turn_answer.trim().is_empty() {
+            return;
+        }
+        let Some(start) = self.answer_start else {
+            return;
+        };
+        if !has_markdown(&self.turn_answer) {
+            self.turn_answer.clear();
+            self.answer_start = None;
+            return;
+        }
+        let rendered = tui_markdown::from_str(&self.turn_answer);
+        let lines: Vec<Line<'static>> = rendered
+            .lines
+            .iter()
+            .map(|line| Line {
+                style: line.style,
+                alignment: line.alignment,
+                spans: line
+                    .spans
+                    .iter()
+                    .map(|span| Span {
+                        content: std::borrow::Cow::Owned(span.content.to_string()),
+                        style: span.style,
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.scrollback.splice(start.., lines);
+        self.turn_answer.clear();
+        self.answer_start = None;
     }
 
     fn push_indented(&mut self, body: &str) {
@@ -157,6 +210,11 @@ impl TuiRenderer {
             }
         }
     }
+}
+
+fn has_markdown(text: &str) -> bool {
+    const MARKERS: [&str; 7] = ["**", "`", "# ", "```", "- ", "[", "> "];
+    MARKERS.iter().any(|marker| text.contains(marker))
 }
 
 pub struct TuiState {
@@ -746,6 +804,76 @@ mod test {
             ),
             KeyAction::Quit
         );
+    }
+
+    #[test]
+    fn markdown_answer_renders_styled_lines_at_the_boundary() {
+        let rendered = lines(vec![
+            text("Some **bold** text"),
+            AgentEvent::CompletionStarted,
+        ]);
+
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].spans.len(), 3);
+        assert_eq!(rendered[0].spans[1].content, "bold");
+        assert!(rendered[0].spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn markdown_heading_and_paragraph_render_styled() {
+        let rendered = lines(vec![
+            text("# Head\n\n**Bold**"),
+            AgentEvent::CompletionStarted,
+        ]);
+
+        assert_eq!(rendered.len(), 3);
+        assert!(rendered[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(rendered[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(rendered[2].spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn thinking_is_not_markdown_rendered() {
+        let described = describe(&lines(vec![thinking("**not** rendered"), text("done")]));
+
+        assert_eq!(
+            described,
+            vec![
+                ("**not** rendered".into(), Modifier::DIM),
+                ("done".into(), Modifier::empty()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_output_is_not_markdown_rendered() {
+        let described = describe(&lines(vec![AgentEvent::ToolStarted {
+            header: "bash".into(),
+            body: Some("**cmd**".into()),
+        }]));
+
+        assert_eq!(
+            described,
+            vec![
+                ("⚙ bash".into(), Modifier::BOLD),
+                ("  **cmd**".into(), Modifier::DIM),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_completion_renders_its_own_answer() {
+        let rendered = lines(vec![
+            text("first **a**"),
+            AgentEvent::CompletionStarted,
+            text("second **b**"),
+        ]);
+
+        assert_eq!(rendered.len(), 2);
+        assert!(rendered[0].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered[0].spans[1].content, "a");
+        assert!(rendered[1].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered[1].spans[1].content, "b");
     }
 
     #[test]
