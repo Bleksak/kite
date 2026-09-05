@@ -1,4 +1,5 @@
 use std::mem;
+use std::sync::LazyLock;
 
 use crossterm::cursor;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyModifiers};
@@ -11,7 +12,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-use tui_markdown;
+use tui_markdown::{from_str_with_options, Options, StyleSheet};
+
+#[derive(Clone)]
+struct TuiStyleSheet;
+
+impl StyleSheet for TuiStyleSheet {
+    fn code_block_fence(&self) -> &str {
+        ""
+    }
+}
+
+static MD_OPTIONS: LazyLock<Options<TuiStyleSheet>> = LazyLock::new(|| Options::new(TuiStyleSheet));
 
 use crate::agent::{Agent, AgentEvent, AnswerGate, ThinkingMode};
 
@@ -178,7 +190,7 @@ impl TuiRenderer {
             self.answer_start = None;
             return;
         }
-        let rendered = tui_markdown::from_str(&self.turn_answer);
+        let rendered = from_str_with_options(&self.turn_answer, &MD_OPTIONS);
         let lines: Vec<Line<'static>> = rendered
             .lines
             .iter()
@@ -350,7 +362,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState) {
     let viewport = chunks[1].height as usize;
     let start = state.scroll.min(scrollback.len().saturating_sub(viewport));
     let main = Paragraph::new(&scrollback[start..])
-        .wrap(Wrap { trim: true })
+        .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(main, chunks[1]);
 
@@ -871,6 +883,31 @@ mod test {
         assert_eq!(rendered[0].spans[1].content, "a");
         assert!(rendered[1].spans[1].style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(rendered[1].spans[1].content, "b");
+    }
+
+    #[test]
+    fn code_block_renders_without_fences() {
+        let rendered = lines(vec![
+            text("```python\nx = 1\n```\n"),
+            AgentEvent::CompletionStarted,
+        ]);
+
+        for line in &rendered {
+            assert!(!line.to_string().contains("```"));
+        }
+    }
+
+    #[test]
+    fn code_block_gets_syntax_highlighting() {
+        let rendered = lines(vec![
+            text("```python\nx = 1\n```\n"),
+            AgentEvent::CompletionStarted,
+        ]);
+
+        let has_color = rendered
+            .iter()
+            .any(|line| line.spans.iter().any(|span| span.style.fg.is_some()));
+        assert!(has_color);
     }
 
     #[test]
