@@ -166,7 +166,11 @@ impl StreamAccumulator {
 
             if let Some(tool_calls) = choice.delta.tool_calls {
                 for call in tool_calls {
-                    let index = call.index as usize;
+                    let index = call.index;
+                    if index < 0 || index > 255 {
+                        continue;
+                    }
+                    let index = index as usize;
                     while self.tool_slots.len() <= index {
                         self.tool_slots.push(ToolSlot::default());
                     }
@@ -710,6 +714,30 @@ mod test {
         assert_eq!(tool_calls[0].id, "call_1");
         assert_eq!(tool_calls[0].function.name, "bash");
         assert_eq!(tool_calls[0].function.arguments, r#"{"command":"echo hi"}"#);
+    }
+
+    #[test]
+    fn out_of_range_tool_call_indices_are_dropped() {
+        let mut acc = StreamAccumulator::new();
+
+        feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":-1,"id":"call_bad","function":{"name":"bash","arguments":"{\"command\":\"x\"}"}}]}}]}"#,
+        );
+        feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":256,"id":"call_big","function":{"name":"bash","arguments":"{\"command\":\"x\"}"}}]}}]}"#,
+        );
+        feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ok","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+        );
+
+        let Message::Assistant { tool_calls, .. } = acc.into_message() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_ok");
     }
 
     #[test]
