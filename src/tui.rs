@@ -23,6 +23,7 @@ pub struct TuiRenderer {
     gate: AnswerGate,
     scrollback: Vec<Line<'static>>,
     thinking: String,
+    answer: String,
     tool_header: Option<String>,
 }
 
@@ -32,6 +33,7 @@ impl TuiRenderer {
             gate: AnswerGate::new(),
             scrollback: Vec::new(),
             thinking: String::new(),
+            answer: String::new(),
             tool_header: None,
         }
     }
@@ -40,12 +42,26 @@ impl TuiRenderer {
         &self.scrollback
     }
 
+    pub fn push_user(&mut self, text: &str) {
+        self.close_thinking();
+        self.tool_header = None;
+        for line in text.split('\n') {
+            if line.is_empty() {
+                self.scrollback.push(Line::default());
+            } else {
+                self.scrollback
+                    .push(Line::from(Span::styled(line.to_string(), Style::default().bold())));
+            }
+        }
+    }
+
     pub fn on_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::CompletionStarted => {
                 self.close_thinking();
                 if let Some(remaining) = self.gate.finish() {
-                    self.push_lines(&remaining, Style::default());
+                    self.push_answer_text(&remaining);
+                    self.flush_answer();
                 }
                 self.gate = AnswerGate::new();
             }
@@ -59,10 +75,11 @@ impl TuiRenderer {
                 }
                 if let Some(text) = text {
                     self.close_thinking();
-                    self.push_lines(&text, Style::default());
+                    self.push_answer_text(&text);
                 }
             }
             AgentEvent::ToolStarted { header, body } => {
+                self.flush_answer();
                 self.close_thinking();
                 self.tool_header = Some(header.clone());
                 self.scrollback
@@ -72,6 +89,7 @@ impl TuiRenderer {
                 }
             }
             AgentEvent::ToolResult { header, body } => {
+                self.flush_answer();
                 if self.tool_header.as_deref() != Some(header.as_str()) {
                     self.tool_header = Some(header.clone());
                     self.scrollback
@@ -87,16 +105,46 @@ impl TuiRenderer {
         self.close_thinking();
         self.tool_header = None;
         if let Some(remaining) = self.gate.finish() {
-            self.push_lines(&remaining, Style::default());
+            self.push_answer_text(&remaining);
         }
+        self.flush_answer();
     }
 
     fn close_thinking(&mut self) {
         if self.thinking.is_empty() {
             return;
         }
+        self.flush_answer();
         let thinking = mem::take(&mut self.thinking);
-        self.push_lines(&thinking, Style::default().dim());
+        for line in thinking.split('\n') {
+            if line.is_empty() {
+                self.scrollback.push(Line::default());
+            } else {
+                self.scrollback
+                    .push(Line::from(Span::styled(line.to_string(), Style::default().dim())));
+            }
+        }
+    }
+
+    fn push_answer_text(&mut self, text: &str) {
+        self.answer.push_str(text);
+        while let Some(index) = self.answer.find('\n') {
+            let line = self.answer[..index].to_string();
+            self.answer.drain(..=index);
+            if line.is_empty() {
+                self.scrollback.push(Line::default());
+            } else {
+                self.scrollback.push(Line::from(line));
+            }
+        }
+    }
+
+    fn flush_answer(&mut self) {
+        if self.answer.is_empty() {
+            return;
+        }
+        let line = mem::take(&mut self.answer);
+        self.scrollback.push(Line::from(line));
     }
 
     fn push_indented(&mut self, body: &str) {
@@ -109,21 +157,13 @@ impl TuiRenderer {
             }
         }
     }
-
-    fn push_lines(&mut self, text: &str, style: Style) {
-        for line in text.split('\n') {
-            if line.is_empty() {
-                self.scrollback.push(Line::default());
-            } else {
-                self.scrollback.push(Line::from(Span::styled(line.to_string(), style)));
-            }
-        }
-    }
 }
 
 pub struct TuiState {
     pub renderer: TuiRenderer,
     pub scroll: usize,
+    pub following: bool,
+    pub viewport: usize,
     pub input: String,
     pub running: bool,
     pub error: Option<String>,
@@ -137,6 +177,8 @@ impl TuiState {
         TuiState {
             renderer: TuiRenderer::new(),
             scroll: 0,
+            following: true,
+            viewport: 24,
             input: String::new(),
             running: false,
             error: None,
@@ -166,11 +208,11 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     if state.running {
         return match key.code {
             KeyCode::PageUp => {
-                state.scroll = (state.scroll + PAGE).min(state.renderer.scrollback().len());
+                page_up(state);
                 KeyAction::None
             }
             KeyCode::PageDown => {
-                state.scroll = state.scroll.saturating_sub(PAGE);
+                page_down(state);
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -181,6 +223,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             if state.input.is_empty() {
                 KeyAction::None
             } else {
+                state.following = true;
                 KeyAction::Submit(mem::take(&mut state.input))
             }
         }
@@ -189,11 +232,11 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             KeyAction::None
         }
         KeyCode::PageUp => {
-            state.scroll = (state.scroll + PAGE).min(state.renderer.scrollback().len());
+            page_up(state);
             KeyAction::None
         }
         KeyCode::PageDown => {
-            state.scroll = state.scroll.saturating_sub(PAGE);
+            page_down(state);
             KeyAction::None
         }
         KeyCode::Char(c) => {
@@ -206,6 +249,28 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         }
         _ => KeyAction::None,
     }
+}
+
+fn page_up(state: &mut TuiState) {
+    state.scroll = state.scroll.saturating_sub(PAGE);
+    state.following = false;
+}
+
+fn page_down(state: &mut TuiState) {
+    let max = state.max_scroll();
+    state.scroll = (state.scroll + PAGE).min(max);
+    state.following = state.scroll == max;
+}
+
+impl TuiState {
+    fn max_scroll(&self) -> usize {
+        self.renderer.scrollback().len().saturating_sub(self.viewport)
+    }
+}
+
+fn clamp_scroll(state: &TuiState, viewport: u16) -> usize {
+    let len = state.renderer.scrollback().len();
+    state.scroll.min(len.saturating_sub(viewport as usize))
 }
 
 pub fn draw(frame: &mut Frame, state: &TuiState) {
@@ -230,7 +295,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState) {
 
     let main = Paragraph::new(state.renderer.scrollback())
         .wrap(Wrap { trim: true })
-        .scroll((state.scroll as u16, 0))
+        .scroll((clamp_scroll(state, chunks[1].height) as u16, 0))
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(main, chunks[1]);
 
@@ -326,6 +391,9 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
                     }
                     None => break,
                 }
+                if state.following {
+                    state.scroll = state.max_scroll();
+                }
             }
             key = key_rx.recv() => {
                 let Some(term_event) = key else {
@@ -335,7 +403,9 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
                     KeyAction::Submit(task) => {
                         state.error = None;
                         state.running = true;
-                        state.scroll = 0;
+                        state.renderer.push_user(&task);
+                        state.following = true;
+                        state.scroll = state.max_scroll();
                         input_tx.send(task)?;
                     }
                     KeyAction::Quit => break,
@@ -343,6 +413,10 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
                 }
             }
         }
+        state.viewport = terminal
+            .size()
+            .map(|size| size.height.saturating_sub(6) as usize)
+            .unwrap_or(24);
         terminal.draw(|frame| draw(frame, &state))?;
     }
 
@@ -597,18 +671,60 @@ mod test {
     }
 
     #[test]
+    fn answer_chunks_flow_into_one_line() {
+        let described = describe(&lines(vec![text("Hello "), text("world")]));
+
+        assert_eq!(
+            described,
+            vec![("Hello world".into(), Modifier::empty())]
+        );
+    }
+
+    #[test]
+    fn answer_newlines_split_lines() {
+        let described = describe(&lines(vec![text("first\nsecond")]));
+
+        assert_eq!(
+            described,
+            vec![
+                ("first".into(), Modifier::empty()),
+                ("second".into(), Modifier::empty()),
+            ]
+        );
+    }
+
+    #[test]
+    fn user_question_is_pushed_to_the_scrollback() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_user("do the thing");
+        renderer.finish();
+
+        let described = describe(renderer.scrollback());
+        assert_eq!(
+            described,
+            vec![("do the thing".into(), Modifier::BOLD)]
+        );
+    }
+
+    #[test]
     fn page_keys_scroll_the_main_pane() {
         let mut state = TuiState::new("model".into());
         for _ in 0..3 {
-            state.renderer.on_event(text("x\ny\nz\n"));
+            state.renderer.on_event(text("x\ny\nz\nw\n"));
         }
+        state.renderer.finish();
+        state.viewport = 2;
+        state.following = true;
+        state.scroll = state.max_scroll();
 
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
-        assert_eq!(state.scroll, 10);
+        assert_eq!(state.scroll, 0);
+        assert!(!state.following);
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
-        assert_eq!(state.scroll, 12);
+        assert_eq!(state.scroll, 0);
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageDown)), KeyAction::None);
-        assert_eq!(state.scroll, 2);
+        assert_eq!(state.scroll, 10);
+        assert!(state.following);
     }
 
     #[test]
@@ -636,6 +752,7 @@ mod test {
     fn frame_renders_status_main_and_input() {
         let mut state = TuiState::new("llama".into());
         state.renderer.on_event(text("hello"));
+        state.renderer.finish();
         state.prompt_tokens = 100;
         state.completion_tokens = 5;
 
