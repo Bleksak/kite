@@ -190,7 +190,7 @@ impl Tool {
             }
             Tool::WriteFile(file, content) => {
                 std::fs::write(file, content).map_err(ToolError::Io)?;
-                Ok(String::new())
+                Ok(format!("wrote {} bytes to {file}", content.len()))
             }
             Tool::EditFile(file, old_content, new_content) => {
                 let mut contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
@@ -206,7 +206,7 @@ impl Tool {
                 contents.replace_range(old_index..old_index + old_content.len(), new_content);
 
                 std::fs::write(file, contents).map_err(ToolError::Io)?;
-                Ok(String::new())
+                Ok(format!("edited {file}"))
             }
         }
     }
@@ -490,7 +490,7 @@ mod test {
 
         let result = tool.invoke(timeout()).await.unwrap();
 
-        assert_eq!(result, "");
+        assert_eq!(result, format!("wrote 11 bytes to {}", file.to_string_lossy()));
         assert!(file.exists());
     }
 
@@ -515,7 +515,7 @@ version: 3"#,
 
         let result = tool.invoke(timeout()).await.unwrap();
 
-        assert_eq!(result, "");
+        assert_eq!(result, format!("edited {}", file.to_string_lossy()));
         assert!(file.exists());
         assert_eq!(std::fs::read_to_string(file).unwrap(), "testsion: 3");
     }
