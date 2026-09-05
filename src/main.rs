@@ -77,7 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut renderer = Renderer::new(tty, std::io::stdout(), std::io::stderr());
         match agent.chat(&input, &mut |event| renderer.on_event(event)).await {
             Ok(_) => renderer.finish(),
-            Err(error) => eprintln!("error: {error}"),
+            Err(error) => {
+                renderer.finish();
+                eprintln!("error: {error}");
+            }
         }
     }
 
