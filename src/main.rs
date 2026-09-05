@@ -11,7 +11,7 @@ use openai_oxide::client::OpenAI;
 use render::Renderer;
 use tokio::io::AsyncBufReadExt;
 
-const SYSTEM_PROMPT: &str = "You are a coding agent. Use the tools to accomplish tasks.";
+const SYSTEM_PROMPT: &str = "You are a coding agent. Use the tools to accomplish tasks. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them.";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
