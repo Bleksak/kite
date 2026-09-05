@@ -101,14 +101,15 @@ struct StreamUsage {
 
 #[derive(Deserialize)]
 struct StreamChoice {
-    delta: StreamDelta,
+    #[serde(default)]
+    delta: Option<StreamDelta>,
 }
 
 #[derive(Deserialize)]
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "reasoning_content")]
     reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<DeltaToolCall>>,
@@ -153,18 +154,21 @@ impl StreamAccumulator {
         }
 
         for choice in chunk.choices {
+            let Some(delta) = choice.delta else {
+                continue;
+            };
             let mut tokens = ChunkTokens::default();
 
-            if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
+            if let Some(text) = delta.content.filter(|t| !t.is_empty()) {
                 self.content.push_str(&text);
                 tokens.text = Some(text);
             }
 
-            if let Some(reasoning) = choice.delta.reasoning.filter(|r| !r.is_empty()) {
+            if let Some(reasoning) = delta.reasoning.filter(|r| !r.is_empty()) {
                 tokens.thinking = Some(reasoning);
             }
 
-            if let Some(tool_calls) = choice.delta.tool_calls {
+            if let Some(tool_calls) = delta.tool_calls {
                 for call in tool_calls {
                     let index = call.index;
                     if index < 0 {
@@ -780,6 +784,37 @@ mod test {
         );
 
         assert_eq!(acc.usage(), (Some(12), Some(7)));
+    }
+
+    #[test]
+    fn chunk_without_delta_is_ignored() {
+        let mut acc = StreamAccumulator::new();
+
+        let tokens = feed_json(&mut acc, r#"{"choices":[{"index":0}]}"#);
+
+        assert!(tokens.is_empty());
+        let Message::Assistant { content, tool_calls } = acc.into_message() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(content, None);
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn reasoning_content_alias_is_surfaced_as_thinking() {
+        let mut acc = StreamAccumulator::new();
+
+        let tokens = feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#,
+        );
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].thinking.as_deref(), Some("hmm"));
+        let Message::Assistant { content, .. } = acc.into_message() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(content, None);
     }
 
     fn gate_chunk(thinking: Option<&str>, text: Option<&str>) -> ChunkTokens {
