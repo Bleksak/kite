@@ -6,6 +6,7 @@ use openai_oxide::types::chat::{
 };
 use serde::Deserialize;
 
+use crate::context::Context;
 use crate::message::Message;
 use crate::tool::{tool_definitions, Tool};
 
@@ -79,6 +80,16 @@ impl Default for AnswerGate {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<StreamUsage>,
+}
+
+#[derive(Deserialize)]
+struct StreamUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +129,7 @@ struct StreamAccumulator {
     content: String,
     tool_slots: Vec<ToolSlot>,
     finished: bool,
+    usage: (Option<u64>, Option<u64>),
 }
 
 impl StreamAccumulator {
@@ -126,11 +138,16 @@ impl StreamAccumulator {
             content: String::new(),
             tool_slots: Vec::new(),
             finished: false,
+            usage: (None, None),
         }
     }
 
     fn feed(&mut self, chunk: StreamChunk) -> Vec<ChunkTokens> {
         let mut out = Vec::new();
+
+        if let Some(usage) = chunk.usage {
+            self.usage = (usage.prompt_tokens, usage.completion_tokens);
+        }
 
         for choice in chunk.choices {
             if choice.finish_reason.is_some() {
@@ -182,6 +199,10 @@ impl StreamAccumulator {
         self.finished
     }
 
+    fn usage(&self) -> (Option<u64>, Option<u64>) {
+        self.usage
+    }
+
     fn into_message(self) -> Message {
         Message::Assistant {
             content: if self.content.is_empty() {
@@ -215,18 +236,21 @@ enum Step {
 pub struct Agent {
     client: OpenAI,
     model: String,
-    system_prompt: String,
-    messages: Vec<Message>,
+    context: Context,
     extra_body: Option<serde_json::Value>,
 }
 
 impl Agent {
-    pub fn new(client: OpenAI, model: impl Into<String>, system_prompt: impl Into<String>) -> Agent {
+    pub fn new(
+        client: OpenAI,
+        model: impl Into<String>,
+        system_prompt: impl Into<String>,
+        max_tokens: u64,
+    ) -> Agent {
         Agent {
             client,
             model: model.into(),
-            system_prompt: system_prompt.into(),
-            messages: Vec::new(),
+            context: Context::new(system_prompt, max_tokens),
             extra_body: None,
         }
     }
@@ -236,8 +260,16 @@ impl Agent {
         self
     }
 
+    pub fn context(&self) -> &Context {
+        &self.context
+    }
+
+    pub fn context_mut(&mut self) -> &mut Context {
+        &mut self.context
+    }
+
     pub fn history(&self) -> &[Message] {
-        &self.messages
+        self.context.messages()
     }
 
     pub async fn chat(
@@ -245,12 +277,18 @@ impl Agent {
         user_message: &str,
         on_token: &mut impl FnMut(ChunkTokens),
     ) -> Result<String, OpenAIError> {
-        self.messages.push(Message::User {
+        self.context.push(Message::User {
             content: user_message.to_string(),
         });
 
         loop {
-            let message = self.stream_completion(self.build_request(), on_token).await?;
+            if self.context.needs_compaction() {
+                self.context.compact();
+            }
+
+            let (message, usage) = self.stream_completion(self.build_request(), on_token).await?;
+            self.context.record_usage(usage.0, usage.1);
+
             if let Step::Done(text) = self.handle_response(message).await {
                 return Ok(text);
             }
@@ -263,14 +301,14 @@ impl Agent {
         };
 
         if tool_calls.is_empty() {
-            self.messages.push(Message::Assistant {
+            self.context.push(Message::Assistant {
                 content: content.clone(),
                 tool_calls,
             });
             return Step::Done(content.unwrap_or_default());
         }
 
-        self.messages.push(Message::Assistant {
+        self.context.push(Message::Assistant {
             content,
             tool_calls: tool_calls.clone(),
         });
@@ -284,7 +322,7 @@ impl Agent {
                 },
                 Err(error) => error.to_string(),
             };
-            self.messages.push(Message::Tool {
+            self.context.push(Message::Tool {
                 tool_call_id,
                 content,
             });
@@ -296,12 +334,7 @@ impl Agent {
     fn build_request(&self) -> ChatCompletionRequest {
         let mut request = ChatCompletionRequest::new(
             self.model.clone(),
-            std::iter::once(Message::System {
-                content: self.system_prompt.clone(),
-            })
-            .chain(self.messages.iter().cloned())
-            .map(|message| message.to_request())
-            .collect(),
+            self.context.build_messages(),
         );
         request.tools = Some(tool_definitions());
         request
@@ -311,7 +344,7 @@ impl Agent {
         &self,
         request: ChatCompletionRequest,
         on_token: &mut impl FnMut(ChunkTokens),
-    ) -> Result<Message, OpenAIError> {
+    ) -> Result<(Message, (Option<u64>, Option<u64>)), OpenAIError> {
         let mut body = serde_json::to_value(request)?;
         body["stream"] = serde_json::Value::Bool(true);
         if let Some(extra) = &self.extra_body
@@ -336,7 +369,8 @@ impl Agent {
             }
         }
 
-        Ok(accumulator.into_message())
+        let usage = accumulator.usage();
+        Ok((accumulator.into_message(), usage))
     }
 }
 
@@ -357,7 +391,7 @@ mod test {
     }
 
     fn agent() -> Agent {
-        Agent::new(OpenAI::new("test-key"), "test-model", "be concise")
+        Agent::new(OpenAI::new("test-key"), "test-model", "be concise", 10000)
     }
 
     async fn run_tool_call(agent: &mut Agent, id: &str, name: &str, arguments: &str) -> Step {
@@ -485,7 +519,7 @@ mod test {
     #[test]
     fn request_contains_system_prompt_and_tools() {
         let mut agent = agent();
-        agent.messages.push(Message::User {
+        agent.context_mut().push(Message::User {
             content: "hello".into(),
         });
 
