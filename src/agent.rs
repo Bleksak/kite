@@ -254,6 +254,8 @@ pub struct Agent {
     pub bash_timeout: Duration,
 }
 
+const MAX_TOOL_ROUNDS: usize = 25;
+
 impl Agent {
     pub fn new(
         client: OpenAI,
@@ -284,12 +286,17 @@ impl Agent {
         &mut self,
         user_message: &str,
         on_event: &mut impl FnMut(AgentEvent),
-    ) -> Result<String, OpenAIError> {
+    ) -> Result<String, Box<dyn std::error::Error>> {
         self.context.messages.push(Message::User {
             content: user_message.to_string(),
         });
 
+        let mut round = 0;
         loop {
+            round += 1;
+            if round > MAX_TOOL_ROUNDS {
+                return Err(format!("tool loop exceeded {MAX_TOOL_ROUNDS} rounds").into());
+            }
             if self.context.needs_compaction() {
                 self.context.compact();
             }
