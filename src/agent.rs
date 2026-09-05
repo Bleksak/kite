@@ -95,8 +95,6 @@ struct StreamUsage {
 #[derive(Deserialize)]
 struct StreamChoice {
     delta: StreamDelta,
-    #[serde(default)]
-    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -128,7 +126,6 @@ impl Default for ToolSlot {
 struct StreamAccumulator {
     content: String,
     tool_slots: Vec<ToolSlot>,
-    finished: bool,
     usage: (Option<u64>, Option<u64>),
 }
 
@@ -137,7 +134,6 @@ impl StreamAccumulator {
         StreamAccumulator {
             content: String::new(),
             tool_slots: Vec::new(),
-            finished: false,
             usage: (None, None),
         }
     }
@@ -150,10 +146,6 @@ impl StreamAccumulator {
         }
 
         for choice in chunk.choices {
-            if choice.finish_reason.is_some() {
-                self.finished = true;
-            }
-
             let mut tokens = ChunkTokens::default();
 
             if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
@@ -195,10 +187,6 @@ impl StreamAccumulator {
         out
     }
 
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
     fn usage(&self) -> (Option<u64>, Option<u64>) {
         self.usage
     }
@@ -234,10 +222,10 @@ enum Step {
 }
 
 pub struct Agent {
-    client: OpenAI,
-    model: String,
-    context: Context,
-    extra_body: Option<serde_json::Value>,
+    pub client: OpenAI,
+    pub model: String,
+    pub context: Context,
+    pub extra_body: Option<serde_json::Value>,
 }
 
 impl Agent {
@@ -260,16 +248,8 @@ impl Agent {
         self
     }
 
-    pub fn context(&self) -> &Context {
-        &self.context
-    }
-
-    pub fn context_mut(&mut self) -> &mut Context {
-        &mut self.context
-    }
-
     pub fn history(&self) -> &[Message] {
-        self.context.messages()
+        &self.context.messages
     }
 
     pub async fn chat(
@@ -277,7 +257,7 @@ impl Agent {
         user_message: &str,
         on_token: &mut impl FnMut(ChunkTokens),
     ) -> Result<String, OpenAIError> {
-        self.context.push(Message::User {
+        self.context.messages.push(Message::User {
             content: user_message.to_string(),
         });
 
@@ -301,14 +281,14 @@ impl Agent {
         };
 
         if tool_calls.is_empty() {
-            self.context.push(Message::Assistant {
+            self.context.messages.push(Message::Assistant {
                 content: content.clone(),
                 tool_calls,
             });
             return Step::Done(content.unwrap_or_default());
         }
 
-        self.context.push(Message::Assistant {
+        self.context.messages.push(Message::Assistant {
             content,
             tool_calls: tool_calls.clone(),
         });
@@ -322,7 +302,7 @@ impl Agent {
                 },
                 Err(error) => error.to_string(),
             };
-            self.context.push(Message::Tool {
+            self.context.messages.push(Message::Tool {
                 tool_call_id,
                 content,
             });
@@ -347,6 +327,7 @@ impl Agent {
     ) -> Result<(Message, (Option<u64>, Option<u64>)), OpenAIError> {
         let mut body = serde_json::to_value(request)?;
         body["stream"] = serde_json::Value::Bool(true);
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
         if let Some(extra) = &self.extra_body
             && let (Some(map), Some(extra_map)) = (body.as_object_mut(), extra.as_object())
         {
@@ -363,9 +344,6 @@ impl Agent {
             let chunk: StreamChunk = serde_json::from_value(value)?;
             for tokens in accumulator.feed(chunk) {
                 on_token(tokens);
-            }
-            if accumulator.is_finished() {
-                break;
             }
         }
 
@@ -519,7 +497,7 @@ mod test {
     #[test]
     fn request_contains_system_prompt_and_tools() {
         let mut agent = agent();
-        agent.context_mut().push(Message::User {
+        agent.context.messages.push(Message::User {
             content: "hello".into(),
         });
 
@@ -664,12 +642,17 @@ mod test {
     }
 
     #[test]
-    fn finish_reason_marks_the_stream_finished() {
+    fn usage_chunk_after_finish_is_captured() {
         let mut acc = StreamAccumulator::new();
 
-        assert!(!acc.is_finished());
+        feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
         feed_json(&mut acc, r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
-        assert!(acc.is_finished());
+        feed_json(
+            &mut acc,
+            r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":7}}"#,
+        );
+
+        assert_eq!(acc.usage(), (Some(12), Some(7)));
     }
 
     fn gate_chunk(thinking: Option<&str>, text: Option<&str>) -> ChunkTokens {

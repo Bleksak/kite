@@ -3,12 +3,12 @@ use openai_oxide::types::chat::ChatCompletionMessageParam;
 use crate::message::Message;
 
 pub struct Context {
-    system_prompt: String,
-    messages: Vec<Message>,
-    prompt_tokens: Option<u64>,
-    total_prompt_tokens: u64,
-    total_completion_tokens: u64,
-    max_tokens: u64,
+    pub system_prompt: String,
+    pub messages: Vec<Message>,
+    pub prompt_tokens: Option<u64>,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub max_tokens: u64,
 }
 
 impl Context {
@@ -21,14 +21,6 @@ impl Context {
             total_completion_tokens: 0,
             max_tokens,
         }
-    }
-
-    pub fn push(&mut self, message: Message) {
-        self.messages.push(message);
-    }
-
-    pub fn messages(&self) -> &[Message] {
-        &self.messages
     }
 
     pub fn build_messages(&self) -> Vec<ChatCompletionMessageParam> {
@@ -50,14 +42,6 @@ impl Context {
         }
     }
 
-    pub fn total_prompt_tokens(&self) -> u64 {
-        self.total_prompt_tokens
-    }
-
-    pub fn total_completion_tokens(&self) -> u64 {
-        self.total_completion_tokens
-    }
-
     pub fn needs_compaction(&self) -> bool {
         self.prompt_tokens
             .is_some_and(|tokens| tokens > self.max_tokens)
@@ -77,7 +61,7 @@ mod test {
     #[test]
     fn build_messages_puts_system_prompt_first() {
         let mut context = context();
-        context.push(Message::User {
+        context.messages.push(Message::User {
             content: "hi".into(),
         });
 
@@ -105,8 +89,8 @@ mod test {
         context.record_usage(Some(150), Some(20));
 
         assert!(context.needs_compaction());
-        assert_eq!(context.total_prompt_tokens(), 200);
-        assert_eq!(context.total_completion_tokens(), 30);
+        assert_eq!(context.total_prompt_tokens, 200);
+        assert_eq!(context.total_completion_tokens, 30);
     }
 
     #[test]
@@ -123,12 +107,12 @@ mod test {
     #[test]
     fn compact_is_a_no_op_for_now() {
         let mut context = context();
-        context.push(Message::User {
+        context.messages.push(Message::User {
             content: "hi".into(),
         });
 
         context.compact();
 
-        assert_eq!(context.messages().len(), 1);
+        assert_eq!(context.messages.len(), 1);
     }
 }

@@ -96,8 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "session over: {} prompt / {} completion tokens",
-        agent.context().total_prompt_tokens(),
-        agent.context().total_completion_tokens()
+        agent.context.total_prompt_tokens,
+        agent.context.total_completion_tokens
     );
 
     Ok(())
