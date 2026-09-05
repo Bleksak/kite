@@ -180,7 +180,7 @@ impl Tool {
                 ))
             }
             Tool::ReadFile(file, start, end) => {
-                let contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
+                let contents = tokio::fs::read_to_string(file).await.map_err(ToolError::Io)?;
                 let lines: Vec<&str> = contents.lines().collect();
                 let start = start.unwrap_or(1).saturating_sub(1).min(lines.len());
                 let end = end
@@ -189,11 +189,11 @@ impl Tool {
                 Ok(lines[start..end].join("\n"))
             }
             Tool::WriteFile(file, content) => {
-                std::fs::write(file, content).map_err(ToolError::Io)?;
+                tokio::fs::write(file, content).await.map_err(ToolError::Io)?;
                 Ok(format!("wrote {} bytes to {file}", content.len()))
             }
             Tool::EditFile(file, old_content, new_content) => {
-                let mut contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
+                let mut contents = tokio::fs::read_to_string(file).await.map_err(ToolError::Io)?;
                 let crlf = contents.contains("\r\n");
                 let old = if crlf {
                     old_content.replace('\n', "\r\n")
@@ -216,7 +216,7 @@ impl Tool {
                 let old_index = contents.find(&old).unwrap();
                 contents.replace_range(old_index..old_index + old.len(), &new);
 
-                std::fs::write(file, contents).map_err(ToolError::Io)?;
+                tokio::fs::write(file, contents).await.map_err(ToolError::Io)?;
                 Ok(format!("edited {file}"))
             }
         }
