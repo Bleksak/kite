@@ -5,13 +5,13 @@ use futures_util::StreamExt;
 use openai_oxide::client::OpenAI;
 use openai_oxide::error::OpenAIError;
 use openai_oxide::types::chat::{
-    ChatCompletionRequest, DeltaToolCall, FunctionCall, ToolCall,
+    ChatCompletionRequest, DeltaToolCall, FunctionCall, StreamOptions, ToolCall,
 };
 use serde::Deserialize;
 
 use crate::context::Context;
 use crate::message::Message;
-use crate::tool::{tool_definitions, Tool, ToolOutput};
+use crate::tool::{TOOL_DEFINITIONS, Tool, ToolOutput};
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct ChunkTokens {
@@ -119,20 +119,11 @@ struct StreamDelta {
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
+#[derive(Default)]
 struct ToolSlot {
     id: String,
     name: String,
     arguments: String,
-}
-
-impl Default for ToolSlot {
-    fn default() -> Self {
-        ToolSlot {
-            id: String::new(),
-            name: String::new(),
-            arguments: String::new(),
-        }
-    }
 }
 
 struct StreamAccumulator {
@@ -279,6 +270,7 @@ impl Agent {
         self
     }
 
+    #[cfg(test)]
     pub fn history(&self) -> &[Message] {
         &self.context.messages
     }
@@ -364,7 +356,7 @@ impl Agent {
                 Ok(tool) => {
                     let (header, output) = (tool.header(), tool.output());
                     let (body, show_result) = match &output {
-                        ToolOutput::Before(body) => (Some(body.clone()), false),
+                        ToolOutput::Before(body) => (Some(body.to_string()), false),
                         ToolOutput::After => (None, true),
                         ToolOutput::Hidden => (None, false),
                     };
@@ -411,7 +403,7 @@ impl Agent {
             self.model.clone(),
             self.context.build_messages(),
         );
-        request.tools = Some(tool_definitions());
+        request.tools = Some((*TOOL_DEFINITIONS).clone());
         request
     }
 
@@ -420,18 +412,23 @@ impl Agent {
         request: ChatCompletionRequest,
         on_token: &mut impl FnMut(ChunkTokens),
     ) -> Result<(Message, (Option<u64>, Option<u64>)), OpenAIError> {
-        let mut body = serde_json::to_value(request)?;
-        body["stream"] = serde_json::Value::Bool(true);
-        body["stream_options"] = serde_json::json!({ "include_usage": true });
-        if let Some(extra) = &self.extra_body
-            && let (Some(map), Some(extra_map)) = (body.as_object_mut(), extra.as_object())
-        {
-            for (key, value) in extra_map {
-                map.insert(key.clone(), value.clone());
-            }
-        }
+        let mut request = request;
+        request.stream = Some(true);
+        request.stream_options = Some(StreamOptions {
+            include_usage: Some(true),
+        });
 
-        let mut stream = self.client.chat().completions().create_stream_raw(&body).await?;
+        let mut stream = if let Some(extra) = &self.extra_body {
+            let mut body = serde_json::to_value(&request)?;
+            if let (Some(map), Some(extra_map)) = (body.as_object_mut(), extra.as_object()) {
+                for (key, value) in extra_map {
+                    map.insert(key.clone(), value.clone());
+                }
+            }
+            self.client.chat().completions().create_stream_raw(&body).await?
+        } else {
+            self.client.chat().completions().create_stream_raw(&request).await?
+        };
         let mut accumulator = StreamAccumulator::new();
 
         while let Some(value) = stream.next().await {

@@ -1,4 +1,5 @@
 use std::process::Stdio;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -50,8 +51,8 @@ pub enum Tool {
     EditFile(String, String, String),
 }
 
-pub enum ToolOutput {
-    Before(String),
+pub enum ToolOutput<'a> {
+    Before(&'a str),
     After,
     Hidden,
 }
@@ -99,11 +100,11 @@ impl Tool {
         }
     }
 
-    pub fn output(&self) -> ToolOutput {
+    pub fn output(&self) -> ToolOutput<'_> {
         match self {
-            Tool::Bash(cmd) => ToolOutput::Before(cmd.clone()),
+            Tool::Bash(cmd) => ToolOutput::Before(cmd),
             Tool::ReadFile(..) => ToolOutput::After,
-            Tool::WriteFile(_, content) => ToolOutput::Before(content.clone()),
+            Tool::WriteFile(_, content) => ToolOutput::Before(content),
             Tool::EditFile(..) => ToolOutput::Hidden,
         }
     }
@@ -117,10 +118,6 @@ impl Tool {
             Tool::WriteFile(_, _) => "Write a file",
             Tool::EditFile(_, _, _) => "Edit a file",
         }
-    }
-
-    pub fn is_read_only(&self) -> bool {
-        matches!(self, Tool::ReadFile(..))
     }
 
     pub async fn invoke(&self, timeout: Duration) -> Result<String, ToolError> {
@@ -209,7 +206,17 @@ impl Tool {
                 } else {
                     new_content.clone()
                 };
-                let occurrences = contents.matches(&old).count();
+                let mut occurrences = 0;
+                let mut first_index = 0;
+                for (index, _) in contents.match_indices(&old) {
+                    if occurrences == 0 {
+                        first_index = index;
+                    }
+                    occurrences += 1;
+                    if occurrences > 1 {
+                        break;
+                    }
+                }
                 if occurrences != 1 {
                     return Err(ToolError::AmbiguousEdit {
                         path: file.clone(),
@@ -217,8 +224,7 @@ impl Tool {
                     });
                 }
 
-                let old_index = contents.find(&old).unwrap();
-                contents.replace_range(old_index..old_index + old.len(), &new);
+                contents.replace_range(first_index..first_index + old.len(), &new);
 
                 tokio::fs::write(file, contents).await.map_err(ToolError::Io)?;
                 Ok(format!("edited {file}"))
@@ -226,6 +232,8 @@ impl Tool {
         }
     }
 }
+
+pub static TOOL_DEFINITIONS: LazyLock<Vec<OpenAITool>> = LazyLock::new(tool_definitions);
 
 #[derive(Deserialize)]
 struct BashArgs {
