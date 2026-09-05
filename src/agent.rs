@@ -8,12 +8,19 @@ use serde::Deserialize;
 
 use crate::context::Context;
 use crate::message::Message;
-use crate::tool::{tool_definitions, Tool};
+use crate::tool::{tool_definitions, Tool, ToolOutput};
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct ChunkTokens {
     pub thinking: Option<String>,
     pub text: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum AgentEvent {
+    Tokens(ChunkTokens),
+    ToolStarted { header: String, body: Option<String> },
+    ToolResult(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -255,7 +262,7 @@ impl Agent {
     pub async fn chat(
         &mut self,
         user_message: &str,
-        on_token: &mut impl FnMut(ChunkTokens),
+        on_event: &mut impl FnMut(AgentEvent),
     ) -> Result<String, OpenAIError> {
         self.context.messages.push(Message::User {
             content: user_message.to_string(),
@@ -266,16 +273,21 @@ impl Agent {
                 self.context.compact();
             }
 
-            let (message, usage) = self.stream_completion(self.build_request(), on_token).await?;
+            let (message, usage) = self
+                .stream_completion(
+                    self.build_request(),
+                    &mut |tokens| on_event(AgentEvent::Tokens(tokens)),
+                )
+                .await?;
             self.context.record_usage(usage.0, usage.1);
 
-            if let Step::Done(text) = self.handle_response(message).await {
+            if let Step::Done(text) = self.handle_response(message, on_event).await {
                 return Ok(text);
             }
         }
     }
 
-    async fn handle_response(&mut self, message: Message) -> Step {
+    async fn handle_response(&mut self, message: Message, on_event: &mut impl FnMut(AgentEvent)) -> Step {
         let Message::Assistant { content, tool_calls } = message else {
             return Step::Done(String::new());
         };
@@ -296,10 +308,29 @@ impl Agent {
         for call in tool_calls {
             let tool_call_id = call.id.clone();
             let content = match Tool::try_from(call) {
-                Ok(tool) => match tool.invoke().await {
-                    Ok(output) => output,
-                    Err(error) => error.to_string(),
-                },
+                Ok(tool) => {
+                    let (header, output) = (tool.header(), tool.output());
+                    let (body, show_result) = match &output {
+                        ToolOutput::Before(body) => (Some(body.clone()), false),
+                        ToolOutput::After => (None, true),
+                        ToolOutput::Hidden => (None, false),
+                    };
+                    on_event(AgentEvent::ToolStarted {
+                        header,
+                        body,
+                    });
+
+                    let content = match tool.invoke().await {
+                        Ok(output) => output,
+                        Err(error) => error.to_string(),
+                    };
+
+                    if show_result {
+                        on_event(AgentEvent::ToolResult(content.clone()));
+                    }
+
+                    content
+                }
                 Err(error) => error.to_string(),
             };
             self.context.messages.push(Message::Tool {
@@ -356,6 +387,7 @@ impl Agent {
 mod test {
     use super::*;
     use openai_oxide::types::chat::{FunctionCall, ToolCall};
+    use test_files::TestFiles;
 
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
@@ -372,27 +404,41 @@ mod test {
         Agent::new(OpenAI::new("test-key"), "test-model", "be concise", 10000)
     }
 
-    async fn run_tool_call(agent: &mut Agent, id: &str, name: &str, arguments: &str) -> Step {
-        agent.handle_response(Message::Assistant {
-            content: None,
-            tool_calls: vec![tool_call(id, name, arguments)],
-        })
-        .await
+    async fn run_tool_call(
+        agent: &mut Agent,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        events: &mut Vec<AgentEvent>,
+    ) -> Step {
+        agent
+            .handle_response(
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![tool_call(id, name, arguments)],
+                },
+                &mut |event| events.push(event),
+            )
+            .await
     }
 
-    async fn finish(agent: &mut Agent, text: &str) -> Step {
-        agent.handle_response(Message::Assistant {
-            content: Some(text.into()),
-            tool_calls: vec![],
-        })
-        .await
+    async fn finish(agent: &mut Agent, text: &str, events: &mut Vec<AgentEvent>) -> Step {
+        agent
+            .handle_response(
+                Message::Assistant {
+                    content: Some(text.into()),
+                    tool_calls: vec![],
+                },
+                &mut |event| events.push(event),
+            )
+            .await
     }
 
     #[tokio::test]
     async fn simple_answer_returns_text() {
         let mut agent = agent();
 
-        let step = finish(&mut agent, "hello").await;
+        let step = finish(&mut agent, "hello", &mut Vec::new()).await;
 
         assert_eq!(step, Step::Done("hello".into()));
         assert_eq!(
@@ -408,7 +454,7 @@ mod test {
     async fn tool_call_executes_and_continues() {
         let mut agent = agent();
 
-        let step = run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"echo out"}"#).await;
+        let step = run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"echo out"}"#, &mut Vec::new()).await;
 
         assert_eq!(step, Step::Continue);
         assert_eq!(agent.history().len(), 2);
@@ -425,7 +471,7 @@ mod test {
     async fn tool_error_is_returned_to_model() {
         let mut agent = agent();
 
-        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"exit 3"}"#).await;
+        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"exit 3"}"#, &mut Vec::new()).await;
 
         assert_eq!(
             agent.history()[1],
@@ -440,7 +486,7 @@ mod test {
     async fn invalid_arguments_are_returned_to_model() {
         let mut agent = agent();
 
-        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"ls""#).await;
+        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"ls""#, &mut Vec::new()).await;
 
         let Message::Tool { content, .. } = &agent.history()[1] else {
             panic!("expected tool message");
@@ -453,7 +499,7 @@ mod test {
     async fn unknown_tool_is_returned_to_model() {
         let mut agent = agent();
 
-        run_tool_call(&mut agent, "call_1", "nuke", "{}").await;
+        run_tool_call(&mut agent, "call_1", "nuke", "{}", &mut Vec::new()).await;
 
         assert_eq!(
             agent.history()[1],
@@ -465,16 +511,73 @@ mod test {
     }
 
     #[tokio::test]
+    async fn bash_tool_call_emits_command_as_started_body() {
+        let mut agent = agent();
+        let mut events = Vec::new();
+
+        run_tool_call(
+            &mut agent,
+            "call_1",
+            "bash",
+            r#"{"command":"echo out"}"#,
+            &mut events,
+        )
+        .await;
+
+        assert_eq!(
+            events,
+            vec![AgentEvent::ToolStarted {
+                header: "bash".into(),
+                body: Some("echo out".into()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_tool_call_emits_read_content_as_result() {
+        let files = TestFiles::new();
+        files.file("a.txt", "line one\nline two");
+        let path = files.path().join("a.txt").to_string_lossy().into_owned();
+        let mut agent = agent();
+        let mut events = Vec::new();
+
+        run_tool_call(
+            &mut agent,
+            "call_1",
+            "read_file",
+            &format!("{{\"path\":\"{path}\"}}"),
+            &mut events,
+        )
+        .await;
+
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ToolStarted {
+                    header: format!("read_file: {path}"),
+                    body: None,
+                },
+                AgentEvent::ToolResult("line one\nline two".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn parallel_tool_calls_all_get_results() {
         let mut agent = agent();
         let step = agent
-            .handle_response(Message::Assistant {
-                content: None,
-                tool_calls: vec![
-                    tool_call("call_1", "bash", r#"{"command":"echo one"}"#),
-                    tool_call("call_2", "bash", r#"{"command":"echo two"}"#),
-                ],
-            })
+            .handle_response(
+                Message::Assistant {
+                    content: None,
+                    tool_calls: vec![
+                        tool_call("call_1", "bash", r#"{"command":"echo one"}"#),
+                        tool_call("call_2", "bash", r#"{"command":"echo two"}"#),
+                    ],
+                },
+                &mut |event| {
+                    let _ = event;
+                },
+            )
             .await;
         assert_eq!(step, Step::Continue);
 

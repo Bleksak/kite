@@ -40,6 +40,12 @@ pub enum Tool {
     EditFile(String, String, String),
 }
 
+pub enum ToolOutput {
+    Before(String),
+    After,
+    Hidden,
+}
+
 impl Tool {
     pub fn label(&self) -> &'static str {
         match &self {
@@ -47,6 +53,35 @@ impl Tool {
             Tool::ReadFile(..) => "read_file",
             Tool::WriteFile(_, _) => "write_file",
             Tool::EditFile(_, _, _) => "edit_file",
+        }
+    }
+
+    pub fn header(&self) -> String {
+        match self {
+            Tool::Bash(_) => "bash".to_string(),
+            Tool::ReadFile(path, start, end) => {
+                let range = match (start, end) {
+                    (None, None) => None,
+                    (Some(start), None) => Some(format!("[{start}..]")),
+                    (None, Some(end)) => Some(format!("[..={end}]")),
+                    (Some(start), Some(end)) => Some(format!("[{start}..={end}]")),
+                };
+                match range {
+                    Some(range) => format!("read_file: {path} {range}"),
+                    None => format!("read_file: {path}"),
+                }
+            }
+            Tool::WriteFile(path, _) => format!("write_file: {path}"),
+            Tool::EditFile(path, _, _) => format!("edit_file: {path}"),
+        }
+    }
+
+    pub fn output(&self) -> ToolOutput {
+        match self {
+            Tool::Bash(cmd) => ToolOutput::Before(cmd.clone()),
+            Tool::ReadFile(..) => ToolOutput::After,
+            Tool::WriteFile(_, content) => ToolOutput::Before(content.clone()),
+            Tool::EditFile(..) => ToolOutput::Hidden,
         }
     }
 
@@ -249,6 +284,26 @@ mod test {
                 arguments: arguments.into(),
             },
         }
+    }
+
+    #[test]
+    fn read_file_header_formats_the_range() {
+        assert_eq!(
+            Tool::ReadFile("a.txt".into(), None, None).header(),
+            "read_file: a.txt"
+        );
+        assert_eq!(
+            Tool::ReadFile("a.txt".into(), Some(10), None).header(),
+            "read_file: a.txt [10..]"
+        );
+        assert_eq!(
+            Tool::ReadFile("a.txt".into(), None, Some(20)).header(),
+            "read_file: a.txt [..=20]"
+        );
+        assert_eq!(
+            Tool::ReadFile("a.txt".into(), Some(10), Some(20)).header(),
+            "read_file: a.txt [10..=20]"
+        );
     }
 
     #[tokio::test]
