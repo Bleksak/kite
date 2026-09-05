@@ -194,7 +194,18 @@ impl Tool {
             }
             Tool::EditFile(file, old_content, new_content) => {
                 let mut contents = std::fs::read_to_string(file).map_err(ToolError::Io)?;
-                let occurrences = contents.matches(old_content).count();
+                let crlf = contents.contains("\r\n");
+                let old = if crlf {
+                    old_content.replace('\n', "\r\n")
+                } else {
+                    old_content.clone()
+                };
+                let new = if crlf {
+                    new_content.replace('\n', "\r\n")
+                } else {
+                    new_content.clone()
+                };
+                let occurrences = contents.matches(&old).count();
                 if occurrences != 1 {
                     return Err(ToolError::AmbiguousEdit {
                         path: file.clone(),
@@ -202,8 +213,8 @@ impl Tool {
                     });
                 }
 
-                let old_index = contents.find(old_content).unwrap();
-                contents.replace_range(old_index..old_index + old_content.len(), new_content);
+                let old_index = contents.find(&old).unwrap();
+                contents.replace_range(old_index..old_index + old.len(), &new);
 
                 std::fs::write(file, contents).map_err(ToolError::Io)?;
                 Ok(format!("edited {file}"))
@@ -518,6 +529,47 @@ version: 3"#,
         assert_eq!(result, format!("edited {}", file.to_string_lossy()));
         assert!(file.exists());
         assert_eq!(std::fs::read_to_string(file).unwrap(), "testsion: 3");
+    }
+
+    #[tokio::test]
+    async fn edit_file_crlf_file_keeps_crlf() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "line one\r\nline two\r\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::EditFile(
+            file.to_string_lossy().into(),
+            "line one\nline two".into(),
+            "line ONE\nline two".into(),
+        );
+
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        assert_eq!(result, format!("edited {}", file.to_string_lossy()));
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "line ONE\r\nline two\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_file_crlf_single_line() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "line one\r\nline two\r\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::EditFile(
+            file.to_string_lossy().into(),
+            "line one".into(),
+            "line ONE".into(),
+        );
+
+        tool.invoke(timeout()).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "line ONE\r\nline two\r\n"
+        );
     }
 
     #[tokio::test]
