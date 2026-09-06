@@ -66,6 +66,21 @@ impl Agent {
         self
     }
 
+    pub fn with_pinned_mode(mut self, mode: Mode) -> Agent {
+        self.mode = Arc::new(Mutex::new(mode));
+        self.context.system_prompt = mode.system_prompt().to_string();
+        self
+    }
+
+    pub fn stage_mode(&self) -> Option<Mode> {
+        let guard = self.mode.lock().unwrap();
+        if Arc::strong_count(&self.mode) == 1 {
+            Some(*guard)
+        } else {
+            None
+        }
+    }
+
     #[cfg(test)]
     pub fn history(&self) -> &[Message] {
         &self.context.messages
@@ -318,6 +333,13 @@ impl Agent {
     }
 }
 
+pub fn terminator_payload(arguments: &str, field: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|value| value.get(field).and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_else(|| arguments.to_string())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -404,6 +426,24 @@ mod test {
 
     fn agent() -> Agent {
         Agent::new(OpenAI::new("test-key"), "test-model", Arc::new(Mutex::new(Mode::Yolo)), 10000, Duration::from_secs(30))
+    }
+
+    #[test]
+    fn pinned_mode_is_unaffected_by_the_shared_cell() {
+        let shared = Arc::new(Mutex::new(Mode::Yolo));
+        let mut agent = Agent::new(OpenAI::new("test-key"), "test-model", shared.clone(), 10000, Duration::from_secs(30));
+        agent = agent.with_pinned_mode(Mode::Implement);
+        *shared.lock().unwrap() = Mode::Plan;
+        assert_eq!(*agent.mode.lock().unwrap(), Mode::Implement);
+        assert_eq!(agent.context.system_prompt, Mode::Implement.system_prompt());
+    }
+
+    #[test]
+    fn terminator_payload_extracts_the_field_and_falls_back_to_raw() {
+        assert_eq!(terminator_payload(r#"{"plan":"step one"}"#, "plan"), "step one");
+        assert_eq!(terminator_payload(r#"{"findings":"it broke"}"#, "findings"), "it broke");
+        assert_eq!(terminator_payload("not json", "plan"), "not json");
+        assert_eq!(terminator_payload(r#"{"plan":"step one"}"#, "findings"), r#"{"plan":"step one"}"#);
     }
 
     async fn run_tool_call(

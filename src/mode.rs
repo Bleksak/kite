@@ -4,6 +4,7 @@ use crate::tool::Tool;
 pub enum Mode {
     Yolo,
     Plan,
+    Implement,
 }
 
 impl Mode {
@@ -11,6 +12,7 @@ impl Mode {
         match self {
             Self::Yolo => Self::Plan,
             Self::Plan => Self::Yolo,
+            Self::Implement => Self::Yolo,
         }
     }
 
@@ -18,6 +20,7 @@ impl Mode {
         match self {
             Self::Yolo => "yolo",
             Self::Plan => "plan",
+            Self::Implement => "implement",
         }
     }
 
@@ -37,6 +40,16 @@ impl Mode {
                 Tool::ReadOnlyBash(String::new()),
                 Tool::SubmitPlan(String::new()),
             ],
+            Self::Implement => vec![
+                Tool::ReadFile(String::new(), None, None),
+                Tool::ReadOnlyBash(String::new()),
+                Tool::Bash(String::new()),
+                Tool::WriteFile(String::new(), String::new()),
+                Tool::EditFile(String::new(), String::new(), String::new()),
+                Tool::WebFetch(String::new()),
+                Tool::BgRun(String::new()),
+                Tool::Escalate(String::new()),
+            ],
         }
     }
 
@@ -44,6 +57,7 @@ impl Mode {
         match self {
             Self::Yolo => None,
             Self::Plan => Some("submit_plan"),
+            Self::Implement => Some("escalate"),
         }
     }
 
@@ -55,6 +69,7 @@ impl Mode {
         match self {
             Self::Yolo => "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them.",
             Self::Plan => "You are a planning agent. Investigate the codebase with read_file and read-only bash commands, then call submit_plan with a concrete, step-by-step implementation plan. Do not modify any files. Call submit_plan alone, without other tools.",
+            Self::Implement => "You are an implementation agent. Execute the plan step by step with the tools. Verify your work (build, tests) with bash or bg_run. If you hit a blocker you cannot resolve, call escalate alone with a description of the blocker; do not guess around it.",
         }
     }
 }
@@ -109,6 +124,36 @@ mod test {
         assert!(!Mode::Plan.allows(&Tool::WriteFile("a".into(), "x".into())));
         assert!(!Mode::Plan.allows(&Tool::EditFile("a".into(), "x".into(), "y".into())));
         assert!(!Mode::Plan.allows(&Tool::BgRun("sleep 1".into())));
+    }
+
+    #[test]
+    fn implement_schema_contains_its_tools() {
+        let tools = Mode::Implement.base_tools();
+        let definitions = crate::tool::tool_definitions(&tools);
+        let names = definitions
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "read_file", "readonly_bash", "bash", "write_file", "edit_file", "webfetch", "bg_run", "escalate"
+            ]
+        );
+    }
+
+    #[test]
+    fn implement_terminator_is_escalate_and_rejects_submit_plan() {
+        assert_eq!(Mode::Implement.terminator(), Some("escalate"));
+        assert!(!Mode::Implement.allows(&Tool::SubmitPlan("plan".into())));
+        assert!(Mode::Implement.allows(&Tool::Escalate("blocker".into())));
+        assert!(Mode::Implement.allows(&Tool::WriteFile("a".into(), "x".into())));
+    }
+
+    #[test]
+    fn tab_cycles_yolo_and_plan_only() {
+        assert_eq!(Mode::Yolo.next(), Mode::Plan);
+        assert_eq!(Mode::Plan.next(), Mode::Yolo);
     }
 
     #[test]

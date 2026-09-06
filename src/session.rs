@@ -4,6 +4,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::context::Context;
+use crate::mode::Mode;
 use crate::transcript::TuiRenderer;
 
 pub struct Session {
@@ -17,6 +18,8 @@ pub struct Session {
     pub scroller: Scroller,
     pub label: String,
     pub context: Option<Context>,
+    pub gate: bool,
+    pub stage: Option<Mode>,
     tail_cache: (usize, usize, usize, usize),
 }
 
@@ -33,6 +36,8 @@ impl Session {
             scroller: Scroller::at_tail(),
             label: String::new(),
             context: None,
+            gate: false,
+            stage: None,
             tail_cache: (0, 0, 0, 0),
         }
     }

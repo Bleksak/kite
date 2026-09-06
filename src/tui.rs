@@ -30,6 +30,8 @@ pub enum TuiEvent {
     Agent { session: u64, event: AgentEvent },
     TurnDone { session: u64, context: Context },
     TurnError { session: u64, message: String },
+    GatePending { session: u64 },
+    StageChanged { session: u64, mode: Option<Mode> },
 }
 
 pub struct TuiState {
@@ -448,11 +450,11 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     }
     match key.code {
         KeyCode::Enter => {
-            if session.input.is_empty() {
+            if session.input.is_empty() && !session.gate {
                 KeyAction::None
             } else {
                 let task = mem::take(&mut session.input);
-                if session.label.is_empty() {
+                if !task.is_empty() && session.label.is_empty() {
                     session.label = task.trim().chars().take(24).collect();
                 }
                 session.scroller.set_following(true);
@@ -881,17 +883,33 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             Span::styled("█".to_string(), Style::default().bold()),
         ])
     };
-    let mode = *state.mode.lock().unwrap();
-    let mode_title = Line::from(Span::styled(
-        format!(" {} {} ", if mode == Mode::Plan { "📋" } else { "⚒" }, mode.label()),
-        Style::default()
-            .bold()
-            .fg(if mode == Mode::Plan {
-                Color::Rgb(0xb5, 0xbd, 0x68)
-            } else {
-                Color::Rgb(0xd4, 0xd4, 0xd4)
-            }),
-    ));
+    let shared = *state.mode.lock().unwrap();
+    let effective = session.stage.unwrap_or(shared);
+    let mode_title = if session.gate {
+        Line::from(Span::styled(
+            " 📋 plan ready — Enter to implement, type feedback to re-plan ".to_string(),
+            Style::default().bold().fg(Color::Rgb(0xb5, 0xbd, 0x68)),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                " {} {} ",
+                match effective {
+                    Mode::Plan => "📋",
+                    Mode::Implement => "🔧",
+                    Mode::Yolo => "⚒",
+                },
+                effective.label()
+            ),
+            Style::default()
+                .bold()
+                .fg(match effective {
+                    Mode::Plan => Color::Rgb(0xb5, 0xbd, 0x68),
+                    Mode::Implement => Color::Rgb(0xe5, 0xb5, 0x67),
+                    Mode::Yolo => Color::Rgb(0xd4, 0xd4, 0xd4),
+                }),
+        ))
+    };
     frame.render_widget(
         Paragraph::new(input_line)
             .block(Block::default().borders(Borders::ALL).title(mode_title)),
@@ -899,21 +917,98 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     );
 }
 
+async fn handle_outcome(
+    agent: &mut Agent,
+    new_agent: &std::sync::Arc<dyn Fn() -> Agent + Send + Sync>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<TuiEvent>,
+    id: u64,
+    gate: &mut Option<String>,
+    mut outcome: crate::agent::ChatOutcome,
+) {
+    loop {
+        match &outcome {
+            crate::agent::ChatOutcome::Terminated { tool, arguments } if tool == "submit_plan" => {
+                *gate = Some(crate::agent::terminator_payload(arguments, "plan"));
+                let context = agent.context.clone();
+                let _ = event_tx.send(TuiEvent::TurnDone { session: id, context });
+                let _ = event_tx.send(TuiEvent::GatePending { session: id });
+                return;
+            }
+            crate::agent::ChatOutcome::Terminated { tool, arguments } if tool == "escalate" => {
+                let findings = crate::agent::terminator_payload(arguments, "findings");
+                *agent = new_agent().with_pinned_mode(Mode::Plan);
+                let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
+                let message = format!(
+                    "The implementation hit a blocker: {findings}\n\nRevise the plan, keeping what is already done, and call submit_plan."
+                );
+                let tx = event_tx.clone();
+                match agent
+                    .chat(
+                        &message,
+                        &mut |event| {
+                            let _ = tx.send(TuiEvent::Agent { session: id, event });
+                        },
+                    )
+                    .await
+                {
+                    Ok(next) => {
+                        outcome = next;
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(TuiEvent::TurnError {
+                            session: id,
+                            message: error.to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
+            _ => {
+                if agent.stage_mode() == Some(Mode::Implement) {
+                    *agent = new_agent();
+                    let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: None });
+                }
+                let context = agent.context.clone();
+                let _ = event_tx.send(TuiEvent::TurnDone { session: id, context });
+                return;
+            }
+        }
+    }
+}
+
 fn spawn_agent(
     id: u64,
-    agent: Agent,
+    new_agent: std::sync::Arc<dyn Fn() -> Agent + Send + Sync>,
+    restored: Option<Context>,
     event_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
 ) -> (tokio::sync::mpsc::UnboundedSender<String>, tokio::task::AbortHandle) {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let task = tokio::spawn(async move {
-        let mut agent = agent;
+        let mut agent = new_agent();
+        if let Some(context) = restored {
+            agent.context = context;
+        }
+        let mut gate: Option<String> = None;
         let mut bg_rx = crate::bg::REGISTRY.subscribe();
         loop {
             tokio::select! {
                 input = input_rx.recv() => {
-                    let Some(input) = input else { break; };
+                    let Some(mut input) = input else { break; };
+                    if let Some(plan) = gate.take() {
+                        let message = if input.is_empty() {
+                            agent = new_agent().with_pinned_mode(Mode::Implement);
+                            let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Implement) });
+                            format!("Execute this plan:\n\n{plan}")
+                        } else {
+                            agent = new_agent().with_pinned_mode(Mode::Plan);
+                            let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
+                            format!("The plan was rejected. Feedback: {input}\n\nOriginal plan:\n{plan}\n\nRevise the plan and call submit_plan.")
+                        };
+                        input = message;
+                    }
                     let tx = event_tx.clone();
-                    match agent
+                    let result = agent
                         .chat(
                             &input,
                             &mut |event| {
@@ -921,38 +1016,55 @@ fn spawn_agent(
                             },
                         )
                         .await
-                    {
-                        Ok(_answer) => {
-                            let context = agent.context.clone();
-                            let _ = tx.send(TuiEvent::TurnDone { session: id, context });
+                        .map_err(|error| error.to_string());
+                    match result {
+                        Ok(outcome) => {
+                            handle_outcome(
+                                &mut agent,
+                                &new_agent,
+                                &event_tx,
+                                id,
+                                &mut gate,
+                                outcome,
+                            )
+                            .await;
                         }
-                        Err(error) => {
-                            let _ = tx.send(TuiEvent::TurnError {
+                        Err(message) => {
+                            let _ = event_tx.send(TuiEvent::TurnError {
                                 session: id,
-                                message: error.to_string(),
+                                message,
                             });
                         }
                     }
                 }
                 signal = bg_rx.recv() => {
-                    if let Ok(task_id) = signal
+                    if gate.is_none()
+                        && let Ok(task_id) = signal
                         && agent.owns_and_unseen(&task_id)
                     {
                         let tx = event_tx.clone();
-                        match agent
+                        let result = agent
                             .bg_turn(&mut |event| {
                                 let _ = tx.send(TuiEvent::Agent { session: id, event });
                             })
                             .await
-                        {
-                            Ok(_answer) => {
-                                let context = agent.context.clone();
-                                let _ = tx.send(TuiEvent::TurnDone { session: id, context });
+                            .map_err(|error| error.to_string());
+                        match result {
+                            Ok(outcome) => {
+                                handle_outcome(
+                                    &mut agent,
+                                    &new_agent,
+                                    &event_tx,
+                                    id,
+                                    &mut gate,
+                                    outcome,
+                                )
+                                .await;
                             }
-                            Err(error) => {
+                            Err(message) => {
                                 let _ = tx.send(TuiEvent::TurnError {
                                     session: id,
-                                    message: error.to_string(),
+                                    message,
                                 });
                             }
                         }
@@ -1013,11 +1125,8 @@ pub async fn run(
     let mut handles: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
 
     for session in &state.sessions {
-        let mut agent = new_agent();
-        if let Some(context) = &session.context {
-            agent.context = context.clone();
-        }
-        let (input_tx, input_handle) = spawn_agent(session.id, agent, agent_tx.clone());
+        let restored = session.context.clone();
+        let (input_tx, input_handle) = spawn_agent(session.id, new_agent.clone(), restored, agent_tx.clone());
         inputs.insert(session.id, input_tx);
         handles.insert(session.id, input_handle);
     }
@@ -1096,6 +1205,17 @@ pub async fn run(
                             session.error = Some(message);
                         }
                     }
+                    Some(TuiEvent::GatePending { session: id }) => {
+                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                            session.gate = true;
+                        }
+                    }
+                    Some(TuiEvent::StageChanged { session: id, mode }) => {
+                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                            session.stage = mode;
+                            session.gate = false;
+                        }
+                    }
                     None => break,
                 }
             }
@@ -1110,7 +1230,9 @@ pub async fn run(
                         let session = &mut state.sessions[state.active];
                         session.error = None;
                         session.running = true;
-                        session.renderer.push_user(&task);
+                        if !task.is_empty() {
+                            session.renderer.push_user(&task);
+                        }
                         let max = session.max_scroll(state.pane_width, state.viewport);
                         session.scroller.end(max);
                         inputs[&id].send(task)?;
@@ -1119,7 +1241,7 @@ pub async fn run(
                     KeyAction::NewSession => {
                         let id = state.sessions[state.active].id;
                         let (input_tx, input_handle) =
-                            spawn_agent(id, new_agent(), agent_tx.clone());
+                            spawn_agent(id, new_agent.clone(), None, agent_tx.clone());
                         inputs.insert(id, input_tx);
                         handles.insert(id, input_handle);
                     }
@@ -1186,6 +1308,10 @@ pub async fn run(
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::time::Duration;
+    use openai_oxide::client::OpenAI;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     use crate::stream::ChunkTokens;
     use crate::message::Message;
     use crate::transcript::TuiRenderer;
@@ -2334,6 +2460,19 @@ mod test {
     }
 
     #[test]
+    fn enter_with_empty_input_is_a_noop_without_a_gate() {
+        let mut state = TuiState::new("model".into());
+        assert_eq!(handle_key(&mut state, &key(KeyCode::Enter)), KeyAction::None);
+    }
+
+    #[test]
+    fn enter_with_empty_input_submits_when_the_gate_is_pending() {
+        let mut state = TuiState::new("model".into());
+        state.session().gate = true;
+        assert_eq!(handle_key(&mut state, &key(KeyCode::Enter)), KeyAction::Submit(String::new()));
+    }
+
+    #[test]
     fn home_and_end_work_while_running() {
         let mut state = TuiState::new("model".into());
         state.session().running = true;
@@ -2794,5 +2933,140 @@ mod test {
         assert!(joined.contains("[1/1]"));
         assert!(joined.contains("hello"));
         assert!(joined.contains(">"));
+    }
+
+    fn complete_request(data: &[u8]) -> Option<String> {
+        let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&data[..header_end]).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })?;
+        let body_start = header_end + 4;
+        if data.len() < body_start + length {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&data[body_start..body_start + length]).into_owned())
+    }
+
+    async fn wait_for_event(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<TuiEvent>,
+        events: &mut Vec<TuiEvent>,
+        predicate: impl Fn(&TuiEvent) -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+            {
+                if predicate(&event) {
+                    events.push(event);
+                    return true;
+                }
+                events.push(event);
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn plan_gate_approval_runs_the_implement_stage_then_resets() {
+        let (tx_req, mut rx_req) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"implemented\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+        ])));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx_req.clone();
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                data.extend_from_slice(&buf[..n]);
+                                if let Some(body) = complete_request(&data) {
+                                    let _ = tx.send(body);
+                                    let sse = match responses.lock().unwrap().pop_front() {
+                                        Some(response) => response,
+                                        None => "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+                                    };
+                                    let response = format!(
+                                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
+                                    );
+                                    if socket.write_all(response.as_bytes()).await.is_err() {
+                                        break;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
+        );
+        let shared = Arc::new(Mutex::new(Mode::Yolo));
+        let factory = Arc::new(move || {
+            Agent::new(
+                client.clone(),
+                "test-model",
+                shared.clone(),
+                10000,
+                Duration::from_secs(30),
+            )
+            .with_pinned_mode(Mode::Plan)
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
+        let (input_tx, handle) = spawn_agent(1, factory, None, event_tx);
+
+        input_tx.send("plan me a feature".to_string()).unwrap();
+        let mut events = vec![];
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(e, TuiEvent::GatePending { .. }))
+                .await
+        );
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(
+                &mut event_rx,
+                &mut events,
+                |e| matches!(e, TuiEvent::StageChanged { mode: None, .. })
+            )
+            .await
+        );
+        handle.abort();
+
+        let mut requests = vec![];
+        while let Ok(body) = rx_req.try_recv() {
+            requests.push(body);
+        }
+        let implement_request = requests
+            .into_iter()
+            .find(|body| body.contains("Execute this plan"))
+            .expect("the implement stage request carries the plan");
+        assert!(implement_request.contains("step one"));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEvent::StageChanged { mode: Some(Mode::Implement), .. }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            TuiEvent::TurnDone { .. }
+        )));
     }
 }

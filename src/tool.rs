@@ -69,6 +69,7 @@ pub enum Tool {
     WebFetch(String),
     BgRun(String),
     SubmitPlan(String),
+    Escalate(String),
 }
 
 pub enum ToolOutput<'a> {
@@ -100,6 +101,7 @@ impl Tool {
             Tool::WebFetch(_) => "webfetch",
             Tool::BgRun(_) => "bg_run",
             Tool::SubmitPlan(_) => "submit_plan",
+            Tool::Escalate(_) => "escalate",
         }
     }
 
@@ -124,6 +126,7 @@ impl Tool {
             Tool::WebFetch(url) => format!("webfetch: {url}"),
             Tool::BgRun(_) => "bg_run".to_string(),
             Tool::SubmitPlan(_) => "submit_plan".to_string(),
+            Tool::Escalate(_) => "escalate".to_string(),
         }
     }
 
@@ -137,13 +140,14 @@ impl Tool {
             Tool::WebFetch(url) => ToolOutput::Before(url),
             Tool::BgRun(command) => ToolOutput::Before(command),
             Tool::SubmitPlan(plan) => ToolOutput::Before(plan),
+            Tool::Escalate(findings) => ToolOutput::Before(findings),
         }
     }
 
     pub fn description(&self) -> &'static str {
         match &self {
             Tool::Bash(_) => "Run a bash script",
-            Tool::ReadOnlyBash(_) => "Run a bash script in a read-only sandbox; the working directory is the current directory, /tmp is writable",
+            Tool::ReadOnlyBash(_) => "Run a bash script in a read-only mode",
             Tool::ReadFile(_, _, _) => {
                 "Read a file, optionally a line range (1-based start and end line, both inclusive)"
             }
@@ -154,6 +158,9 @@ impl Tool {
                 "Run a long-running command in the background (tests, builds, dev servers). Returns a task id immediately; the task's result is reported automatically when it finishes"
             }
             Tool::SubmitPlan(_) => "Submit the final plan. Call this alone, without other tools.",
+            Tool::Escalate(_) => {
+                "Escalate a blocker you cannot resolve. Call this alone, without other tools."
+            }
         }
     }
 
@@ -290,6 +297,7 @@ impl Tool {
                 Ok(format!("task {id} started; its result will be reported when it finishes"))
             }
             Tool::SubmitPlan(_) => Err(ToolError::TerminatorNotExecutable),
+            Tool::Escalate(_) => Err(ToolError::TerminatorNotExecutable),
         }
     }
 
@@ -400,6 +408,11 @@ struct SubmitPlanArgs {
     plan: String,
 }
 
+#[derive(Deserialize)]
+struct EscalateArgs {
+    findings: String,
+}
+
 fn parse_args<A: serde::de::DeserializeOwned>(name: &str, arguments: &str) -> Result<A, ToolError> {
     serde_json::from_str(arguments).map_err(|source| ToolError::InvalidArguments {
         name: name.to_string(),
@@ -435,6 +448,8 @@ impl TryFrom<OpenAIToolCall> for Tool {
                 .map(|a| Tool::BgRun(a.command)),
             "submit_plan" => parse_args::<SubmitPlanArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::SubmitPlan(a.plan)),
+            "escalate" => parse_args::<EscalateArgs>(&function.name, &function.arguments)
+                .map(|a| Tool::Escalate(a.findings)),
             other => Err(ToolError::UnknownTool {
                 name: other.to_string(),
             }),
@@ -490,6 +505,13 @@ fn parameters(tool: &Tool) -> serde_json::Value {
                 "plan": { "type": "string", "description": "the complete, step-by-step implementation plan" }
             },
             "required": ["plan"]
+        }),
+        Tool::Escalate(_) => json!({
+            "type": "object",
+            "properties": {
+                "findings": { "type": "string", "description": "the blocker you cannot resolve, with what was tried" }
+            },
+            "required": ["findings"]
         }),
     }
 }
