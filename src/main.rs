@@ -13,11 +13,10 @@ mod tui;
 
 
 use agent::Agent;
-use thinking::{ThinkingLevel, ThinkingLevelCell};
+use std::sync::{Arc, Mutex};
+use thinking::ThinkingLevel;
 use clap::Parser;
 use openai_oxide::client::OpenAI;
-use std::sync::Arc;
-
 const SYSTEM_PROMPT: &str = "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them.";
 
 #[derive(Parser)]
@@ -42,7 +41,7 @@ fn build_agent(
     client: &OpenAI,
     model: &str,
     thinking: ThinkingLevel,
-    thinking_cell: Arc<ThinkingLevelCell>,
+    thinking_cell: Arc<Mutex<ThinkingLevel>>,
     context_window: u64,
     bash_timeout: u64,
 ) -> Agent {
@@ -65,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = cli.model.clone();
 
     let client = client.clone();
-    let thinking_cell = Arc::new(ThinkingLevelCell::new(cli.thinking));
+    let thinking_cell = Arc::new(Mutex::new(cli.thinking));
     tui::run(
         {
             let model = model.clone();

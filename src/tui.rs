@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::mem;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crossterm::cursor;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyModifiers};
@@ -17,7 +17,7 @@ use ratatui::{Frame, Terminal};
 
 
 use crate::agent::Agent;
-use crate::thinking::ThinkingLevelCell;
+use crate::thinking::ThinkingLevel;
 use crate::context::Context;
 use crate::paths::CONTEXT_DIR;
 use crate::session::{Cursor, Scroller, Session};
@@ -37,7 +37,7 @@ pub struct TuiState {
     pub viewport: usize,
     pub pane_width: usize,
     pub model: String,
-    pub thinking: Arc<ThinkingLevelCell>,
+    pub thinking: Arc<Mutex<ThinkingLevel>>,
     pub picker_open: bool,
     pub picker_cursor: Cursor,
     pub picker_query: String,
@@ -57,7 +57,7 @@ impl TuiState {
             viewport: 22,
             pane_width: 118,
             model,
-            thinking: Arc::new(ThinkingLevelCell::default()),
+            thinking: Arc::new(std::sync::Mutex::new(ThinkingLevel::Off)),
             picker_open: false,
             picker_cursor: Cursor::default(),
             picker_query: String::new(),
@@ -74,7 +74,7 @@ impl TuiState {
         &mut self.sessions[self.active]
     }
 
-    pub fn with_thinking(mut self, cell: Arc<ThinkingLevelCell>) -> TuiState {
+    pub fn with_thinking(mut self, cell: Arc<Mutex<ThinkingLevel>>) -> TuiState {
         self.thinking = cell;
         self
     }
@@ -403,7 +403,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 KeyAction::None
             }
             KeyCode::Char('t') => {
-                state.thinking.set(state.thinking.get().next());
+                let mut level = state.thinking.lock().unwrap();
+                *level = level.next();
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -606,7 +607,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
         ));
     }
-    let thinking_level = state.thinking.get();
+    let thinking_level = *state.thinking.lock().unwrap();
     status_spans.push(Span::styled(
         format!("  ·  💭 {}", thinking_level.label()),
         Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
@@ -933,7 +934,7 @@ fn spawn_agent(
 pub async fn run(
     new_agent: impl Fn() -> Agent + Send + Sync + 'static,
     model: String,
-    thinking: Arc<ThinkingLevelCell>,
+    thinking: Arc<Mutex<ThinkingLevel>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
@@ -1932,17 +1933,17 @@ mod test {
         let mut state = TuiState::new("model".into());
         let event = TermEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
 
-        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Off);
+        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Off);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Low);
+        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Low);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Medium);
+        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Medium);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::High);
+        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::High);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::XHigh);
+        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::XHigh);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Off);
+        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Off);
     }
 
     #[test]

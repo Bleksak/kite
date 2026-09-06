@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -10,7 +10,8 @@ use openai_oxide::types::chat::{ChatCompletionRequest, StreamOptions, ToolCall};
 use crate::context::Context;
 use crate::message::Message;
 use crate::stream::{AgentEvent, ChunkTokens, StreamAccumulator, StreamChunk};
-use crate::thinking::ThinkingLevelCell;
+use crate::thinking::ThinkingLevel;
+
 use crate::tool::{TOOL_DEFINITIONS, Tool, ToolOutput};
 
 #[derive(Debug, PartialEq)]
@@ -23,7 +24,7 @@ pub struct Agent {
     pub client: OpenAI,
     pub model: String,
     pub context: Context,
-    pub thinking: Option<(Arc<ThinkingLevelCell>, Option<bool>)>,
+    pub thinking: Option<(Arc<Mutex<ThinkingLevel>>, Option<bool>)>,
     pub bash_timeout: Duration,
     bg_seen: std::collections::HashSet<String>,
     bg_mine: std::collections::HashSet<String>,
@@ -50,7 +51,7 @@ impl Agent {
         }
     }
 
-    pub fn with_thinking(mut self, cell: Arc<ThinkingLevelCell>, base: Option<bool>) -> Agent {
+    pub fn with_thinking(mut self, cell: Arc<Mutex<ThinkingLevel>>, base: Option<bool>) -> Agent {
         self.thinking = Some((cell, base));
         self
     }
@@ -252,7 +253,7 @@ impl Agent {
         let extra = self
             .thinking
             .as_ref()
-            .and_then(|(cell, base)| cell.get().body(*base));
+            .and_then(|(cell, base)| cell.lock().unwrap().body(*base));
         let mut stream = if let Some(extra) = extra {
             let mut body = serde_json::to_value(&request)?;
             if let (Some(map), Some(extra_map)) = (body.as_object_mut(), extra.as_object()) {
@@ -285,7 +286,6 @@ mod test {
     use openai_oxide::types::chat::{FunctionCall, ToolCall};
     use test_files::TestFiles;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use crate::thinking::ThinkingLevel;
 
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
@@ -763,7 +763,7 @@ mod test {
         let client = OpenAI::with_config(
             openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
         );
-        let cell = Arc::new(ThinkingLevelCell::new(ThinkingLevel::Off));
+        let cell = Arc::new(Mutex::new(ThinkingLevel::Off));
         let mut agent = Agent::new(client, "test-model", "be concise", 10000, Duration::from_secs(30))
             .with_thinking(cell.clone(), None);
 
@@ -777,12 +777,12 @@ mod test {
         assert!(!body.contains("reasoning_effort"), "auto + off must send no override: {body}");
         assert!(!body.contains("chat_template_kwargs"), "auto + off must send no override: {body}");
 
-        cell.set(ThinkingLevel::Low);
+        *cell.lock().unwrap() = ThinkingLevel::Low;
         let body = turn(&mut agent).await;
         assert!(body.contains("\"reasoning_effort\":\"low\""), "{body}");
         assert!(body.contains("\"enable_thinking\":true"), "{body}");
 
-        cell.set(ThinkingLevel::XHigh);
+        *cell.lock().unwrap() = ThinkingLevel::XHigh;
         let body = turn(&mut agent).await;
         assert!(body.contains("\"reasoning_effort\":\"xhigh\""), "{body}");
     }

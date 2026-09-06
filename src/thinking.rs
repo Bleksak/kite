@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU8, Ordering};
-
 #[derive(Debug, PartialEq, Eq, Clone, Copy, clap::ValueEnum)]
 pub enum ThinkingLevel {
     Off,
@@ -52,50 +50,6 @@ impl ThinkingLevel {
                 "reasoning_effort": "xhigh"
             })),
         }
-    }
-}
-
-pub struct ThinkingLevelCell {
-    value: AtomicU8,
-}
-
-impl ThinkingLevelCell {
-    pub fn new(level: ThinkingLevel) -> ThinkingLevelCell {
-        ThinkingLevelCell {
-            value: AtomicU8::new(match level {
-                ThinkingLevel::Off => 0,
-                ThinkingLevel::Low => 1,
-                ThinkingLevel::Medium => 2,
-                ThinkingLevel::High => 3,
-                ThinkingLevel::XHigh => 4,
-            }),
-        }
-    }
-
-    pub fn get(&self) -> ThinkingLevel {
-        match self.value.load(Ordering::SeqCst) {
-            1 => ThinkingLevel::Low,
-            2 => ThinkingLevel::Medium,
-            3 => ThinkingLevel::High,
-            4 => ThinkingLevel::XHigh,
-            _ => ThinkingLevel::Off,
-        }
-    }
-
-    pub fn set(&self, level: ThinkingLevel) {
-        self.value.store(match level {
-            ThinkingLevel::Off => 0,
-            ThinkingLevel::Low => 1,
-            ThinkingLevel::Medium => 2,
-            ThinkingLevel::High => 3,
-            ThinkingLevel::XHigh => 4,
-        }, Ordering::SeqCst);
-    }
-}
-
-impl Default for ThinkingLevelCell {
-    fn default() -> Self {
-        Self::new(ThinkingLevel::Off)
     }
 }
 
