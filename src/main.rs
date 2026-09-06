@@ -6,12 +6,14 @@ mod paths;
 mod session;
 mod session_store;
 mod stream;
+mod thinking;
 mod transcript;
 mod tool;
 mod tui;
 
 
-use agent::{Agent, ThinkingLevel, ThinkingLevelCell};
+use agent::Agent;
+use thinking::{ThinkingLevel, ThinkingLevelCell};
 use clap::Parser;
 use openai_oxide::client::OpenAI;
 use std::sync::Arc;

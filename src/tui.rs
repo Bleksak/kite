@@ -16,7 +16,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Widget};
 use ratatui::{Frame, Terminal};
 
 
-use crate::agent::{Agent, ThinkingLevelCell};
+use crate::agent::Agent;
+use crate::thinking::ThinkingLevelCell;
 use crate::context::Context;
 use crate::paths::CONTEXT_DIR;
 use crate::session::{Cursor, Scroller, Session};
@@ -606,7 +607,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         ));
     }
     let thinking_level = state.thinking.get();
-    if thinking_level != crate::agent::ThinkingLevel::Off {
+    if thinking_level != crate::thinking::ThinkingLevel::Off {
         status_spans.push(Span::styled(
             format!("  ·  💭 {}", thinking_level.label()),
             Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
@@ -1933,15 +1934,15 @@ mod test {
         let mut state = TuiState::new("model".into());
         let event = TermEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
 
-        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::Off);
+        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Off);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::Low);
+        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Low);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::Medium);
+        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Medium);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::XHigh);
+        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::XHigh);
         handle_key(&mut state, &event);
-        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::Off);
+        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Off);
     }
 
     #[test]
