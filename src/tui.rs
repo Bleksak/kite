@@ -18,7 +18,7 @@ use ratatui::{Frame, Terminal};
 use crate::agent::Agent;
 use crate::context::Context;
 use crate::paths::CONTEXT_DIR;
-use crate::session::{Scroller, Session};
+use crate::session::{Cursor, Scroller, Session};
 use crate::session_store::{self, SessionFile};
 use crate::stream::AgentEvent;
 use crate::transcript::BlockKind;
@@ -36,11 +36,11 @@ pub struct TuiState {
     pub pane_width: usize,
     pub model: String,
     pub picker_open: bool,
-    pub picker_cursor: usize,
+    pub picker_cursor: Cursor,
     pub picker_query: String,
     pub picker_rename: Option<String>,
     pub tasks_open: bool,
-    pub tasks_cursor: usize,
+    pub tasks_cursor: Cursor,
     pub task_output_id: Option<String>,
     pub task_output_scroll: Scroller,
     next_id: u64,
@@ -55,11 +55,11 @@ impl TuiState {
             pane_width: 118,
             model,
             picker_open: false,
-            picker_cursor: 0,
+            picker_cursor: Cursor::default(),
             picker_query: String::new(),
             picker_rename: None,
             tasks_open: false,
-            tasks_cursor: 0,
+            tasks_cursor: Cursor::default(),
             task_output_id: None,
             task_output_scroll: Scroller::default(),
             next_id: 1,
@@ -113,19 +113,6 @@ pub enum KeyAction {
 }
 
 const PAGE: usize = 10;
-
-fn tasks_move(state: &mut TuiState, len: usize, down: bool) {
-    if len == 0 {
-        return;
-    }
-    state.tasks_cursor = if down {
-        (state.tasks_cursor + 1) % len
-    } else if state.tasks_cursor == 0 {
-        len - 1
-    } else {
-        state.tasks_cursor - 1
-    };
-}
 
 fn task_output_scroll_max(state: &TuiState) -> usize {
     let Some(id) = &state.task_output_id else {
@@ -225,7 +212,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             return match key.code {
                 KeyCode::Enter => {
                     let buf = state.picker_rename.take().unwrap();
-                    if let Some(i) = state.filtered().get(state.picker_cursor).copied() {
+                    if let Some(i) = state.filtered().get(state.picker_cursor.pos).copied() {
                         state.sessions[i].label = buf;
                     }
                     KeyAction::None
@@ -252,21 +239,11 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('j') => {
-                    let len = state.filtered().len();
-                    if len > 0 {
-                        state.picker_cursor = (state.picker_cursor + 1) % len;
-                    }
+                    state.picker_cursor.down(state.filtered().len());
                     KeyAction::None
                 }
                 KeyCode::Char('k') => {
-                    let len = state.filtered().len();
-                    if len > 0 {
-                        state.picker_cursor = if state.picker_cursor == 0 {
-                            len - 1
-                        } else {
-                            state.picker_cursor - 1
-                        };
-                    }
+                    state.picker_cursor.up(state.filtered().len());
                     KeyAction::None
                 }
                 KeyCode::Char('n') => {
@@ -278,7 +255,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 }
                 KeyCode::Char('x') => {
                     let filtered = state.filtered();
-                    if let Some(i) = filtered.get(state.picker_cursor).copied()
+                    if let Some(i) = filtered.get(state.picker_cursor.pos).copied()
                         && state.sessions.len() > 1
                         && !state.sessions[i].running
                     {
@@ -287,12 +264,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                             state.active = state.sessions.len() - 1;
                         }
                     }
-                    let len = state.filtered().len();
-                    state.picker_cursor = if len == 0 {
-                        0
-                    } else {
-                        state.picker_cursor.min(len - 1)
-                    };
+                    state.picker_cursor.clamp(state.filtered().len());
                     KeyAction::CloseSession
                 }
                 KeyCode::Char('r') => {
@@ -313,26 +285,16 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         }
         return match key.code {
             KeyCode::Up => {
-                let len = state.filtered().len();
-                if len > 0 {
-                    state.picker_cursor = if state.picker_cursor == 0 {
-                        len - 1
-                    } else {
-                        state.picker_cursor - 1
-                    };
-                }
+                state.picker_cursor.up(state.filtered().len());
                 KeyAction::None
             }
             KeyCode::Down => {
-                let len = state.filtered().len();
-                if len > 0 {
-                    state.picker_cursor = (state.picker_cursor + 1) % len;
-                }
+                state.picker_cursor.down(state.filtered().len());
                 KeyAction::None
             }
             KeyCode::Enter => {
                 let filtered = state.filtered();
-                if let Some(i) = filtered.get(state.picker_cursor).copied() {
+                if let Some(i) = filtered.get(state.picker_cursor.pos).copied() {
                     state.active = i;
                 }
                 state.picker_open = false;
@@ -344,22 +306,12 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             }
             KeyCode::Backspace => {
                 state.picker_query.pop();
-                let len = state.filtered().len();
-                state.picker_cursor = if len == 0 {
-                    0
-                } else {
-                    state.picker_cursor.min(len - 1)
-                };
+                state.picker_cursor.clamp(state.filtered().len());
                 KeyAction::None
             }
             KeyCode::Char(c) => {
                 state.picker_query.push(c);
-                let len = state.filtered().len();
-                state.picker_cursor = if len == 0 {
-                    0
-                } else {
-                    state.picker_cursor.min(len - 1)
-                };
+                state.picker_cursor.clamp(state.filtered().len());
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -371,11 +323,11 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('j') => {
-                    tasks_move(state, len, true);
+                    state.tasks_cursor.down(len);
                     KeyAction::None
                 }
                 KeyCode::Char('k') => {
-                    tasks_move(state, len, false);
+                    state.tasks_cursor.up(len);
                     KeyAction::None
                 }
                 KeyCode::Char('s') => {
@@ -392,29 +344,29 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         }
         return match key.code {
             KeyCode::Up => {
-                tasks_move(state, len, false);
+                state.tasks_cursor.up(len);
                 KeyAction::None
             }
             KeyCode::Down => {
-                tasks_move(state, len, true);
+                state.tasks_cursor.down(len);
                 KeyAction::None
             }
             KeyCode::Char('j') => {
-                tasks_move(state, len, true);
+                state.tasks_cursor.down(len);
                 KeyAction::None
             }
             KeyCode::Char('k') => {
-                tasks_move(state, len, false);
+                state.tasks_cursor.up(len);
                 KeyAction::None
             }
             KeyCode::Char('x') => {
-                if let Some(task) = tasks.get(state.tasks_cursor) {
+                if let Some(task) = tasks.get(state.tasks_cursor.pos) {
                     let _ = crate::bg::REGISTRY.kill(&task.id);
                 }
                 KeyAction::None
             }
             KeyCode::Enter => {
-                if let Some(task) = tasks.get(state.tasks_cursor) {
+                if let Some(task) = tasks.get(state.tasks_cursor.pos) {
                     state.task_output_id = Some(task.id.clone());
                     state.task_output_scroll = Scroller::at_tail();
                 }
@@ -432,13 +384,13 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             KeyCode::Char('s') => {
                 state.picker_open = true;
                 state.tasks_open = false;
-                state.picker_cursor = state.active;
+                state.picker_cursor.set(state.active);
                 KeyAction::None
             }
             KeyCode::Char('q') => {
                 state.tasks_open = true;
                 state.picker_open = false;
-                state.tasks_cursor = 0;
+                state.tasks_cursor.set(0);
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -681,7 +633,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                 .iter()
                 .enumerate()
                 .map(|(i, session_idx)| {
-                    let selected = i == state.picker_cursor;
+                    let selected = i == state.picker_cursor.pos;
                     let session = &state.sessions[*session_idx];
                     let marker = if selected { "›" } else { " " };
                     let status = if session.running { "working…" } else { "idle" };
@@ -762,7 +714,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                 .iter()
                 .enumerate()
                 .map(|(i, task)| {
-                    let selected = i == state.tasks_cursor;
+                    let selected = i == state.tasks_cursor.pos;
                     let status = match &task.status {
                         crate::bg::BgStatus::Running => "running  ".to_string(),
                         crate::bg::BgStatus::Finished(None) => "killed   ".to_string(),
@@ -1256,7 +1208,7 @@ mod test {
         handle_key(&mut state, &ctrl('s'));
 
         assert!(state.picker_open);
-        assert_eq!(state.picker_cursor, 1);
+        assert_eq!(state.picker_cursor.pos, 1);
 
         handle_key(&mut state, &ctrl('s'));
         assert!(!state.picker_open);
@@ -1277,11 +1229,11 @@ mod test {
 
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &ctrl('k'));
-        assert_eq!(state.picker_cursor, 1);
+        assert_eq!(state.picker_cursor.pos, 1);
         handle_key(&mut state, &ctrl('k'));
-        assert_eq!(state.picker_cursor, 0);
+        assert_eq!(state.picker_cursor.pos, 0);
         handle_key(&mut state, &ctrl('j'));
-        assert_eq!(state.picker_cursor, 1);
+        assert_eq!(state.picker_cursor.pos, 1);
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.active, 1);
         assert!(!state.picker_open);
@@ -1377,7 +1329,7 @@ mod test {
 
         handle_key(&mut state, &key(KeyCode::Char('l')));
         assert_eq!(state.filtered(), vec![0]);
-        assert_eq!(state.picker_cursor, 0);
+        assert_eq!(state.picker_cursor.pos, 0);
 
         handle_key(&mut state, &key(KeyCode::Char('2')));
         assert!(state.filtered().is_empty());
@@ -1392,11 +1344,11 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('q'));
-        state.tasks_cursor = crate::bg::REGISTRY
+        state.tasks_cursor.set(crate::bg::REGISTRY
             .list()
-            .iter()
-            .position(|t| t.id == id)
-            .unwrap();
+.iter()
+.position(|t| t.id == id)
+.unwrap());
         assert!(state.tasks_open);
         assert!(!state.picker_open);
 
@@ -1435,7 +1387,7 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert_eq!(state.tasks_cursor, 0);
+        assert_eq!(state.tasks_cursor.pos, 0);
         handle_key(&mut state, &key(KeyCode::Char('q')));
         assert!(!state.tasks_open);
     }
@@ -1455,11 +1407,11 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('q'));
-        state.tasks_cursor = crate::bg::REGISTRY
+        state.tasks_cursor.set(crate::bg::REGISTRY
             .list()
-            .iter()
-            .position(|t| t.id == id)
-            .unwrap();
+.iter()
+.position(|t| t.id == id)
+.unwrap());
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.task_output_id.as_deref(), Some(id.as_str()));
 
@@ -1641,7 +1593,7 @@ mod test {
         state.sessions.push(Session::new(1));
         state.sessions[1].label = "old name".into();
         state.picker_open = true;
-        state.picker_cursor = 1;
+        state.picker_cursor.set(1);
         state.picker_rename = Some("new na".into());
 
         let backend = TestBackend::new(80, 12);

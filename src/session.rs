@@ -50,6 +50,33 @@ impl Session {
 }
 
 #[derive(Default)]
+pub struct Cursor {
+    pub pos: usize,
+}
+
+impl Cursor {
+    pub fn down(&mut self, len: usize) {
+        if len > 0 {
+            self.pos = (self.pos + 1) % len;
+        }
+    }
+
+    pub fn up(&mut self, len: usize) {
+        if len > 0 {
+            self.pos = if self.pos == 0 { len - 1 } else { self.pos - 1 };
+        }
+    }
+
+    pub fn clamp(&mut self, len: usize) {
+        self.pos = if len == 0 { 0 } else { self.pos.min(len - 1) };
+    }
+
+    pub fn set(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+}
+
+#[derive(Default)]
 pub struct Scroller {
     pub offset: usize,
     pub following: bool,

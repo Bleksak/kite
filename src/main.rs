@@ -3,8 +3,6 @@ mod bg;
 mod context;
 mod message;
 mod paths;
-mod repl;
-mod render;
 mod session;
 mod session_store;
 mod stream;
@@ -14,8 +12,7 @@ mod tui;
 
 
 use agent::Agent;
-use std::io::IsTerminal;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use openai_oxide::client::OpenAI;
 
 const SYSTEM_PROMPT: &str = "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them.";
@@ -36,22 +33,13 @@ struct Cli {
 
     #[arg(long, default_value_t = 300)]
     bash_timeout: u64,
-
-    #[arg(long, value_enum)]
-    ui: Option<Ui>,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
 enum Thinking {
     Auto,
     On,
     Off,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum Ui {
-    Plain,
-    Tui,
 }
 
 fn build_agent(
@@ -84,38 +72,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(cli.api_url));
     let model = cli.model.clone();
 
-    let use_tui = match cli.ui {
-        Some(Ui::Tui) => true,
-        Some(Ui::Plain) => false,
-        None => std::io::stdin().is_terminal(),
-    };
-
-    if use_tui {
-        let client = client.clone();
-        tui::run(
-            {
-                let model = model.clone();
-                move || {
-                    build_agent(
-                        &client,
-                        &model,
-                        cli.thinking,
-                        cli.context_window,
-                        cli.bash_timeout,
-                    )
-                }
-            },
-            model,
-        )
-        .await
-    } else {
-        repl::run_plain(build_agent(
-            &client,
-            &model,
-            cli.thinking,
-            cli.context_window,
-            cli.bash_timeout,
-        ))
-        .await
-    }
+    let client = client.clone();
+    tui::run(
+        {
+            let model = model.clone();
+            move || {
+                build_agent(
+                    &client,
+                    &model,
+                    cli.thinking,
+                    cli.context_window,
+                    cli.bash_timeout,
+                )
+            }
+        },
+        model,
+    )
+    .await
 }
