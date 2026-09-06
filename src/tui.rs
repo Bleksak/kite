@@ -549,11 +549,8 @@ fn display_lines(
         .zip(blocks.iter())
         .map(|(line, block)| {
             let (text_background, block_background) = match block {
-                BlockKind::User => (None, Some(Color::Rgb(192, 192, 192))),
-                BlockKind::Thinking => (
-                    Some(Color::Rgb(128, 128, 128)),
-                    Some(Color::Rgb(128, 128, 128)),
-                ),
+                BlockKind::User => (None, Some(Color::Rgb(128, 128, 128))),
+                BlockKind::Thinking => (None, Some(Color::Rgb(192, 192, 192))),
                 _ => (None, None),
             };
             if text_background.is_none() && block_background.is_none() {
@@ -1110,11 +1107,11 @@ mod test {
         let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
         let user = &display[1];
         assert_eq!(user.width(), 40);
-        assert_eq!(user.spans[0].style.bg, Some(Color::Rgb(192, 192, 192)));
-        assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::Rgb(192, 192, 192)));
+        assert_eq!(user.spans[0].style.bg, Some(Color::Rgb(128, 128, 128)));
+        assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::Rgb(128, 128, 128)));
         let thinking = &display[4];
         assert_eq!(thinking.width(), 40);
-        assert_eq!(thinking.spans.last().unwrap().style.bg, Some(Color::Rgb(128, 128, 128)));
+        assert_eq!(thinking.spans.last().unwrap().style.bg, Some(Color::Rgb(192, 192, 192)));
         assert_eq!(thinking.spans[0].style.fg, Some(Color::Black));
         let answer = &display[7];
         assert!(answer.spans.iter().all(|s| s.style.bg.is_none()));
