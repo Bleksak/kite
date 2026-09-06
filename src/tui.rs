@@ -302,7 +302,7 @@ impl TuiRenderer {
         let lines = style_markdown_lines(
             render_markdown_lines(&self.turn_answer),
             None,
-            Some(Color::Yellow),
+            None,
         );
         let count = lines.len();
         self.scrollback.splice(start.., lines);
@@ -316,12 +316,9 @@ impl TuiRenderer {
 
     fn push_markdown(&mut self, text: &str, block: BlockKind) {
         let (base, bold) = match block {
-            BlockKind::User => (
-                Some(Color::Rgb(212, 212, 212)),
-                Some(Color::Yellow),
-            ),
+            BlockKind::User => (Some(Color::Rgb(212, 212, 212)), None),
             BlockKind::Thinking => (Some(Color::Rgb(128, 128, 128)), None),
-            _ => (None, Some(Color::Yellow)),
+            _ => (None, None),
         };
         let lines = style_markdown_lines(render_markdown_lines(text), base, bold);
         for line in lines {
@@ -1553,7 +1550,7 @@ mod test {
     }
 
     #[test]
-    fn user_markdown_gets_white_base_and_yellow_bold() {
+    fn user_markdown_gets_pi_base_and_plain_bold() {
         let mut renderer = TuiRenderer::new();
         renderer.push_user("plain **bold** and `code`");
         renderer.finish();
@@ -1562,7 +1559,7 @@ mod test {
         let spans = &line.spans;
         assert_eq!(spans[0].style.fg, Some(Color::Rgb(212, 212, 212)));
         let bold_span = spans.iter().find(|s| s.content.as_ref() == "bold").unwrap();
-        assert_eq!(bold_span.style.fg, Some(Color::Yellow));
+        assert_eq!(bold_span.style.fg, Some(Color::Rgb(212, 212, 212)));
         assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
         let code_span = spans.iter().find(|s| s.content.as_ref() == "code").unwrap();
         assert_eq!(code_span.style.fg, Some(Color::Rgb(138, 190, 183)));
