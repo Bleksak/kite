@@ -251,7 +251,7 @@ impl TuiState {
             renderer: TuiRenderer::new(),
             scroll: 0,
             following: true,
-            viewport: 24,
+            viewport: 22,
             pane_width: 118,
             tail_cache: (0, 0, 0, 0),
             input: String::new(),
@@ -524,8 +524,8 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
         }
         state.viewport = terminal
             .size()
-            .map(|size| size.height.saturating_sub(6) as usize)
-            .unwrap_or(24);
+            .map(|size| size.height.saturating_sub(8) as usize)
+            .unwrap_or(22);
         state.pane_width = terminal
             .size()
             .map(|size| size.width.saturating_sub(2) as usize)
@@ -831,6 +831,44 @@ mod test {
         state.renderer.finish();
 
         assert_eq!(state.max_scroll(), 1);
+    }
+
+
+
+
+
+    #[test]
+    fn tail_shows_the_last_line_of_a_large_scrollback() {
+        let mut state = TuiState::new("model".into());
+        state.viewport = 22;
+        state.pane_width = 118;
+        for i in 0..30 {
+            let width = if i % 3 == 0 { 300 } else { 20 };
+            state.renderer.on_event(text(&format!("line {} {}\n", i, "x".repeat(width))));
+        }
+        state.renderer.finish();
+        state.following = true;
+        state.scroll = state.max_scroll();
+
+        let scrollback = state.renderer.scrollback();
+        let last_line = scrollback.last().unwrap().to_string();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 118, 24));
+        Paragraph::new(&scrollback[state.scroll..])
+            .wrap(Wrap { trim: false })
+            .render(Rect::new(0, 0, 118, 22), &mut buffer);
+        let mut rows = Vec::new();
+        for y in 0..22 {
+            let mut row = String::new();
+            for x in 0..118 {
+                row.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            rows.push(row);
+        }
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains(&last_line),
+            "last line {last_line} missing from tail viewport:\n{joined}"
+        );
     }
 
     #[test]
