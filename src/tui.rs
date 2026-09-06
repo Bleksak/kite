@@ -9,7 +9,7 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Widget};
 use ratatui::{Frame, Terminal};
@@ -268,7 +268,11 @@ impl TuiRenderer {
             self.answer_start = None;
             return;
         }
-        let lines = render_markdown_lines(&self.turn_answer);
+        let lines = style_markdown_lines(
+            render_markdown_lines(&self.turn_answer),
+            None,
+            Some(Color::Yellow),
+        );
         let count = lines.len();
         self.scrollback.splice(start.., lines);
         self.blocks.splice(
@@ -280,7 +284,16 @@ impl TuiRenderer {
     }
 
     fn push_markdown(&mut self, text: &str, block: BlockKind) {
-        for line in render_markdown_lines(text) {
+        let (base, bold) = match block {
+            BlockKind::User => (
+                Some(Color::Rgb(255, 255, 255)),
+                Some(Color::Yellow),
+            ),
+            BlockKind::Thinking => (Some(Color::Black), Some(Color::Blue)),
+            _ => (None, Some(Color::Yellow)),
+        };
+        let lines = style_markdown_lines(render_markdown_lines(text), base, bold);
+        for line in lines {
             self.push_line(line, block);
         }
     }
@@ -307,6 +320,46 @@ fn padding_line() -> Line<'static> {
         " ".to_string(),
         Style::default().fg(Color::Red),
     ))
+}
+
+fn style_markdown_lines(
+    lines: Vec<Line<'static>>,
+    base: Option<Color>,
+    bold: Option<Color>,
+) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let spans: Vec<Span> = line
+                .spans
+                .iter()
+                .map(|span| {
+                    let style = if span.style.fg.is_none() {
+                        let color = if span.style.add_modifier.contains(Modifier::BOLD) {
+                            bold
+                        } else {
+                            base
+                        };
+                        match color {
+                            Some(color) => span.style.patch(Style::default().fg(color)),
+                            None => span.style,
+                        }
+                    } else {
+                        span.style
+                    };
+                    Span {
+                        content: std::borrow::Cow::Owned(span.content.to_string()),
+                        style,
+                    }
+                })
+                .collect();
+            Line {
+                style: line.style,
+                alignment: line.alignment,
+                spans,
+            }
+        })
+        .collect()
 }
 
 fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
@@ -1462,6 +1515,34 @@ mod test {
         let line = &renderer.scrollback()[1];
         assert_eq!(line.spans[0].content.as_ref(), "just a question");
         assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn user_markdown_gets_white_base_and_colored_bold() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_user("plain **bold** and `code`");
+        renderer.finish();
+
+        let line = &renderer.scrollback()[1];
+        let spans = &line.spans;
+        assert_eq!(spans[0].style.fg, Some(Color::Rgb(255, 255, 255)));
+        let bold_span = spans.iter().find(|s| s.content.as_ref() == "bold").unwrap();
+        assert_eq!(bold_span.style.fg, Some(Color::Yellow));
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+        let code_span = spans.iter().find(|s| s.content.as_ref() == "code").unwrap();
+        assert_eq!(code_span.style.fg, Some(Color::White));
+        assert_eq!(code_span.style.bg, Some(Color::Black));
+    }
+
+    #[test]
+    fn thinking_markdown_gets_black_base_and_colored_bold() {
+        let rendered = lines(vec![thinking("plain **bold**"), text("done")]);
+
+        let line = &rendered[1];
+        let spans = &line.spans;
+        assert_eq!(spans[0].style.fg, Some(Color::Black));
+        let bold_span = spans.iter().find(|s| s.content.as_ref() == "bold").unwrap();
+        assert_eq!(bold_span.style.fg, Some(Color::Blue));
     }
 
     #[test]
