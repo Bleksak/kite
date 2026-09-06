@@ -207,6 +207,9 @@ impl TuiRenderer {
             if line.trim().is_empty() && self.answer_start.is_none() {
                 continue;
             }
+            if self.answer_start.is_none() {
+                self.push_line(padding_line(), BlockKind::Answer);
+            }
             self.mark_answer_start();
             if line.is_empty() {
                 self.push_line(Line::default(), BlockKind::Answer);
@@ -223,6 +226,9 @@ impl TuiRenderer {
         let line = strip_vs16(&mem::take(&mut self.answer));
         if line.trim().is_empty() && self.answer_start.is_none() {
             return;
+        }
+        if self.answer_start.is_none() {
+            self.push_line(padding_line(), BlockKind::Answer);
         }
         self.mark_answer_start();
         self.push_line(Line::from(line), BlockKind::Answer);
@@ -544,7 +550,7 @@ fn display_lines(
         .map(|(line, block)| {
             let background = match block {
                 BlockKind::User => Some(Style::default().bg(Color::DarkGray)),
-                BlockKind::Thinking => Some(Style::default().bg(Color::Indexed(252))),
+                BlockKind::Thinking => Some(Style::default().bg(Color::Rgb(128, 128, 128))),
                 _ => None,
             };
             let Some(background) = background else {
@@ -804,6 +810,7 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 ("Let me think. ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("42".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
             ]
@@ -823,6 +830,7 @@ mod test {
             vec![
                 (" ".into(), Modifier::empty()),
                 ("reasoning ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("answer".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -869,6 +877,7 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 ("glued".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("narration".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -894,10 +903,12 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 ("first ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("narration".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("second ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("answer".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -1014,6 +1025,7 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("Hello world".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
             ]
@@ -1027,6 +1039,7 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("first".into(), Modifier::empty()),
                 ("second".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -1079,7 +1092,7 @@ mod test {
         assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::DarkGray));
         let thinking = &display[4];
         assert_eq!(thinking.width(), 40);
-        assert_eq!(thinking.spans.last().unwrap().style.bg, Some(Color::Indexed(252)));
+        assert_eq!(thinking.spans.last().unwrap().style.bg, Some(Color::Rgb(128, 128, 128)));
         assert_eq!(thinking.spans[0].style.fg, Some(Color::Black));
         let answer = &display[7];
         assert!(answer.spans.iter().all(|s| s.style.bg.is_none()));
@@ -1092,6 +1105,7 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("Hello".into(), Modifier::empty()),
                 ("world".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -1109,6 +1123,7 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 ("Let me think.".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("42".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
             ]
@@ -1122,6 +1137,7 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("one".into(), Modifier::empty()),
                 ("".into(), Modifier::empty()),
                 ("two".into(), Modifier::empty()),
@@ -1140,7 +1156,7 @@ mod test {
         }
         state.renderer.finish();
 
-        assert_eq!(state.max_scroll(), 2);
+        assert_eq!(state.max_scroll(), 3);
     }
 
 
@@ -1193,7 +1209,7 @@ mod test {
         state.scroll = state.max_scroll();
 
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
-        assert_eq!(state.scroll, 1);
+        assert_eq!(state.scroll, 2);
         assert!(!state.following);
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
         assert_eq!(state.scroll, 0);
@@ -1201,7 +1217,7 @@ mod test {
         assert_eq!(state.scroll, 10);
         assert!(!state.following);
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageDown)), KeyAction::None);
-        assert_eq!(state.scroll, 11);
+        assert_eq!(state.scroll, 12);
         assert!(state.following);
     }
 
@@ -1233,10 +1249,10 @@ mod test {
             AgentEvent::CompletionStarted,
         ]);
 
-        assert_eq!(rendered.len(), 2);
-        assert_eq!(rendered[0].spans.len(), 3);
-        assert_eq!(rendered[0].spans[1].content, "bold");
-        assert!(rendered[0].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered.len(), 3);
+        assert_eq!(rendered[1].spans.len(), 3);
+        assert_eq!(rendered[1].spans[1].content, "bold");
+        assert!(rendered[1].spans[1].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1246,10 +1262,10 @@ mod test {
             AgentEvent::CompletionStarted,
         ]);
 
-        assert_eq!(rendered.len(), 4);
-        assert!(rendered[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(rendered[0].style.add_modifier.contains(Modifier::UNDERLINED));
-        assert!(rendered[2].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered.len(), 5);
+        assert!(rendered[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(rendered[1].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(rendered[3].spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1261,6 +1277,7 @@ mod test {
             vec![
                 (" ".into(), Modifier::empty()),
                 ("**not** rendered".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("done".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -1292,11 +1309,11 @@ mod test {
             text("second **b**"),
         ]);
 
-        assert_eq!(rendered.len(), 4);
-        assert!(rendered[0].spans[1].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(rendered[0].spans[1].content, "a");
-        assert!(rendered[2].spans[1].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(rendered[2].spans[1].content, "b");
+        assert_eq!(rendered.len(), 6);
+        assert!(rendered[1].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered[1].spans[1].content, "a");
+        assert!(rendered[4].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered[4].spans[1].content, "b");
     }
 
     #[test]
