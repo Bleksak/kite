@@ -23,6 +23,10 @@ impl StyleSheet for TuiStyleSheet {
     fn code_block_fence(&self) -> &str {
         ""
     }
+
+    fn code(&self) -> Style {
+        Style::new().cyan().on_black()
+    }
 }
 
 static MD_OPTIONS: LazyLock<Options<TuiStyleSheet>> = LazyLock::new(|| Options::new(TuiStyleSheet));
@@ -1530,7 +1534,7 @@ mod test {
         assert_eq!(bold_span.style.fg, Some(Color::Yellow));
         assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
         let code_span = spans.iter().find(|s| s.content.as_ref() == "code").unwrap();
-        assert_eq!(code_span.style.fg, Some(Color::White));
+        assert_eq!(code_span.style.fg, Some(Color::Cyan));
         assert_eq!(code_span.style.bg, Some(Color::Black));
     }
 
