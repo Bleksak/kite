@@ -65,6 +65,7 @@ pub enum Tool {
     WriteFile(String, String),
     EditFile(String, String, String),
     WebFetch(String),
+    BgRun(String),
 }
 
 pub enum ToolOutput<'a> {
@@ -94,6 +95,7 @@ impl Tool {
             Tool::WriteFile(_, _) => "write_file",
             Tool::EditFile(_, _, _) => "edit_file",
             Tool::WebFetch(_) => "webfetch",
+            Tool::BgRun(_) => "bg_run",
         }
     }
 
@@ -116,6 +118,7 @@ impl Tool {
             Tool::WriteFile(path, _) => format!("write_file: {path}"),
             Tool::EditFile(path, _, _) => format!("edit_file: {path}"),
             Tool::WebFetch(url) => format!("webfetch: {url}"),
+            Tool::BgRun(_) => "bg_run".to_string(),
         }
     }
 
@@ -127,6 +130,7 @@ impl Tool {
             Tool::WriteFile(_, content) => ToolOutput::Before(content),
             Tool::EditFile(..) => ToolOutput::After,
             Tool::WebFetch(url) => ToolOutput::Before(url),
+            Tool::BgRun(command) => ToolOutput::Before(command),
         }
     }
 
@@ -140,6 +144,9 @@ impl Tool {
             Tool::WriteFile(_, _) => "Write a file",
             Tool::EditFile(_, _, _) => "Edit a file",
             Tool::WebFetch(_) => "Fetch a URL and return the response body",
+            Tool::BgRun(_) => {
+                "Run a long-running command in the background (tests, builds, dev servers). Returns a task id immediately; the task's result is reported automatically when it finishes"
+            }
         }
     }
 
@@ -269,6 +276,12 @@ impl Tool {
 
                 Ok(cap_output(body))
             }
+            Tool::BgRun(command) => {
+                let id = crate::bg::REGISTRY
+                    .run(command)
+                    .map_err(|source| ToolError::Io(std::io::Error::other(source.to_string())))?;
+                Ok(format!("task {id} started; its result will be reported when it finishes"))
+            }
         }
     }
 
@@ -392,6 +405,8 @@ impl TryFrom<OpenAIToolCall> for Tool {
                 .map(|a| Tool::EditFile(a.path, a.old_content, a.new_content)),
             "webfetch" => parse_args::<WebFetchArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::WebFetch(a.url)),
+            "bg_run" => parse_args::<BashArgs>(&function.name, &function.arguments)
+                .map(|a| Tool::BgRun(a.command)),
             other => Err(ToolError::UnknownTool {
                 name: other.to_string(),
             }),
@@ -407,6 +422,7 @@ pub fn tool_definitions() -> Vec<OpenAITool> {
         Tool::WriteFile(String::new(), String::new()),
         Tool::EditFile(String::new(), String::new(), String::new()),
         Tool::WebFetch(String::new()),
+        Tool::BgRun(String::new()),
     ];
 
     tools
@@ -424,7 +440,7 @@ pub fn tool_definitions() -> Vec<OpenAITool> {
 
 fn parameters(tool: &Tool) -> serde_json::Value {
     match tool {
-        Tool::Bash(_) | Tool::ReadOnlyBash(_) => json!({
+        Tool::Bash(_) | Tool::ReadOnlyBash(_) | Tool::BgRun(_) => json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "the shell command to run" }

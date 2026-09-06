@@ -31,10 +31,6 @@ impl<W: Write, E: Write> Renderer<W, E> {
         match event {
             AgentEvent::CompletionStarted => {
                 self.close_thinking();
-                if let Some(remaining) = self.gate.finish() {
-                    let _ = writeln!(self.out, "{remaining}");
-                    let _ = self.out.flush();
-                }
                 self.gate = AnswerGate::new();
             }
             AgentEvent::Tokens(chunk) => {
@@ -76,15 +72,24 @@ impl<W: Write, E: Write> Renderer<W, E> {
                 self.close_output();
                 let _ = self.out.flush();
             }
+            AgentEvent::BgTaskDone { id, command, code } => {
+                let status = match code {
+                    Some(0) => "exit 0".to_string(),
+                    Some(code) => format!("exit {code}"),
+                    None => "killed".to_string(),
+                };
+                let _ = writeln!(
+                    self.err,
+                    "⏺ task {id} ({command}) finished — {status}"
+                );
+                let _ = self.err.flush();
+            }
         }
     }
 
     pub fn finish(&mut self) {
         self.close_thinking();
         self.close_output();
-        if let Some(remaining) = self.gate.finish() {
-            let _ = writeln!(self.out, "{remaining}");
-        }
         let _ = writeln!(self.out);
         let _ = self.out.flush();
     }
@@ -289,7 +294,7 @@ mod test {
     }
 
     #[test]
-    fn buffered_text_flushes_at_the_completion_boundary() {
+    fn text_glued_to_thinking_is_emitted_immediately() {
         let (out, err) = render(
             false,
             false,
@@ -307,7 +312,7 @@ mod test {
             err,
             "<thinking>\nglued</thinking>\n<thinking>\nnext round</thinking>\n"
         );
-        assert_eq!(out, "narration\n\n");
+        assert_eq!(out, "narration\n");
     }
 
     #[test]

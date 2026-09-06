@@ -25,6 +25,7 @@ pub enum AgentEvent {
     Tokens(ChunkTokens),
     ToolStarted { header: String, body: Option<String> },
     ToolResult { header: String, body: String },
+    BgTaskDone { id: String, command: String, code: Option<i32> },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -35,14 +36,12 @@ pub enum ThinkingMode {
 
 pub struct AnswerGate {
     answer_started: bool,
-    buffered: String,
 }
 
 impl AnswerGate {
     pub fn new() -> AnswerGate {
         AnswerGate {
             answer_started: false,
-            buffered: String::new(),
         }
     }
 
@@ -58,26 +57,11 @@ impl AnswerGate {
 
         let mut out = None;
         if let Some(t) = text {
-            if self.answer_started {
-                out = Some(t.clone());
-            } else if thinking.is_none() {
-                self.answer_started = true;
-                self.buffered.push_str(t);
-                out = Some(std::mem::take(&mut self.buffered));
-            } else {
-                self.buffered.push_str(t);
-            }
+            self.answer_started = true;
+            out = Some(t.clone());
         }
 
         (thinking_mode, out)
-    }
-
-    pub fn finish(&mut self) -> Option<String> {
-        if self.answer_started || self.buffered.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.buffered))
-        }
     }
 }
 
@@ -244,6 +228,8 @@ pub struct Agent {
     pub context: Context,
     pub extra_body: Option<serde_json::Value>,
     pub bash_timeout: Duration,
+    bg_seen: std::collections::HashSet<String>,
+    bg_mine: std::collections::HashSet<String>,
 }
 
 const MAX_TOOL_ROUNDS: usize = 25;
@@ -262,6 +248,8 @@ impl Agent {
             context: Context::new(system_prompt, max_tokens),
             extra_body: None,
             bash_timeout,
+            bg_seen: std::collections::HashSet::new(),
+            bg_mine: std::collections::HashSet::new(),
         }
     }
 
@@ -283,7 +271,24 @@ impl Agent {
         self.context.messages.push(Message::User {
             content: user_message.to_string(),
         });
+        self.run_turns(on_event).await
+    }
 
+    pub async fn bg_turn(
+        &mut self,
+        on_event: &mut impl FnMut(AgentEvent),
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        self.run_turns(on_event).await
+    }
+
+    pub fn owns_and_unseen(&self, id: &str) -> bool {
+        self.bg_mine.contains(id) && !self.bg_seen.contains(id)
+    }
+
+    async fn run_turns(
+        &mut self,
+        on_event: &mut impl FnMut(AgentEvent),
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let mut round = 0;
         loop {
             round += 1;
@@ -293,6 +298,7 @@ impl Agent {
             if self.context.needs_compaction() {
                 self.context.compact();
             }
+            self.report_bg_tasks(on_event);
             on_event(AgentEvent::CompletionStarted);
 
             let (message, usage) = self
@@ -306,6 +312,27 @@ impl Agent {
             if let Step::Done(text) = self.handle_response(message, on_event).await {
                 return Ok(text);
             }
+        }
+    }
+
+    fn report_bg_tasks(&mut self, on_event: &mut impl FnMut(AgentEvent)) {
+        let reports = crate::bg::REGISTRY.due_reports(&mut self.bg_seen);
+        for report in reports {
+            self.context.messages.push(Message::User {
+                content: format!(
+                    "Background task {} finished ({}).\nCommand: {}\nOutput: {}\nOutput file: {}",
+                    report.id,
+                    report.status_line(),
+                    report.command,
+                    report.tail(4096),
+                    report.output_path.display(),
+                ),
+            });
+            on_event(AgentEvent::BgTaskDone {
+                id: report.id,
+                command: report.command,
+                code: report.code,
+            });
         }
     }
 
@@ -379,11 +406,17 @@ impl Agent {
         let mut outputs = outputs.into_iter();
         for (call, slot) in calls.iter().zip(slots) {
             let content = match slot {
-                Ok((_, header)) => {
+                Ok((tool, header)) => {
                     let content = match outputs.next().unwrap() {
                         Ok(output) => output,
                         Err(error) => error.to_string(),
                     };
+                    if matches!(tool, Tool::BgRun(_))
+                        && let Some(rest) = content.strip_prefix("task ")
+                        && let Some(id) = rest.split_whitespace().next()
+                    {
+                        self.bg_mine.insert(id.to_string());
+                    }
                     on_event(AgentEvent::ToolResult {
                         header,
                         body: content.clone(),
@@ -450,6 +483,7 @@ mod test {
     use super::*;
     use openai_oxide::types::chat::{FunctionCall, ToolCall};
     use test_files::TestFiles;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
@@ -510,6 +544,99 @@ mod test {
                 &mut |event| events.push(event),
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn bg_turn_delivers_finished_task_to_the_model() {
+        fn complete_request(data: &[u8]) -> Option<String> {
+            let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
+            let headers = std::str::from_utf8(&data[..header_end]).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })?;
+            let body_start = header_end + 4;
+            if data.len() < body_start + length {
+                return None;
+            }
+            Some(String::from_utf8_lossy(&data[body_start..body_start + length]).into_owned())
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                data.extend_from_slice(&buf[..n]);
+                                if let Some(body) = complete_request(&data) {
+                                    let _ = tx.send(body);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"tests reported\"}}]}\n\ndata: [DONE]\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
+        );
+        let mut agent = Agent::new(client, "test-model", "be concise", 10000, Duration::from_secs(30));
+
+        let mut events = vec![];
+        run_tool_call(
+            &mut agent,
+            "t1",
+            "bg_run",
+            r#"{"command":"echo bg-e2e-marker"}"#,
+            &mut events,
+        )
+        .await;
+
+        for _ in 0..200 {
+            if crate::bg::REGISTRY.list().iter().any(|t| {
+                t.command == "echo bg-e2e-marker"
+                    && matches!(t.status, crate::bg::BgStatus::Finished(_))
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let id = crate::bg::REGISTRY
+            .list()
+            .into_iter()
+            .find(|t| t.command == "echo bg-e2e-marker")
+            .unwrap()
+            .id;
+        assert!(agent.owns_and_unseen(&id));
+
+        let answer = agent.bg_turn(&mut |event| events.push(event)).await.unwrap();
+        assert_eq!(answer, "tests reported");
+
+        let request = rx.recv().await.unwrap();
+        assert!(request.contains("Background task"));
+        assert!(request.contains("bg-e2e-marker"));
     }
 
     #[tokio::test]
@@ -772,10 +899,10 @@ mod test {
         assert_eq!(text, "hello");
 
         let tools = request.tools.as_ref().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         assert_eq!(
             tools.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>(),
-            vec!["bash", "readonly_bash", "read_file", "write_file", "edit_file", "webfetch"]
+            vec!["bash", "readonly_bash", "read_file", "write_file", "edit_file", "webfetch", "bg_run"]
         );
     }
 
@@ -993,32 +1120,13 @@ mod test {
     }
 
     #[test]
-    fn gate_buffers_text_glued_to_reasoning() {
+    fn gate_emits_text_glued_to_reasoning_immediately() {
         let mut gate = AnswerGate::new();
 
         let (mode, out) = gate.on_chunk(&gate_chunk(Some("reasoning"), Some("Hello")));
-        assert_eq!((mode, out), (ThinkingMode::Live, None));
+        assert_eq!((mode, out), (ThinkingMode::Live, Some("Hello".into())));
 
-        let (mode, out) = gate.on_chunk(&gate_chunk(None, Some(" world")));
-        assert_eq!((mode, out), (ThinkingMode::Hidden, Some("Hello world".into())));
-    }
-
-    #[test]
-    fn gate_flushes_buffered_text_when_no_pure_chunk_arrives() {
-        let mut gate = AnswerGate::new();
-
-        gate.on_chunk(&gate_chunk(Some("reasoning"), Some("all")));
-        gate.on_chunk(&gate_chunk(Some("still reasoning"), Some("glued")));
-
-        assert_eq!(gate.finish(), Some("allglued".into()));
-    }
-
-    #[test]
-    fn gate_finish_is_empty_when_answer_started() {
-        let mut gate = AnswerGate::new();
-
-        gate.on_chunk(&gate_chunk(None, Some("hi")));
-
-        assert_eq!(gate.finish(), None);
+        let (mode, out) = gate.on_chunk(&gate_chunk(Some("more reasoning"), Some(" world")));
+        assert_eq!((mode, out), (ThinkingMode::Hidden, Some(" world".into())));
     }
 }

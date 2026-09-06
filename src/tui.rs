@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::mem;
+use std::path::Path;
 use std::sync::LazyLock;
 
 use crossterm::cursor;
@@ -15,6 +16,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Widget};
 use ratatui::{Frame, Terminal};
 
 use tui_markdown::{from_str_with_options, Options, StyleSheet};
+use serde::{Deserialize, Serialize};
+
+use crate::context::Context;
+
+const SESSIONS_DIR: &str = ".kite/sessions";
 
 #[derive(Clone)]
 struct TuiStyleSheet;
@@ -58,12 +64,14 @@ impl StyleSheet for TuiStyleSheet {
 
 static MD_OPTIONS: LazyLock<Options<TuiStyleSheet>> = LazyLock::new(|| Options::new(TuiStyleSheet));
 
-use crate::agent::{Agent, AgentEvent, AnswerGate, ThinkingMode};
+use crate::agent::{Agent, AgentEvent, AnswerGate, ChunkTokens, ThinkingMode};
+use crate::message::Message;
+use crate::tool::{Tool, ToolOutput};
 
 pub enum TuiEvent {
-    Agent(AgentEvent),
-    TurnDone { prompt: u64, completion: u64 },
-    TurnError(String),
+    Agent { session: u64, event: AgentEvent },
+    TurnDone { session: u64, context: Context },
+    TurnError { session: u64, message: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -138,14 +146,48 @@ impl TuiRenderer {
         self.push_line(padding_line(), BlockKind::User);
     }
 
+    pub fn replay_context(&mut self, context: &Context) {
+        let mut tool_headers: HashMap<String, String> = HashMap::new();
+        for message in &context.messages {
+            match message {
+                Message::System { .. } => {}
+                Message::User { content } => self.push_user(content),
+                Message::Assistant { content, tool_calls } => {
+                    if let Some(text) = content {
+                        self.on_event(AgentEvent::Tokens(ChunkTokens {
+                            thinking: None,
+                            text: Some(text.clone()),
+                        }));
+                        self.on_event(AgentEvent::CompletionStarted);
+                    }
+                    for call in tool_calls {
+                        if let Ok(tool) = Tool::try_from(call.clone()) {
+                            let header = tool.header();
+                            tool_headers.insert(call.id.clone(), header.clone());
+                            let body = match tool.output() {
+                                ToolOutput::Before(body) => Some(body.to_string()),
+                                _ => None,
+                            };
+                            self.on_event(AgentEvent::ToolStarted { header, body });
+                        }
+                    }
+                }
+                Message::Tool { tool_call_id, content } => {
+                    if let Some(header) = tool_headers.get(tool_call_id).cloned() {
+                        self.on_event(AgentEvent::ToolResult {
+                            header,
+                            body: content.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     pub fn on_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::CompletionStarted => {
                 self.close_thinking();
-                if let Some(remaining) = self.gate.finish() {
-                    self.push_answer_text(&remaining);
-                    self.turn_answer.push_str(&strip_vs16(&remaining));
-                }
                 self.end_answer_block();
                 self.gate = AnswerGate::new();
             }
@@ -205,15 +247,25 @@ impl TuiRenderer {
                 }
                 self.push_line(padding_line(), BlockKind::ToolDone);
             }
+            AgentEvent::BgTaskDone { id, command, code } => {
+                let status = match code {
+                    Some(0) => "exit 0".to_string(),
+                    Some(code) => format!("exit {code}"),
+                    None => "killed".to_string(),
+                };
+                self.push_line(
+                    Line::from(Span::styled(
+                        format!("⏺ task {id} ({command}) finished — {status}"),
+                        Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
+                    )),
+                    BlockKind::ToolDone,
+                );
+            }
         }
     }
 
     pub fn finish(&mut self) {
         self.close_thinking();
-        if let Some(remaining) = self.gate.finish() {
-            self.push_answer_text(&remaining);
-            self.turn_answer.push_str(&strip_vs16(&remaining));
-        }
         self.end_answer_block();
     }
 
@@ -311,7 +363,7 @@ impl TuiRenderer {
         self.scrollback.splice(start.., lines);
         self.blocks.splice(
             start..,
-            std::iter::repeat(BlockKind::Answer).take(count).collect::<Vec<_>>(),
+            std::iter::repeat_n(BlockKind::Answer, count).collect::<Vec<_>>(),
         );
         self.turn_answer.clear();
         self.answer_start = None;
@@ -469,7 +521,7 @@ fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
                     .iter()
                     .map(|span| Span {
                         content: std::borrow::Cow::Owned(strip_vs16(
-                            &span.content.to_string(),
+                            span.content.as_ref(),
                         )),
                         style: span.style.patch(line.style),
                     })
@@ -562,37 +614,216 @@ fn prepare_markdown(text: &str) -> (String, HashMap<String, String>) {
     (joined.join("\n"), restore)
 }
 
-pub struct TuiState {
+pub struct Session {
+    id: u64,
     pub renderer: TuiRenderer,
-    pub scroll: usize,
-    pub following: bool,
-    pub viewport: usize,
-    pub pane_width: usize,
-    tail_cache: (usize, usize, usize, usize),
     pub input: String,
     pub running: bool,
     pub error: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    pub model: String,
+    pub scroller: Scroller,
+    pub label: String,
+    pub context: Option<Context>,
+    tail_cache: (usize, usize, usize, usize),
 }
 
-impl TuiState {
-    pub fn new(model: String) -> TuiState {
-        TuiState {
+impl Session {
+    fn new(id: u64) -> Session {
+        Session {
+            id,
             renderer: TuiRenderer::new(),
-            scroll: 0,
-            following: true,
-            viewport: 22,
-            pane_width: 118,
-            tail_cache: (0, 0, 0, 0),
             input: String::new(),
             running: false,
             error: None,
             prompt_tokens: 0,
             completion_tokens: 0,
-            model,
+            scroller: Scroller::at_tail(),
+            label: String::new(),
+            context: None,
+            tail_cache: (0, 0, 0, 0),
         }
+    }
+
+    fn max_scroll(&mut self, pane_width: usize, viewport: usize) -> usize {
+        let len = self.renderer.scrollback().len();
+        let (cl, cw, cv, cs) = self.tail_cache;
+        if cl == len && cw == pane_width && cv == viewport {
+            return cs;
+        }
+        let result = tail_start(len, self.renderer.scrollback(), pane_width as u16, viewport);
+        self.tail_cache = (len, pane_width, viewport, result);
+        result
+    }
+}
+
+#[derive(Default)]
+pub struct Scroller {
+    offset: usize,
+    following: bool,
+}
+
+impl Scroller {
+    fn at_tail() -> Self {
+        Scroller {
+            offset: 0,
+            following: true,
+        }
+    }
+
+    fn offset(&self) -> usize {
+        self.offset
+    }
+
+    fn following(&self) -> bool {
+        self.following
+    }
+
+    fn set_following(&mut self, following: bool) {
+        self.following = following;
+    }
+
+    fn toward_top(&mut self, n: usize) {
+        self.offset = self.offset.saturating_sub(n);
+        self.following = false;
+    }
+
+    fn toward_bottom(&mut self, n: usize, max: usize) {
+        self.offset = (self.offset + n).min(max);
+        self.following = self.offset == max;
+    }
+
+    fn home(&mut self) {
+        self.offset = 0;
+        self.following = false;
+    }
+
+    fn end(&mut self, max: usize) {
+        self.offset = max;
+        self.following = true;
+    }
+
+    fn follow_tail(&mut self, max: usize) {
+        if self.following {
+            self.offset = max;
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SessionFile {
+    label: String,
+    context: Context,
+}
+
+fn save_session(dir: &std::path::Path, id: u64, label: &str, context: &Context) {
+    if std::fs::create_dir_all(dir).is_ok() {
+        let file = SessionFile {
+            label: label.to_string(),
+            context: context.clone(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&file) {
+            let _ = std::fs::write(dir.join(format!("{id}.json")), json);
+        }
+    }
+}
+
+fn remove_session_file(dir: &std::path::Path, id: u64) {
+    let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+}
+
+fn load_sessions(dir: &std::path::Path) -> Vec<(u64, SessionFile)> {
+    let mut loaded = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return loaded,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && let Ok(id) = stem.parse::<u64>()
+            && let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(file) = serde_json::from_str::<SessionFile>(&json)
+        {
+            loaded.push((id, file));
+        }
+    }
+    loaded.sort_by_key(|(id, _)| *id);
+    loaded
+}
+
+pub struct TuiState {
+    pub sessions: Vec<Session>,
+    pub active: usize,
+    pub viewport: usize,
+    pub pane_width: usize,
+    pub model: String,
+    pub picker_open: bool,
+    pub picker_cursor: usize,
+    pub picker_query: String,
+    pub picker_rename: Option<String>,
+    pub tasks_open: bool,
+    pub tasks_cursor: usize,
+    pub task_output_id: Option<String>,
+    pub task_output_scroll: Scroller,
+    next_id: u64,
+}
+
+impl TuiState {
+    pub fn new(model: String) -> TuiState {
+        TuiState {
+            sessions: vec![Session::new(0)],
+            active: 0,
+            viewport: 22,
+            pane_width: 118,
+            model,
+            picker_open: false,
+            picker_cursor: 0,
+            picker_query: String::new(),
+            picker_rename: None,
+            tasks_open: false,
+            tasks_cursor: 0,
+            task_output_id: None,
+            task_output_scroll: Scroller::default(),
+            next_id: 1,
+        }
+    }
+
+    pub fn session(&mut self) -> &mut Session {
+        &mut self.sessions[self.active]
+    }
+
+    pub fn with_sessions(model: String, loaded: Vec<(u64, SessionFile)>) -> TuiState {
+        let mut state = TuiState::new(model);
+        state.sessions = Vec::new();
+        state.next_id = 0;
+        for (id, file) in loaded {
+            let mut session = Session::new(id);
+            session.label = file.label;
+            session.prompt_tokens = file.context.total_prompt_tokens;
+            session.completion_tokens = file.context.total_completion_tokens;
+            session.context = Some(file.context);
+            state.sessions.push(session);
+            state.next_id = state.next_id.max(id + 1);
+        }
+        state.sessions.push(Session::new(state.next_id));
+        state.active = state.sessions.len() - 1;
+        state.next_id += 1;
+        state
+    }
+
+    pub fn filtered(&self) -> Vec<usize> {
+        if self.picker_query.is_empty() {
+            return (0..self.sessions.len()).collect();
+        }
+        let query = self.picker_query.to_lowercase();
+        (0..self.sessions.len())
+            .filter(|i| {
+                self.sessions[*i].label.to_lowercase().contains(&query)
+                    || i.to_string().contains(&query)
+            })
+            .collect()
     }
 }
 
@@ -601,19 +832,63 @@ pub enum KeyAction {
     None,
     Submit(String),
     Quit,
+    NewSession,
+    CloseSession,
 }
 
 const PAGE: usize = 10;
 
+fn tasks_move(state: &mut TuiState, len: usize, down: bool) {
+    if len == 0 {
+        return;
+    }
+    state.tasks_cursor = if down {
+        (state.tasks_cursor + 1) % len
+    } else if state.tasks_cursor == 0 {
+        len - 1
+    } else {
+        state.tasks_cursor - 1
+    };
+}
+
+fn task_output_scroll_max(state: &TuiState) -> usize {
+    let Some(id) = &state.task_output_id else {
+        return 0;
+    };
+    let Some(task) = crate::bg::REGISTRY.list().into_iter().find(|t| t.id == *id) else {
+        return 0;
+    };
+    let text = std::fs::read_to_string(&task.output_path).unwrap_or_default();
+    let total = text.lines().count();
+    let visible = state.viewport.saturating_sub(10);
+    total.saturating_sub(visible)
+}
+
 pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     if let TermEvent::Mouse(mouse) = event {
+        if state.task_output_id.is_some() {
+            let max = task_output_scroll_max(state);
+            return match mouse.kind {
+                event::MouseEventKind::ScrollUp => {
+                    state.task_output_scroll.toward_top(3);
+                    KeyAction::None
+                }
+                event::MouseEventKind::ScrollDown => {
+                    state.task_output_scroll.toward_bottom(3, max);
+                    KeyAction::None
+                }
+                _ => KeyAction::None,
+            };
+        }
+        let (pane_width, viewport) = (state.pane_width, state.viewport);
+        let session = state.session();
         return match mouse.kind {
             event::MouseEventKind::ScrollUp => {
-                mouse_up(state);
+                mouse_up(session);
                 KeyAction::None
             }
             event::MouseEventKind::ScrollDown => {
-                mouse_down(state);
+                mouse_down(session, pane_width, viewport);
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -625,14 +900,284 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return KeyAction::Quit;
     }
-    if state.running {
+    if state.task_output_id.is_some() {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('q') => {
+                    state.task_output_id = None;
+                    state.tasks_open = false;
+                    KeyAction::None
+                }
+                _ => KeyAction::None,
+            };
+        }
+        let scroll_max = task_output_scroll_max(state);
         return match key.code {
-            KeyCode::PageUp => {
-                page_up(state);
+            KeyCode::Esc | KeyCode::Char('q') => {
+                state.task_output_id = None;
+                KeyAction::None
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                state.task_output_scroll.toward_bottom(3, scroll_max);
+                KeyAction::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                state.task_output_scroll.toward_top(3);
                 KeyAction::None
             }
             KeyCode::PageDown => {
-                page_down(state);
+                state.task_output_scroll.toward_bottom(8, scroll_max);
+                KeyAction::None
+            }
+            KeyCode::PageUp => {
+                state.task_output_scroll.toward_top(8);
+                KeyAction::None
+            }
+            KeyCode::Home => {
+                state.task_output_scroll.home();
+                KeyAction::None
+            }
+            KeyCode::End => {
+                state.task_output_scroll.end(scroll_max);
+                KeyAction::None
+            }
+            _ => KeyAction::None,
+        };
+    }
+    if state.picker_open {
+        if state.picker_rename.is_some() {
+            return match key.code {
+                KeyCode::Enter => {
+                    let buf = state.picker_rename.take().unwrap();
+                    if let Some(i) = state.filtered().get(state.picker_cursor).copied() {
+                        state.sessions[i].label = buf;
+                    }
+                    KeyAction::None
+                }
+                KeyCode::Esc => {
+                    state.picker_rename = None;
+                    KeyAction::None
+                }
+                KeyCode::Backspace => {
+                    if let Some(buf) = &mut state.picker_rename {
+                        buf.pop();
+                    }
+                    KeyAction::None
+                }
+                KeyCode::Char(c) => {
+                    if let Some(buf) = &mut state.picker_rename {
+                        buf.push(c);
+                    }
+                    KeyAction::None
+                }
+                _ => KeyAction::None,
+            };
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('j') => {
+                    let len = state.filtered().len();
+                    if len > 0 {
+                        state.picker_cursor = (state.picker_cursor + 1) % len;
+                    }
+                    KeyAction::None
+                }
+                KeyCode::Char('k') => {
+                    let len = state.filtered().len();
+                    if len > 0 {
+                        state.picker_cursor = if state.picker_cursor == 0 {
+                            len - 1
+                        } else {
+                            state.picker_cursor - 1
+                        };
+                    }
+                    KeyAction::None
+                }
+                KeyCode::Char('n') => {
+                    state.sessions.push(Session::new(state.next_id));
+                    state.active = state.sessions.len() - 1;
+                    state.next_id += 1;
+                    state.picker_open = false;
+                    KeyAction::NewSession
+                }
+                KeyCode::Char('x') => {
+                    let filtered = state.filtered();
+                    if let Some(i) = filtered.get(state.picker_cursor).copied()
+                        && state.sessions.len() > 1
+                        && !state.sessions[i].running
+                    {
+                        state.sessions.remove(i);
+                        if state.active >= state.sessions.len() {
+                            state.active = state.sessions.len() - 1;
+                        }
+                    }
+                    let len = state.filtered().len();
+                    state.picker_cursor = if len == 0 {
+                        0
+                    } else {
+                        state.picker_cursor.min(len - 1)
+                    };
+                    KeyAction::CloseSession
+                }
+                KeyCode::Char('r') => {
+                    state.picker_rename = Some(String::new());
+                    KeyAction::None
+                }
+                KeyCode::Char('q') => {
+                    state.tasks_open = true;
+                    state.picker_open = false;
+                    KeyAction::None
+                }
+                KeyCode::Char('s') => {
+                    state.picker_open = false;
+                    KeyAction::None
+                }
+                _ => KeyAction::None,
+            };
+        }
+        return match key.code {
+            KeyCode::Up => {
+                let len = state.filtered().len();
+                if len > 0 {
+                    state.picker_cursor = if state.picker_cursor == 0 {
+                        len - 1
+                    } else {
+                        state.picker_cursor - 1
+                    };
+                }
+                KeyAction::None
+            }
+            KeyCode::Down => {
+                let len = state.filtered().len();
+                if len > 0 {
+                    state.picker_cursor = (state.picker_cursor + 1) % len;
+                }
+                KeyAction::None
+            }
+            KeyCode::Enter => {
+                let filtered = state.filtered();
+                if let Some(i) = filtered.get(state.picker_cursor).copied() {
+                    state.active = i;
+                }
+                state.picker_open = false;
+                KeyAction::None
+            }
+            KeyCode::Esc => {
+                state.picker_open = false;
+                KeyAction::None
+            }
+            KeyCode::Backspace => {
+                state.picker_query.pop();
+                let len = state.filtered().len();
+                state.picker_cursor = if len == 0 {
+                    0
+                } else {
+                    state.picker_cursor.min(len - 1)
+                };
+                KeyAction::None
+            }
+            KeyCode::Char(c) => {
+                state.picker_query.push(c);
+                let len = state.filtered().len();
+                state.picker_cursor = if len == 0 {
+                    0
+                } else {
+                    state.picker_cursor.min(len - 1)
+                };
+                KeyAction::None
+            }
+            _ => KeyAction::None,
+        };
+    }
+    if state.tasks_open {
+        let tasks = crate::bg::REGISTRY.list();
+        let len = tasks.len();
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('j') => {
+                    tasks_move(state, len, true);
+                    KeyAction::None
+                }
+                KeyCode::Char('k') => {
+                    tasks_move(state, len, false);
+                    KeyAction::None
+                }
+                KeyCode::Char('s') => {
+                    state.picker_open = true;
+                    state.tasks_open = false;
+                    KeyAction::None
+                }
+                KeyCode::Char('q') => {
+                    state.tasks_open = false;
+                    KeyAction::None
+                }
+                _ => KeyAction::None,
+            };
+        }
+        return match key.code {
+            KeyCode::Up => {
+                tasks_move(state, len, false);
+                KeyAction::None
+            }
+            KeyCode::Down => {
+                tasks_move(state, len, true);
+                KeyAction::None
+            }
+            KeyCode::Char('j') => {
+                tasks_move(state, len, true);
+                KeyAction::None
+            }
+            KeyCode::Char('k') => {
+                tasks_move(state, len, false);
+                KeyAction::None
+            }
+            KeyCode::Char('x') => {
+                if let Some(task) = tasks.get(state.tasks_cursor) {
+                    let _ = crate::bg::REGISTRY.kill(&task.id);
+                }
+                KeyAction::None
+            }
+            KeyCode::Enter => {
+                if let Some(task) = tasks.get(state.tasks_cursor) {
+                    state.task_output_id = Some(task.id.clone());
+                    state.task_output_scroll = Scroller::at_tail();
+                }
+                KeyAction::None
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                state.tasks_open = false;
+                KeyAction::None
+            }
+            _ => KeyAction::None,
+        };
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('s') => {
+                state.picker_open = true;
+                state.tasks_open = false;
+                state.picker_cursor = state.active;
+                KeyAction::None
+            }
+            KeyCode::Char('q') => {
+                state.tasks_open = true;
+                state.picker_open = false;
+                state.tasks_cursor = 0;
+                KeyAction::None
+            }
+            _ => KeyAction::None,
+        };
+    }
+    let (pane_width, viewport) = (state.pane_width, state.viewport);
+    let session = state.session();
+    if session.running {
+        return match key.code {
+            KeyCode::PageUp => {
+                page_up(session);
+                KeyAction::None
+            }
+            KeyCode::PageDown => {
+                page_down(session, pane_width, viewport);
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -640,30 +1185,42 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     }
     match key.code {
         KeyCode::Enter => {
-            if state.input.is_empty() {
+            if session.input.is_empty() {
                 KeyAction::None
             } else {
-                state.following = true;
-                KeyAction::Submit(mem::take(&mut state.input))
+                let task = mem::take(&mut session.input);
+                if session.label.is_empty() {
+                    session.label = task.trim().chars().take(24).collect();
+                }
+                session.scroller.set_following(true);
+                KeyAction::Submit(task)
             }
         }
         KeyCode::Backspace => {
-            state.input.pop();
+            session.input.pop();
             KeyAction::None
         }
         KeyCode::PageUp => {
-            page_up(state);
+            page_up(session);
             KeyAction::None
         }
         KeyCode::PageDown => {
-            page_down(state);
+            page_down(session, pane_width, viewport);
+            KeyAction::None
+        }
+        KeyCode::Home => {
+            to_top(session);
+            KeyAction::None
+        }
+        KeyCode::End => {
+            to_bottom(session, pane_width, viewport);
             KeyAction::None
         }
         KeyCode::Char(c) => {
-            if c == 'q' && state.input.is_empty() {
+            if c == 'q' && session.input.is_empty() {
                 KeyAction::Quit
             } else {
-                state.input.push(c);
+                session.input.push(c);
                 KeyAction::None
             }
         }
@@ -671,41 +1228,33 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     }
 }
 
-fn page_up(state: &mut TuiState) {
-    state.scroll = state.scroll.saturating_sub(PAGE);
-    state.following = false;
+fn page_up(session: &mut Session) {
+    session.scroller.toward_top(PAGE);
 }
 
-fn page_down(state: &mut TuiState) {
-    let max = state.max_scroll();
-    state.scroll = (state.scroll + PAGE).min(max);
-    state.following = state.scroll == max;
+fn page_down(session: &mut Session, pane_width: usize, viewport: usize) {
+    let max = session.max_scroll(pane_width, viewport);
+    session.scroller.toward_bottom(PAGE, max);
+}
+
+fn to_top(session: &mut Session) {
+    session.scroller.home();
+}
+
+fn to_bottom(session: &mut Session, pane_width: usize, viewport: usize) {
+    let max = session.max_scroll(pane_width, viewport);
+    session.scroller.end(max);
 }
 
 const MOUSE: usize = 3;
 
-fn mouse_up(state: &mut TuiState) {
-    state.scroll = state.scroll.saturating_sub(MOUSE);
-    state.following = false;
+fn mouse_up(session: &mut Session) {
+    session.scroller.toward_top(MOUSE);
 }
 
-fn mouse_down(state: &mut TuiState) {
-    let max = state.max_scroll();
-    state.scroll = (state.scroll + MOUSE).min(max);
-    state.following = state.scroll == max;
-}
-
-impl TuiState {
-    fn max_scroll(&mut self) -> usize {
-        let len = self.renderer.scrollback().len();
-        let (cl, cw, cv, cs) = self.tail_cache;
-        if cl == len && cw == self.pane_width && cv == self.viewport {
-            return cs;
-        }
-        let result = tail_start(len, self.renderer.scrollback(), self.pane_width as u16, self.viewport);
-        self.tail_cache = (len, self.pane_width, self.viewport, result);
-        result
-    }
+fn mouse_down(session: &mut Session, pane_width: usize, viewport: usize) {
+    let max = session.max_scroll(pane_width, viewport);
+    session.scroller.toward_bottom(MOUSE, max);
 }
 
 fn fits_viewport(lines: &[Line<'static>], width: u16, viewport: usize) -> bool {
@@ -718,7 +1267,7 @@ fn fits_viewport(lines: &[Line<'static>], width: u16, viewport: usize) -> bool {
     (0..width).all(|x| {
         buffer
             .cell((x, viewport as u16))
-            .map_or(true, |cell| *cell == Cell::default())
+            .is_none_or(|cell| *cell == Cell::default())
     })
 }
 
@@ -808,6 +1357,17 @@ fn display_lines(
         .collect()
 }
 
+struct Fill;
+
+impl Widget for Fill {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let spaces = " ".repeat(area.width as usize);
+        for y in 0..area.height {
+            buf.set_string(area.x, area.y + y, &spaces, Style::default());
+        }
+    }
+}
+
 pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let chunks = Layout::new(
@@ -815,20 +1375,37 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         [Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)],
     )
     .split(area);
+    let session = &state.sessions[state.active];
 
-    let status = Line::from(vec![
+    let mut status_spans: Vec<Span> = vec![
         Span::styled(state.model.clone(), Style::default().bold()),
         Span::raw(format!(
             "  ·  {} prompt / {} completion tok",
-            state.prompt_tokens, state.completion_tokens
+            session.prompt_tokens, session.completion_tokens
         )),
-    ]);
+        Span::styled(
+            format!("  ·  [{}/{}]", state.active + 1, state.sessions.len()),
+            Style::default().fg(Color::Rgb(95, 135, 255)),
+        ),
+    ];
+    let running_bg = crate::bg::REGISTRY
+        .list()
+        .into_iter()
+        .filter(|task| matches!(task.status, crate::bg::BgStatus::Running))
+        .count();
+    if running_bg > 0 {
+        status_spans.push(Span::styled(
+            format!("  ·  ⏺{running_bg} bg"),
+            Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
+        ));
+    }
+    let status = Line::from(status_spans);
     frame.render_widget(
         Paragraph::new(status).block(Block::default().borders(Borders::ALL)),
         chunks[0],
     );
 
-    let display = display_lines(state.renderer.scrollback(), state.renderer.blocks(), state.pane_width);
+    let display = display_lines(session.renderer.scrollback(), session.renderer.blocks(), state.pane_width);
     let display = &display[start.min(display.len())..];
     let main = Paragraph::new(display)
         .wrap(Wrap { trim: false })
@@ -837,16 +1414,236 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Rgb(95, 135, 255))),
         );
+    frame.render_widget(Fill, chunks[1]);
     frame.render_widget(main, chunks[1]);
 
-    let input_line = if state.running {
+    if state.picker_open {
+        let filtered = state.filtered();
+        let renaming = state.picker_rename.clone();
+        let list_height = filtered.len().max(1) as u16;
+        let height = list_height + 3;
+        let width = 52u16.min(chunks[1].width.saturating_sub(2));
+        let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
+        let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
+        let lines: Vec<Line> = if filtered.is_empty() {
+            vec![Line::from(Span::styled(
+                " no matches",
+                Style::default().fg(Color::Rgb(102, 102, 102)),
+            ))]
+        } else {
+            filtered
+                .iter()
+                .enumerate()
+                .map(|(i, session_idx)| {
+                    let selected = i == state.picker_cursor;
+                    let session = &state.sessions[*session_idx];
+                    let marker = if selected { "›" } else { " " };
+                    let status = if session.running { "working…" } else { "idle" };
+                    let style = if selected {
+                        Style::default().bold().fg(Color::Rgb(95, 135, 255))
+                    } else {
+                        Style::default()
+                    };
+                    let label = match &renaming {
+                        Some(buf) if selected => {
+                            if buf.is_empty() {
+                                "rename…".to_string()
+                            } else {
+                                buf.clone()
+                            }
+                        }
+                        _ => {
+                            if session.label.is_empty() {
+                                "—".to_string()
+                            } else {
+                                session.label.clone()
+                            }
+                        }
+                    };
+                    Line::from(vec![
+                        Span::styled(format!(" {marker} {}  ", session_idx + 1), style),
+                        Span::styled(label, style),
+                        Span::styled(
+                            format!("  {} · {} / {}", status, session.prompt_tokens, session.completion_tokens),
+                            style,
+                        ),
+                    ])
+                })
+                .collect()
+        };
+        let hint = Line::from(Span::styled(
+            " C-jk · enter · C-n · C-x · C-r · search",
+            Style::default().fg(Color::Rgb(102, 102, 102)),
+        ));
+        let title = if renaming.is_some() {
+            " rename".to_string()
+        } else if state.picker_query.is_empty() {
+            " sessions".to_string()
+        } else {
+            format!(" sessions · {}", state.picker_query)
+        };
+        let picker = Paragraph::new(
+            lines
+                .into_iter()
+                .chain(std::iter::once(hint))
+                .collect::<Vec<Line>>(),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
+                .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
+                .title(format!(" {} ", title)),
+        );
+        frame.render_widget(Fill, Rect::new(x, y, width, height));
+        frame.render_widget(picker, Rect::new(x, y, width, height));
+    }
+
+    if state.tasks_open && state.task_output_id.is_none() {
+        let tasks = crate::bg::REGISTRY.list();
+        let list_height = tasks.len().max(1) as u16;
+        let height = list_height + 3;
+        let width = 52u16.min(chunks[1].width.saturating_sub(2));
+        let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
+        let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
+        let lines: Vec<Line> = if tasks.is_empty() {
+            vec![Line::from(Span::styled(
+                " no tasks",
+                Style::default().fg(Color::Rgb(102, 102, 102)),
+            ))]
+        } else {
+            tasks
+                .iter()
+                .enumerate()
+                .map(|(i, task)| {
+                    let selected = i == state.tasks_cursor;
+                    let status = match &task.status {
+                        crate::bg::BgStatus::Running => "running  ".to_string(),
+                        crate::bg::BgStatus::Finished(None) => "killed   ".to_string(),
+                        crate::bg::BgStatus::Finished(Some(0)) => "exit 0   ".to_string(),
+                        crate::bg::BgStatus::Finished(Some(code)) => format!("exit {code:<4}") ,
+                    };
+                    let duration = task
+                        .finished_at
+                        .map(|finished| finished.duration_since(task.started_at))
+                        .unwrap_or_else(|| std::time::Instant::now().duration_since(task.started_at));
+                    let style = if selected {
+                        Style::default().bold().fg(Color::Rgb(95, 135, 255))
+                    } else {
+                        Style::default()
+                    };
+                    let marker = if selected { "›" } else { " " };
+                    let command: String = task.command.chars().take(28).collect();
+                    Line::from(vec![
+                        Span::styled(format!(" {marker} {}  ", task.id), style),
+                        Span::styled(status, style),
+                        Span::styled(
+                            format!("{}  ", crate::bg::format_duration(duration)),
+                            style,
+                        ),
+                        Span::styled(command, style),
+                    ])
+                })
+                .collect()
+        };
+        let hint = Line::from(Span::styled(
+            " jk · x kill · q close",
+            Style::default().fg(Color::Rgb(102, 102, 102)),
+        ));
+        let tasks_box = Paragraph::new(
+            lines
+                .into_iter()
+                .chain(std::iter::once(hint))
+                .collect::<Vec<Line>>(),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
+                .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
+                .title(" background tasks ".to_string()),
+        );
+        frame.render_widget(Fill, Rect::new(x, y, width, height));
+        frame.render_widget(tasks_box, Rect::new(x, y, width, height));
+    }
+
+    if let Some(id) = &state.task_output_id {
+        let tasks = crate::bg::REGISTRY.list();
+        if let Some(task) = tasks.iter().find(|t| t.id == *id) {
+            let text = std::fs::read_to_string(&task.output_path).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            let width = chunks[1].width;
+            let height = chunks[1].height;
+            let x = chunks[1].x;
+            let y = chunks[1].y;
+            let visible = height as usize - 4;
+            let total = lines.len();
+            let max = total.saturating_sub(visible);
+            let start = if state.task_output_scroll.following() {
+                max
+            } else {
+                state.task_output_scroll.offset().min(max)
+            };
+            let status = match &task.status {
+                crate::bg::BgStatus::Running => "running".to_string(),
+                crate::bg::BgStatus::Finished(None) => "killed".to_string(),
+                crate::bg::BgStatus::Finished(Some(0)) => "exit 0".to_string(),
+                crate::bg::BgStatus::Finished(Some(code)) => format!("exit {code}"),
+            };
+            let mut body: Vec<Line> = vec![Line::from(vec![
+                Span::styled(format!("$ {}", task.command), Style::default().bold()),
+                Span::styled(format!("  ·  {}", status), Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe))),
+            ])];
+            if total == 0 {
+                body.push(Line::from(Span::styled(
+                    if matches!(task.status, crate::bg::BgStatus::Running) {
+                        " (no output yet — task is running) "
+                    } else {
+                        " (no output) "
+                    },
+                    Style::default().fg(Color::Rgb(102, 102, 102)),
+                )));
+            } else {
+                body.extend(
+                    lines[start..].iter().take(visible).map(|line| {
+                        Line::from(Span::styled(
+                            *line,
+                            Style::default().fg(Color::Rgb(0x80, 0x80, 0x80)),
+                        ))
+                    }),
+                );
+            }
+            let hint = Line::from(Span::styled(
+                " jk scroll · q close · C-q close all",
+                Style::default().fg(Color::Rgb(102, 102, 102)),
+            ));
+            let output_box = Paragraph::new(
+                body
+                    .into_iter()
+                    .chain(std::iter::once(hint))
+                    .collect::<Vec<Line>>(),
+            )
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
+                    .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
+                    .title(format!(" task {} output ", task.id)),
+            );
+            frame.render_widget(Fill, Rect::new(x, y, width, height));
+            frame.render_widget(output_box, Rect::new(x, y, width, height));
+        }
+    }
+
+    let input_line = if session.running {
         Line::from(Span::styled("working…".to_string(), Style::default().dim()))
-    } else if let Some(error) = &state.error {
+    } else if let Some(error) = &session.error {
         Line::from(Span::styled(error.clone(), Style::default().red()))
     } else {
         Line::from(vec![
             Span::styled("> ".to_string(), Style::default().bold()),
-            Span::raw(state.input.clone()),
+            Span::raw(session.input.clone()),
             Span::styled("█".to_string(), Style::default().bold()),
         ])
     };
@@ -856,10 +1653,78 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     );
 }
 
-pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::Error>> {
-    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
+fn spawn_agent(
+    id: u64,
+    agent: Agent,
+    event_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
+) -> (tokio::sync::mpsc::UnboundedSender<String>, tokio::task::AbortHandle) {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let task = tokio::spawn(async move {
+        let mut agent = agent;
+        let mut bg_rx = crate::bg::REGISTRY.subscribe();
+        loop {
+            tokio::select! {
+                input = input_rx.recv() => {
+                    let Some(input) = input else { break; };
+                    let tx = event_tx.clone();
+                    match agent
+                        .chat(
+                            &input,
+                            &mut |event| {
+                                let _ = tx.send(TuiEvent::Agent { session: id, event });
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_answer) => {
+                            let context = agent.context.clone();
+                            let _ = tx.send(TuiEvent::TurnDone { session: id, context });
+                        }
+                        Err(error) => {
+                            let _ = tx.send(TuiEvent::TurnError {
+                                session: id,
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
+                signal = bg_rx.recv() => {
+                    if let Ok(task_id) = signal
+                        && agent.owns_and_unseen(&task_id)
+                    {
+                        let tx = event_tx.clone();
+                        match agent
+                            .bg_turn(&mut |event| {
+                                let _ = tx.send(TuiEvent::Agent { session: id, event });
+                            })
+                            .await
+                        {
+                            Ok(_answer) => {
+                                let context = agent.context.clone();
+                                let _ = tx.send(TuiEvent::TurnDone { session: id, context });
+                            }
+                            Err(error) => {
+                                let _ = tx.send(TuiEvent::TurnError {
+                                    session: id,
+                                    message: error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (input_tx, task.abort_handle())
+}
+
+pub async fn run(
+    new_agent: impl Fn() -> Agent + Send + Sync + 'static,
+    model: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
+    let new_agent = std::sync::Arc::new(new_agent);
 
     std::io::stdout().execute(terminal::EnterAlternateScreen)?;
     std::io::stdout().execute(cursor::Hide)?;
@@ -885,72 +1750,131 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
         }
     });
 
-    let agent_task = tokio::spawn(async move {
-        let mut agent = agent;
-        while let Some(task) = input_rx.recv().await {
-            let tx = agent_tx.clone();
-            match agent
-                .chat(
-                    &task,
-                    &mut |event| {
-                        let _ = tx.send(TuiEvent::Agent(event));
-                    },
-                )
-                .await
-            {
-                Ok(_answer) => {
-                    let _ = tx.send(TuiEvent::TurnDone {
-                        prompt: agent.context.total_prompt_tokens,
-                        completion: agent.context.total_completion_tokens,
-                    });
-                }
-                Err(error) => {
-                    let _ = tx.send(TuiEvent::TurnError(error.to_string()));
-                }
-            }
-        }
-        drop(agent_tx);
-    });
+    let mut state = TuiState::with_sessions(model, load_sessions(Path::new(SESSIONS_DIR)));
+    let mut inputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<String>> = HashMap::new();
+    let mut handles: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
 
-    let mut state = TuiState::new(model);
+    for session in &state.sessions {
+        let mut agent = new_agent();
+        if let Some(context) = &session.context {
+            agent.context = context.clone();
+        }
+        let (input_tx, input_handle) = spawn_agent(session.id, agent, agent_tx.clone());
+        inputs.insert(session.id, input_tx);
+        handles.insert(session.id, input_handle);
+    }
+
+    for session in &mut state.sessions {
+        if let Some(context) = &session.context {
+            session.renderer.replay_context(context);
+            let max = session.max_scroll(state.pane_width, state.viewport);
+            session.scroller.end(max);
+        }
+    }
+
     terminal.draw(|frame| draw(frame, &state, 0))?;
+
+    let mut session_watch = tokio::time::interval(std::time::Duration::from_secs(2));
 
     loop {
         tokio::select! {
+            _ = session_watch.tick() => {
+                let removed: Vec<u64> = state
+                    .sessions
+                    .iter()
+                    .filter(|s| {
+                        s.context.is_some()
+                            && !Path::new(SESSIONS_DIR)
+                                .join(format!("{}.json", s.id))
+                                .exists()
+                    })
+                    .map(|s| s.id)
+                    .collect();
+                for id in removed {
+                    if let Some(handle) = handles.remove(&id) {
+                        handle.abort();
+                    }
+                    inputs.remove(&id);
+                    let pos = state.sessions.iter().position(|s| s.id == id).unwrap();
+                    state.sessions.remove(pos);
+                    if state.active > pos && state.active > 0 {
+                        state.active -= 1;
+                    }
+                    if state.active >= state.sessions.len() {
+                        state.active = state.sessions.len().saturating_sub(1);
+                    }
+                }
+            }
             event = agent_rx.recv() => {
                 match event {
-                    Some(TuiEvent::Agent(event)) => state.renderer.on_event(event),
-                    Some(TuiEvent::TurnDone { prompt, completion }) => {
-                        state.renderer.finish();
-                        state.running = false;
-                        state.prompt_tokens = prompt;
-                        state.completion_tokens = completion;
+                    Some(TuiEvent::Agent { session: id, event }) => {
+                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                            session.renderer.on_event(event);
+                            let max = session.max_scroll(state.pane_width, state.viewport);
+                            session.scroller.follow_tail(max);
+                        }
                     }
-                    Some(TuiEvent::TurnError(message)) => {
-                        state.renderer.finish();
-                        state.running = false;
-                        state.error = Some(message);
+                    Some(TuiEvent::TurnDone {
+                        session: id,
+                        context,
+                    }) => {
+                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                            session.renderer.finish();
+                            session.running = false;
+                            session.prompt_tokens = context.total_prompt_tokens;
+                            session.completion_tokens = context.total_completion_tokens;
+                            session.context = Some(context.clone());
+                            if let Some(saved) = &session.context {
+                                save_session(Path::new(SESSIONS_DIR), id, &session.label, saved);
+                            }
+                        }
+                    }
+                    Some(TuiEvent::TurnError { session: id, message }) => {
+                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                            session.renderer.finish();
+                            session.running = false;
+                            session.error = Some(message);
+                        }
                     }
                     None => break,
-                }
-                if state.following {
-                    state.scroll = state.max_scroll();
                 }
             }
             key = key_rx.recv() => {
                 let Some(term_event) = key else {
                     break;
                 };
+                let ids_before: Vec<u64> = state.sessions.iter().map(|s| s.id).collect();
                 match handle_key(&mut state, &term_event) {
                     KeyAction::Submit(task) => {
-                        state.error = None;
-                        state.running = true;
-                        state.renderer.push_user(&task);
-                        state.following = true;
-                        state.scroll = state.max_scroll();
-                        input_tx.send(task)?;
+                        let id = state.sessions[state.active].id;
+                        let session = &mut state.sessions[state.active];
+                        session.error = None;
+                        session.running = true;
+                        session.renderer.push_user(&task);
+                        let max = session.max_scroll(state.pane_width, state.viewport);
+                        session.scroller.end(max);
+                        inputs[&id].send(task)?;
                     }
                     KeyAction::Quit => break,
+                    KeyAction::NewSession => {
+                        let id = state.sessions[state.active].id;
+                        let (input_tx, input_handle) =
+                            spawn_agent(id, new_agent(), agent_tx.clone());
+                        inputs.insert(id, input_tx);
+                        handles.insert(id, input_handle);
+                    }
+                    KeyAction::CloseSession => {
+                        let removed = ids_before
+                            .into_iter()
+                            .find(|id| !state.sessions.iter().any(|s| s.id == *id));
+                        if let Some(id) = removed {
+                            if let Some(handle) = handles.remove(&id) {
+                                handle.abort();
+                            }
+                            inputs.remove(&id);
+                            remove_session_file(Path::new(SESSIONS_DIR), id);
+                        }
+                    }
                     KeyAction::None => {}
                 }
             }
@@ -963,18 +1887,32 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
             .size()
             .map(|size| size.width.saturating_sub(2) as usize)
             .unwrap_or(118);
-        let start = state.scroll.min(state.max_scroll());
+        let start = state.sessions[state.active]
+            .scroller
+            .offset()
+            .min(state.sessions[state.active].max_scroll(state.pane_width, state.viewport));
         terminal.draw(|frame| draw(frame, &state, start))?;
     }
 
-    agent_task.abort();
+    for session in &state.sessions {
+        if !session.running
+            && let Some(context) = &session.context
+            && Path::new(SESSIONS_DIR).join(format!("{}.json", session.id)).exists()
+        {
+            save_session(Path::new(SESSIONS_DIR), session.id, &session.label, context);
+        }
+    }
+    for handle in handles.values() {
+        handle.abort();
+    }
     std::io::stdout().execute(event::DisableMouseCapture)?;
     std::io::stdout().execute(terminal::LeaveAlternateScreen)?;
     std::io::stdout().execute(cursor::Show)?;
     terminal::disable_raw_mode()?;
     println!(
         "session over: {} prompt / {} completion tokens",
-        state.prompt_tokens, state.completion_tokens
+        state.sessions[state.active].prompt_tokens,
+        state.sessions[state.active].completion_tokens
     );
     Ok(())
 }
@@ -983,6 +1921,7 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
 mod test {
     use super::*;
     use crate::agent::ChunkTokens;
+    use crate::message::Message;
     use crossterm::event::KeyEvent;
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -1037,25 +1976,484 @@ mod test {
     fn mouse_wheel_scrolls_the_viewport() {
         let mut state = TuiState::new("model".into());
         for i in 0..30 {
-            state.renderer.on_event(text(&format!("line {i}\n")));
+            state.session().renderer.on_event(text(&format!("line {i}\n")));
         }
-        state.renderer.finish();
-        let max = state.max_scroll();
+        state.session().renderer.finish();
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
         assert!(max > 0);
 
         handle_key(&mut state, &mouse(event::MouseEventKind::ScrollDown));
-        assert_eq!(state.scroll, 3);
-        assert!(!state.following);
+        assert_eq!(state.session().scroller.offset(), 3);
+        assert!(!state.session().scroller.following());
 
         handle_key(&mut state, &mouse(event::MouseEventKind::ScrollUp));
-        assert_eq!(state.scroll, 0);
-        assert!(!state.following);
+        assert_eq!(state.session().scroller.offset(), 0);
+        assert!(!state.session().scroller.following());
 
         for _ in 0..20 {
             handle_key(&mut state, &mouse(event::MouseEventKind::ScrollDown));
         }
-        assert_eq!(state.scroll, max);
-        assert!(state.following);
+        assert_eq!(state.session().scroller.offset(), max);
+        assert!(state.session().scroller.following());
+    }
+
+    fn ctrl(c: char) -> TermEvent {
+        TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn ctrl_s_opens_the_picker_on_the_active_session() {
+        let mut state = TuiState::new("model".into());
+        state.sessions.push(Session::new(1));
+        state.active = 1;
+
+        handle_key(&mut state, &ctrl('s'));
+
+        assert!(state.picker_open);
+        assert_eq!(state.picker_cursor, 1);
+
+        handle_key(&mut state, &ctrl('s'));
+        assert!(!state.picker_open);
+
+        handle_key(&mut state, &ctrl('q'));
+        assert!(state.tasks_open);
+
+        handle_key(&mut state, &ctrl('q'));
+        assert!(!state.tasks_open);
+    }
+
+    #[test]
+    fn picker_navigation_selection_and_cancel() {
+        let mut state = TuiState::new("model".into());
+        state.sessions.push(Session::new(1));
+        state.sessions.push(Session::new(2));
+        state.active = 2;
+
+        handle_key(&mut state, &ctrl('s'));
+        handle_key(&mut state, &ctrl('k'));
+        assert_eq!(state.picker_cursor, 1);
+        handle_key(&mut state, &ctrl('k'));
+        assert_eq!(state.picker_cursor, 0);
+        handle_key(&mut state, &ctrl('j'));
+        assert_eq!(state.picker_cursor, 1);
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(state.active, 1);
+        assert!(!state.picker_open);
+
+        handle_key(&mut state, &ctrl('s'));
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert!(!state.picker_open);
+        assert_eq!(state.active, 1);
+    }
+
+    #[test]
+    fn picker_n_creates_a_session_and_closes_the_picker() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('s'));
+        handle_key(&mut state, &ctrl('n'));
+
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.active, 1);
+        assert!(!state.picker_open);
+    }
+
+    #[test]
+    fn picker_x_closes_the_cursor_session() {
+        let mut state = TuiState::new("model".into());
+        state.sessions.push(Session::new(1));
+        state.active = 1;
+        state.session().running = true;
+
+        handle_key(&mut state, &ctrl('s'));
+        handle_key(&mut state, &ctrl('x'));
+        assert_eq!(state.sessions.len(), 2);
+
+        state.session().running = false;
+        handle_key(&mut state, &ctrl('x'));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.active, 0);
+
+        handle_key(&mut state, &ctrl('s'));
+        assert!(!state.picker_open);
+        handle_key(&mut state, &ctrl('s'));
+        handle_key(&mut state, &ctrl('x'));
+        assert_eq!(state.sessions.len(), 1);
+        assert!(state.picker_open);
+    }
+
+    #[test]
+    fn picker_c_r_renames_the_cursor_session() {
+        let mut state = TuiState::new("model".into());
+        state.sessions.push(Session::new(1));
+        state.sessions[1].label = "old name".into();
+
+        handle_key(&mut state, &ctrl('s'));
+        handle_key(&mut state, &ctrl('j'));
+        handle_key(&mut state, &ctrl('r'));
+        assert!(state.picker_rename.is_some());
+        handle_key(&mut state, &key(KeyCode::Char('n')));
+        handle_key(&mut state, &key(KeyCode::Char('e')));
+        handle_key(&mut state, &key(KeyCode::Char('w')));
+        handle_key(&mut state, &key(KeyCode::Backspace));
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(state.sessions[1].label, "ne");
+        assert!(state.picker_rename.is_none());
+
+        handle_key(&mut state, &ctrl('r'));
+        handle_key(&mut state, &key(KeyCode::Char('x')));
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert_eq!(state.sessions[1].label, "ne");
+        assert!(state.picker_rename.is_none());
+    }
+
+    #[test]
+    fn picker_typing_searches_and_backspace_clears() {
+        let mut state = TuiState::new("model".into());
+        state.picker_open = true;
+
+        handle_key(&mut state, &key(KeyCode::Char('f')));
+        assert_eq!(state.picker_query, "f");
+        assert_eq!(state.session().input, "");
+        handle_key(&mut state, &key(KeyCode::Backspace));
+        assert_eq!(state.picker_query, "");
+        assert!(state.picker_open);
+    }
+
+    #[test]
+    fn picker_search_filters_sessions() {
+        let mut state = TuiState::new("model".into());
+        state.sessions.push(Session::new(1));
+        state.sessions.push(Session::new(2));
+        state.sessions[0].label = "fix login".into();
+        state.sessions[1].label = "refactor parser".into();
+        state.picker_open = true;
+
+        handle_key(&mut state, &key(KeyCode::Char('l')));
+        assert_eq!(state.filtered(), vec![0]);
+        assert_eq!(state.picker_cursor, 0);
+
+        handle_key(&mut state, &key(KeyCode::Char('2')));
+        assert!(state.filtered().is_empty());
+
+        handle_key(&mut state, &key(KeyCode::Backspace));
+        assert_eq!(state.filtered(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn ctrl_q_opens_tasks_overlay_navigates_and_kills() {
+        let id = crate::bg::REGISTRY.run("sleep 30").unwrap();
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('q'));
+        state.tasks_cursor = crate::bg::REGISTRY
+            .list()
+            .iter()
+            .position(|t| t.id == id)
+            .unwrap();
+        assert!(state.tasks_open);
+        assert!(!state.picker_open);
+
+        handle_key(&mut state, &ctrl('s'));
+        assert!(state.picker_open);
+        assert!(!state.tasks_open);
+
+        handle_key(&mut state, &ctrl('q'));
+        assert!(state.tasks_open);
+        assert!(!state.picker_open);
+
+        handle_key(&mut state, &key(KeyCode::Char('x')));
+        for _ in 0..200 {
+            if matches!(
+                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::BgStatus::Finished(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(matches!(
+            crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+            crate::bg::BgStatus::Finished(_)
+        ));
+
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert!(!state.tasks_open);
+    }
+
+    #[test]
+    fn tasks_overlay_ignores_navigation_with_no_tasks() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('q'));
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        handle_key(&mut state, &key(KeyCode::Char('k')));
+        handle_key(&mut state, &key(KeyCode::Char('x')));
+        assert_eq!(state.tasks_cursor, 0);
+        handle_key(&mut state, &key(KeyCode::Char('q')));
+        assert!(!state.tasks_open);
+    }
+
+    #[tokio::test]
+    async fn enter_shows_task_output_and_keys_navigate_and_close() {
+        let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
+        for _ in 0..200 {
+            if matches!(
+                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::BgStatus::Finished(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('q'));
+        state.tasks_cursor = crate::bg::REGISTRY
+            .list()
+            .iter()
+            .position(|t| t.id == id)
+            .unwrap();
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(state.task_output_id.as_deref(), Some(id.as_str()));
+
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        assert_eq!(state.task_output_scroll.offset(), 3);
+        handle_key(&mut state, &key(KeyCode::Char('k')));
+        assert_eq!(state.task_output_scroll.offset(), 0);
+        handle_key(&mut state, &key(KeyCode::PageUp));
+        assert_eq!(state.task_output_scroll.offset(), 0);
+        handle_key(&mut state, &key(KeyCode::PageDown));
+        assert_eq!(state.task_output_scroll.offset(), 8);
+        handle_key(&mut state, &key(KeyCode::Home));
+        assert_eq!(state.task_output_scroll.offset(), 0);
+        assert!(!state.task_output_scroll.following());
+        handle_key(&mut state, &key(KeyCode::End));
+        assert_eq!(state.task_output_scroll.offset(), 18);
+        assert!(state.task_output_scroll.following());
+
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert!(state.task_output_id.is_none());
+        assert!(state.tasks_open);
+
+        handle_key(&mut state, &ctrl('q'));
+        assert!(!state.tasks_open);
+    }
+
+    #[tokio::test]
+    async fn task_output_popup_renders_the_output() {
+        let id = crate::bg::REGISTRY.run("echo popup-visible").unwrap();
+        for _ in 0..200 {
+            if matches!(
+                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::BgStatus::Finished(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let mut state = TuiState::new("model".into());
+        state.tasks_open = true;
+        state.task_output_id = Some(id);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let joined: String = (0..24)
+            .flat_map(|y| {
+                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
+            })
+            .collect();
+        assert!(joined.contains("popup-visible"));
+        assert!(joined.contains("task"));
+    }
+
+    #[tokio::test]
+    async fn task_output_popup_is_opaque_over_chat() {
+        let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
+        for _ in 0..200 {
+            if matches!(
+                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::BgStatus::Finished(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let mut state = TuiState::new("model".into());
+        for i in 0..5 {
+            state.session().renderer.push_user(&format!("CHATLINE-{i}"));
+        }
+        state.tasks_open = true;
+        state.task_output_id = Some(id);
+        state.task_output_scroll.set_following(true);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let in_popup: String = (3..21)
+            .flat_map(|y| {
+                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
+            })
+            .collect();
+        assert!(!in_popup.contains("CHATLINE"));
+        assert!(in_popup.contains("30"));
+    }
+
+    #[tokio::test]
+    async fn mouse_wheel_scrolls_the_open_output_popup() {
+        let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
+        for _ in 0..200 {
+            if matches!(
+                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::BgStatus::Finished(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let mut state = TuiState::new("model".into());
+        state.task_output_id = Some(id);
+        state.task_output_scroll.offset = 10;
+
+        handle_key(&mut state, &mouse(event::MouseEventKind::ScrollUp));
+        assert_eq!(state.task_output_scroll.offset(), 7);
+        handle_key(&mut state, &mouse(event::MouseEventKind::ScrollDown));
+        assert_eq!(state.task_output_scroll.offset(), 10);
+    }
+
+    #[tokio::test]
+    async fn output_scroll_clamps_at_the_bottom_and_scrolls_up_immediately() {
+        let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
+        for _ in 0..200 {
+            if matches!(
+                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::BgStatus::Finished(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let mut state = TuiState::new("model".into());
+        state.task_output_id = Some(id);
+
+        for _ in 0..10 {
+            handle_key(&mut state, &key(KeyCode::Char('j')));
+        }
+        assert_eq!(state.task_output_scroll.offset(), 18);
+        handle_key(&mut state, &key(KeyCode::Char('k')));
+        assert_eq!(state.task_output_scroll.offset(), 15);
+        handle_key(&mut state, &key(KeyCode::PageDown));
+        assert_eq!(state.task_output_scroll.offset(), 18);
+        handle_key(&mut state, &key(KeyCode::PageUp));
+        assert_eq!(state.task_output_scroll.offset(), 10);
+    }
+
+    #[tokio::test]
+    async fn task_output_popup_covers_chat_across_frames() {
+        let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
+        for _ in 0..200 {
+            if matches!(
+                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::BgStatus::Finished(_)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let mut state = TuiState::new("model".into());
+        for i in 0..5 {
+            state.session().renderer.push_user(&format!("CHATLINE-{i}"));
+        }
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+
+        state.tasks_open = true;
+        state.task_output_id = Some(id);
+        state.task_output_scroll.set_following(true);
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let in_popup: String = (3..21)
+            .flat_map(|y| {
+                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
+            })
+            .collect();
+        assert!(!in_popup.contains("CHATLINE"));
+        assert!(in_popup.contains("30"));
+    }
+
+    #[test]
+    fn frame_shows_the_rename_buffer_on_the_cursor_line() {
+        let mut state = TuiState::new("llama".into());
+        state.sessions.push(Session::new(1));
+        state.sessions[1].label = "old name".into();
+        state.picker_open = true;
+        state.picker_cursor = 1;
+        state.picker_rename = Some("new na".into());
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let joined: String = (0..12)
+            .flat_map(|y| {
+                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
+            })
+            .collect();
+        assert!(joined.contains("new na"));
+        assert!(joined.contains("rename"));
+        assert!(!joined.contains("old name"));
+    }
+
+    #[test]
+    fn session_label_is_set_from_the_first_task() {
+        let mut state = TuiState::new("model".into());
+        state.session().input = "fix the login bug".into();
+
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Enter)),
+            KeyAction::Submit("fix the login bug".into())
+        );
+        assert_eq!(state.session().label, "fix the login bug");
+
+        state.session().input = "another task".into();
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(state.session().label, "fix the login bug");
+    }
+
+    #[test]
+    fn frame_renders_the_picker_over_the_main_pane() {
+        let mut state = TuiState::new("llama".into());
+        state.session().renderer.on_event(text("hello"));
+        state.session().renderer.finish();
+        state.sessions.push(Session::new(1));
+        state.sessions[1].running = true;
+        state.picker_open = true;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let joined: String = (0..12)
+            .flat_map(|y| {
+                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
+            })
+            .collect();
+        assert!(joined.contains("sessions"));
+        assert!(joined.contains("working…"));
+        assert!(joined.contains("idle"));
+        assert!(joined.contains("search"));
+        assert!(joined.contains("hello"));
     }
 
     #[test]
@@ -1283,13 +2681,13 @@ mod test {
     #[test]
     fn enter_submits_the_input() {
         let mut state = TuiState::new("model".into());
-        state.input = "hello".into();
+        state.session().input = "hello".into();
 
         assert_eq!(
             handle_key(&mut state, &key(KeyCode::Enter)),
             KeyAction::Submit("hello".into())
         );
-        assert!(state.input.is_empty());
+        assert!(state.session().input.is_empty());
     }
 
     #[test]
@@ -1302,10 +2700,10 @@ mod test {
     #[test]
     fn backspace_pops_the_input() {
         let mut state = TuiState::new("model".into());
-        state.input = "ab".into();
+        state.session().input = "ab".into();
 
         assert_eq!(handle_key(&mut state, &key(KeyCode::Backspace)), KeyAction::None);
-        assert_eq!(state.input, "a");
+        assert_eq!(state.session().input, "a");
     }
 
     #[test]
@@ -1313,9 +2711,9 @@ mod test {
         let mut state = TuiState::new("model".into());
         assert_eq!(handle_key(&mut state, &key(KeyCode::Char('q'))), KeyAction::Quit);
 
-        state.input = "x".into();
+        state.session().input = "x".into();
         assert_eq!(handle_key(&mut state, &key(KeyCode::Char('q'))), KeyAction::None);
-        assert_eq!(state.input, "xq");
+        assert_eq!(state.session().input, "xq");
     }
 
     #[test]
@@ -1550,11 +2948,12 @@ mod test {
         state.viewport = 4;
         state.pane_width = 20;
         for _ in 0..3 {
-            state.renderer.on_event(text(&format!("{}\n", "a".repeat(40))));
+            state.session().renderer.on_event(text(&format!("{}\n", "a".repeat(40))));
         }
-        state.renderer.finish();
+        state.session().renderer.finish();
+        let (pw, vp) = (state.pane_width, state.viewport);
 
-        assert_eq!(state.max_scroll(), 3);
+        assert_eq!(state.session().max_scroll(pw, vp), 3);
     }
 
 
@@ -1568,16 +2967,19 @@ mod test {
         state.pane_width = 118;
         for i in 0..30 {
             let width = if i % 3 == 0 { 300 } else { 20 };
-            state.renderer.on_event(text(&format!("line {} {}\n", i, "x".repeat(width))));
+            state.session().renderer.on_event(text(&format!("line {} {}\n", i, "x".repeat(width))));
         }
-        state.renderer.finish();
-        state.following = true;
-        state.scroll = state.max_scroll();
+        state.session().renderer.finish();
+        state.session().scroller.set_following(true);
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        state.session().scroller.end(max);
 
-        let scrollback = state.renderer.scrollback();
+        let scrollback = state.session().renderer.scrollback().to_vec();
         let last_line = scrollback.last().unwrap().to_string();
+        let scroll = state.session().scroller.offset();
         let mut buffer = Buffer::empty(Rect::new(0, 0, 118, 24));
-        Paragraph::new(&scrollback[state.scroll..])
+        Paragraph::new(&scrollback[scroll..])
             .wrap(Wrap { trim: false })
             .render(Rect::new(0, 0, 118, 22), &mut buffer);
         let mut rows = Vec::new();
@@ -1599,34 +3001,42 @@ mod test {
     fn page_keys_scroll_the_main_pane() {
         let mut state = TuiState::new("model".into());
         for _ in 0..3 {
-            state.renderer.on_event(text("x\ny\nz\nw\n"));
+            state.session().renderer.on_event(text("x\ny\nz\nw\n"));
         }
-        state.renderer.finish();
+        state.session().renderer.finish();
         state.viewport = 2;
-        state.following = true;
-        state.scroll = state.max_scroll();
+        state.session().scroller.set_following(true);
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        state.session().scroller.end(max);
 
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
-        assert_eq!(state.scroll, 2);
-        assert!(!state.following);
+        assert_eq!(state.session().scroller.offset(), 2);
+        assert!(!state.session().scroller.following());
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
-        assert_eq!(state.scroll, 0);
+        assert_eq!(state.session().scroller.offset(), 0);
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageDown)), KeyAction::None);
-        assert_eq!(state.scroll, 10);
-        assert!(!state.following);
+        assert_eq!(state.session().scroller.offset(), 10);
+        assert!(!state.session().scroller.following());
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageDown)), KeyAction::None);
-        assert_eq!(state.scroll, 12);
-        assert!(state.following);
+        assert_eq!(state.session().scroller.offset(), 12);
+        assert!(state.session().scroller.following());
+        assert_eq!(handle_key(&mut state, &key(KeyCode::Home)), KeyAction::None);
+        assert_eq!(state.session().scroller.offset(), 0);
+        assert!(!state.session().scroller.following());
+        assert_eq!(handle_key(&mut state, &key(KeyCode::End)), KeyAction::None);
+        assert_eq!(state.session().scroller.offset(), max);
+        assert!(state.session().scroller.following());
     }
 
     #[test]
     fn typing_is_ignored_while_running() {
         let mut state = TuiState::new("model".into());
-        state.running = true;
-        state.input = "keep".into();
+        state.session().running = true;
+        state.session().input = "keep".into();
 
         assert_eq!(handle_key(&mut state, &key(KeyCode::Char('a'))), KeyAction::None);
-        assert_eq!(state.input, "keep");
+        assert_eq!(state.session().input, "keep");
         assert_eq!(
             handle_key(&mut state, &key(KeyCode::Enter)),
             KeyAction::None
@@ -1995,12 +3405,120 @@ mod test {
     }
 
     #[test]
+    fn replay_context_renders_the_transcript() {
+        use openai_oxide::types::chat::{FunctionCall, ToolCall};
+        let mut renderer = TuiRenderer::new();
+        let mut context = Context::new("sys", 100);
+        context.messages.push(Message::User { content: "do the thing".into() });
+        context.messages.push(Message::Assistant {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                type_: "function".into(),
+                function: FunctionCall {
+                    name: "bash".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                },
+            }],
+        });
+        context.messages.push(Message::Tool {
+            tool_call_id: "call-1".into(),
+            content: "file.txt".into(),
+        });
+        context.messages.push(Message::Assistant {
+            content: Some("done".into()),
+            tool_calls: vec![],
+        });
+
+        renderer.replay_context(&context);
+
+        let described = describe(&renderer.scrollback());
+        assert!(described.iter().any(|(c, _)| c.contains("do the thing")));
+        assert!(described.iter().any(|(c, _)| c.contains("bash")));
+        assert!(described.iter().any(|(c, _)| c.contains("ls")));
+        assert!(described.iter().any(|(c, _)| c.contains("file.txt")));
+        assert!(described.iter().any(|(c, _)| c.contains("done")));
+    }
+
+    #[test]
+    fn session_file_round_trip() {
+        let dir = std::env::temp_dir().join(format!("kite-session-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut context = Context::new("sys prompt", 100);
+        context.messages.push(Message::User { content: "hello".into() });
+        context.messages.push(Message::Assistant {
+            content: Some("hi".into()),
+            tool_calls: vec![],
+        });
+        context.total_prompt_tokens = 120;
+        context.total_completion_tokens = 34;
+
+        save_session(&dir, 7, "fix login", &context);
+        let loaded = load_sessions(&dir);
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, 7);
+        assert_eq!(loaded[0].1.label, "fix login");
+        assert_eq!(loaded[0].1.context.messages.len(), 2);
+        assert_eq!(loaded[0].1.context.total_prompt_tokens, 120);
+        assert_eq!(loaded[0].1.context.total_completion_tokens, 34);
+
+        remove_session_file(&dir, 7);
+        assert!(load_sessions(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_sessions_ignores_corrupt_and_unnamed_files() {
+        let dir = std::env::temp_dir().join(format!("kite-session-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("3.json"), "not json").unwrap();
+        std::fs::write(dir.join("notes.txt"), "{}").unwrap();
+        std::fs::write(dir.join("x.json"), "{}").unwrap();
+
+        assert!(load_sessions(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_sessions_restores_and_falls_back() {
+        let mut context = Context::new("sys", 100);
+        context.messages.push(Message::User { content: "hello".into() });
+        context.total_prompt_tokens = 50;
+        context.total_completion_tokens = 5;
+        let file = SessionFile {
+            label: "fix login".into(),
+            context: context.clone(),
+        };
+
+        let state = TuiState::with_sessions("model".into(), vec![(3, file)]);
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.sessions[0].label, "fix login");
+        assert_eq!(state.sessions[0].context.as_ref().unwrap().messages.len(), 1);
+        assert_eq!(state.sessions[0].prompt_tokens, 50);
+        assert_eq!(state.sessions[0].completion_tokens, 5);
+        assert_eq!(state.sessions[1].label, "");
+        assert!(state.sessions[1].context.is_none());
+        assert_eq!(state.active, 1);
+        assert_eq!(state.next_id, 5);
+
+        let state = TuiState::with_sessions("model".into(), vec![]);
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, 0);
+        assert_eq!(state.active, 0);
+        assert_eq!(state.next_id, 1);
+    }
+
+    #[test]
     fn frame_renders_status_main_and_input() {
         let mut state = TuiState::new("llama".into());
-        state.renderer.on_event(text("hello"));
-        state.renderer.finish();
-        state.prompt_tokens = 100;
-        state.completion_tokens = 5;
+        state.session().renderer.on_event(text("hello"));
+        state.session().renderer.finish();
+        state.session().prompt_tokens = 100;
+        state.session().completion_tokens = 5;
 
         let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2014,6 +3532,7 @@ mod test {
             .collect();
         assert!(joined.contains("llama"));
         assert!(joined.contains("100 prompt / 5 completion tok"));
+        assert!(joined.contains("[1/1]"));
         assert!(joined.contains("hello"));
         assert!(joined.contains(">"));
     }
