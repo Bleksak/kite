@@ -549,10 +549,7 @@ fn display_lines(
         .zip(blocks.iter())
         .map(|(line, block)| {
             let (text_background, block_background) = match block {
-                BlockKind::User => (
-                    Some(Color::DarkGray),
-                    Some(Color::DarkGray),
-                ),
+                BlockKind::User => (None, Some(Color::Rgb(192, 192, 192))),
                 BlockKind::Thinking => (
                     Some(Color::Rgb(128, 128, 128)),
                     Some(Color::Rgb(128, 128, 128)),
@@ -1112,7 +1109,8 @@ mod test {
         let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
         let user = &display[1];
         assert_eq!(user.width(), 40);
-        assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::DarkGray));
+        assert_eq!(user.spans[0].style.bg, None);
+        assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::Rgb(192, 192, 192)));
         let thinking = &display[4];
         assert_eq!(thinking.width(), 40);
         assert_eq!(thinking.spans.last().unwrap().style.bg, Some(Color::Rgb(128, 128, 128)));
