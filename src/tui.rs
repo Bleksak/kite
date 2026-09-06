@@ -25,7 +25,7 @@ impl StyleSheet for TuiStyleSheet {
     }
 
     fn code(&self) -> Style {
-        Style::new().fg(Color::Rgb(0, 159, 159)).on_black()
+        Style::new().fg(Color::Rgb(138, 190, 183))
     }
 }
 
@@ -101,7 +101,7 @@ impl TuiRenderer {
                             strip_vs16(line),
                             Style::default()
                                 .bold()
-                                .fg(Color::Rgb(255, 255, 255)),
+                                .fg(Color::Rgb(212, 212, 212)),
                         )),
                         BlockKind::User,
                     );
@@ -144,7 +144,7 @@ impl TuiRenderer {
                 self.tool_blocks.insert(header.clone(), (self.scrollback.len(), self.scrollback.len()));
                 self.push_line(padding_line(), BlockKind::ToolRunning);
                 self.push_line(
-                    Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())),
+                    Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold().fg(Color::Rgb(212, 212, 212)))),
                     BlockKind::ToolRunning,
                 );
                 if let Some(body) = body {
@@ -166,7 +166,7 @@ impl TuiRenderer {
                     }
                     None => {
                         self.push_line(
-                            Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())),
+                            Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold().fg(Color::Rgb(212, 212, 212)))),
                             BlockKind::ToolDone,
                         );
                     }
@@ -210,7 +210,7 @@ impl TuiRenderer {
                     self.push_line(Line::default(), BlockKind::Thinking);
                 } else {
                     self.push_line(
-                        Line::from(Span::styled(strip_vs16(line), Style::default().fg(Color::Black))),
+                        Line::from(Span::styled(strip_vs16(line), Style::default().fg(Color::Rgb(128, 128, 128)))),
                         BlockKind::Thinking,
                     );
                 }
@@ -290,10 +290,10 @@ impl TuiRenderer {
     fn push_markdown(&mut self, text: &str, block: BlockKind) {
         let (base, bold) = match block {
             BlockKind::User => (
-                Some(Color::Rgb(255, 255, 255)),
+                Some(Color::Rgb(212, 212, 212)),
                 Some(Color::Yellow),
             ),
-            BlockKind::Thinking => (Some(Color::Black), None),
+            BlockKind::Thinking => (Some(Color::Rgb(128, 128, 128)), None),
             _ => (None, Some(Color::Yellow)),
         };
         let lines = style_markdown_lines(render_markdown_lines(text), base, bold);
@@ -310,7 +310,7 @@ impl TuiRenderer {
                 self.push_line(
                     Line::from(Span::styled(
                         format!("  {}", strip_vs16(line)),
-                        Style::default().fg(Color::Rgb(208, 208, 208)),
+                        Style::default().fg(Color::Rgb(128, 128, 128)),
                     )),
                     block,
                 );
@@ -634,10 +634,10 @@ fn display_lines(
         .zip(blocks.iter())
         .map(|(line, block)| {
             let (text_background, block_background) = match block {
-                BlockKind::User => (None, Some(Color::Rgb(65, 65, 65))),
-                BlockKind::Thinking => (None, Some(Color::Rgb(192, 192, 192))),
-                BlockKind::ToolRunning => (None, Some(Color::Rgb(64, 64, 64))),
-                BlockKind::ToolDone => (None, Some(Color::Rgb(0, 100, 0))),
+                BlockKind::User => (None, Some(Color::Rgb(52, 53, 65))),
+                BlockKind::Thinking => (None, None),
+                BlockKind::ToolRunning => (None, Some(Color::Rgb(40, 40, 50))),
+                BlockKind::ToolDone => (None, Some(Color::Rgb(40, 50, 40))),
                 _ => (None, None),
             };
             if text_background.is_none() && block_background.is_none() {
@@ -719,7 +719,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(105, 105, 105))),
+                .border_style(Style::default().fg(Color::Rgb(95, 135, 255))),
         );
     frame.render_widget(main, chunks[1]);
 
@@ -1182,7 +1182,7 @@ mod test {
 
         let line = &renderer.scrollback()[1];
         let span = &line.spans[0];
-        assert_eq!(span.style.fg, Some(Color::Rgb(255, 255, 255)));
+        assert_eq!(span.style.fg, Some(Color::Rgb(212, 212, 212)));
         assert_eq!(span.style.bg, None);
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(renderer.blocks()[1], BlockKind::User);
@@ -1199,12 +1199,11 @@ mod test {
         let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
         let user = &display[1];
         assert_eq!(user.width(), 40);
-        assert_eq!(user.spans[0].style.bg, Some(Color::Rgb(65, 65, 65)));
-        assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::Rgb(65, 65, 65)));
+        assert_eq!(user.spans[0].style.bg, Some(Color::Rgb(52, 53, 65)));
+        assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::Rgb(52, 53, 65)));
         let thinking = &display[4];
-        assert_eq!(thinking.width(), 40);
-        assert_eq!(thinking.spans.last().unwrap().style.bg, Some(Color::Rgb(192, 192, 192)));
-        assert_eq!(thinking.spans[0].style.fg, Some(Color::Black));
+        assert_eq!(thinking.spans.last().unwrap().style.bg, None);
+        assert_eq!(thinking.spans[0].style.fg, Some(Color::Rgb(128, 128, 128)));
         let answer = &display[7];
         assert!(answer.spans.iter().all(|s| s.style.bg.is_none()));
     }
@@ -1344,8 +1343,8 @@ mod test {
         });
 
         let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
-        assert_eq!(display[0].spans.last().unwrap().style.bg, Some(Color::Rgb(64, 64, 64)));
-        assert_eq!(display[3].spans.last().unwrap().style.bg, Some(Color::Rgb(0, 100, 0)));
+        assert_eq!(display[0].spans.last().unwrap().style.bg, Some(Color::Rgb(40, 40, 50)));
+        assert_eq!(display[3].spans.last().unwrap().style.bg, Some(Color::Rgb(40, 50, 40)));
     }
 
     #[test]
@@ -1529,13 +1528,13 @@ mod test {
 
         let line = &renderer.scrollback()[1];
         let spans = &line.spans;
-        assert_eq!(spans[0].style.fg, Some(Color::Rgb(255, 255, 255)));
+        assert_eq!(spans[0].style.fg, Some(Color::Rgb(212, 212, 212)));
         let bold_span = spans.iter().find(|s| s.content.as_ref() == "bold").unwrap();
         assert_eq!(bold_span.style.fg, Some(Color::Yellow));
         assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
         let code_span = spans.iter().find(|s| s.content.as_ref() == "code").unwrap();
-        assert_eq!(code_span.style.fg, Some(Color::Rgb(0, 159, 159)));
-        assert_eq!(code_span.style.bg, Some(Color::Black));
+        assert_eq!(code_span.style.fg, Some(Color::Rgb(138, 190, 183)));
+        assert_eq!(code_span.style.bg, None);
     }
 
     #[test]
@@ -1544,9 +1543,9 @@ mod test {
 
         let line = &rendered[1];
         let spans = &line.spans;
-        assert_eq!(spans[0].style.fg, Some(Color::Black));
+        assert_eq!(spans[0].style.fg, Some(Color::Rgb(128, 128, 128)));
         let bold_span = spans.iter().find(|s| s.content.as_ref() == "bold").unwrap();
-        assert_eq!(bold_span.style.fg, Some(Color::Black));
+        assert_eq!(bold_span.style.fg, Some(Color::Rgb(128, 128, 128)));
         assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
     }
 
