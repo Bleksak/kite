@@ -25,7 +25,7 @@ impl StyleSheet for TuiStyleSheet {
     }
 
     fn code(&self) -> Style {
-        Style::new().fg(Color::Rgb(0, 128, 128)).on_black()
+        Style::new().fg(Color::Rgb(0, 159, 159)).on_black()
     }
 }
 
@@ -1519,7 +1519,7 @@ mod test {
         assert_eq!(bold_span.style.fg, Some(Color::Rgb(255, 255, 255)));
         assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
         let code_span = spans.iter().find(|s| s.content.as_ref() == "code").unwrap();
-        assert_eq!(code_span.style.fg, Some(Color::Rgb(0, 128, 128)));
+        assert_eq!(code_span.style.fg, Some(Color::Rgb(0, 159, 159)));
         assert_eq!(code_span.style.bg, Some(Color::Black));
     }
 
