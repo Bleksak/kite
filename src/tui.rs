@@ -993,6 +993,14 @@ pub async fn run(
     let mut state = TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
         .with_thinking(thinking)
         .with_mode(mode);
+    state.viewport = terminal
+        .size()
+        .map(|size| size.height.saturating_sub(8) as usize)
+        .unwrap_or(22);
+    state.pane_width = terminal
+        .size()
+        .map(|size| size.width.saturating_sub(2) as usize)
+        .unwrap_or(118);
     let mut inputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<String>> = HashMap::new();
     let mut handles: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
 
@@ -1014,7 +1022,11 @@ pub async fn run(
         }
     }
 
-    terminal.draw(|frame| draw(frame, &state, 0))?;
+    let start = state.sessions[state.active]
+        .scroller
+        .offset()
+        .min(state.sessions[state.active].max_scroll(state.pane_width, state.viewport));
+    terminal.draw(|frame| draw(frame, &state, start))?;
 
     let mut session_watch = tokio::time::interval(std::time::Duration::from_secs(2));
 
@@ -1127,6 +1139,12 @@ pub async fn run(
             .size()
             .map(|size| size.width.saturating_sub(2) as usize)
             .unwrap_or(118);
+        for session in &mut state.sessions {
+            if session.scroller.following() {
+                let max = session.max_scroll(state.pane_width, state.viewport);
+                session.scroller.follow_tail(max);
+            }
+        }
         let start = state.sessions[state.active]
             .scroller
             .offset()
