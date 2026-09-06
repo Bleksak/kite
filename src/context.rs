@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 
 use openai_oxide::types::chat::ChatCompletionMessageParam;
+use serde::{Deserialize, Serialize};
 
 use crate::message::Message;
 
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Context {
     pub system_prompt: String,
     pub messages: Vec<Message>,

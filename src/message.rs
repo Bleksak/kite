@@ -1,8 +1,9 @@
 use openai_oxide::types::chat::{
     ChatCompletionMessageParam, ToolCall, UserContent,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
     System {
         content: String,
