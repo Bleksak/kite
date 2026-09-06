@@ -24,8 +24,35 @@ impl StyleSheet for TuiStyleSheet {
         ""
     }
 
+    fn heading(&self, level: u8) -> Style {
+        let style = Style::default()
+            .fg(Color::Rgb(0xf0, 0xc6, 0x74))
+            .bold();
+        if level == 1 {
+            style.underlined()
+        } else {
+            style
+        }
+    }
+
+    fn heading_marker(&self, _level: u8) -> &str {
+        ""
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(Color::Rgb(0x81, 0xa2, 0xbe))
+            .underlined()
+    }
+
     fn code(&self) -> Style {
-        Style::new().fg(Color::Rgb(138, 190, 183))
+        Style::default().fg(Color::Rgb(138, 190, 183))
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default()
+            .fg(Color::Rgb(128, 128, 128))
+            .italic()
     }
 }
 
@@ -376,7 +403,11 @@ fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
             let original = line.to_string();
             let spans: Vec<Span> = match restore.get(&original) {
                 Some(rule) => {
-                    let style = line.spans.first().map(|s| s.style).unwrap_or_default();
+                    let style = line
+                        .spans
+                        .first()
+                        .map(|s| s.style.patch(line.style))
+                        .unwrap_or(line.style);
                     vec![Span {
                         content: std::borrow::Cow::Owned(strip_vs16(rule)),
                         style,
@@ -389,12 +420,12 @@ fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
                         content: std::borrow::Cow::Owned(strip_vs16(
                             &span.content.to_string(),
                         )),
-                        style: span.style,
+                        style: span.style.patch(line.style),
                     })
                     .collect(),
             };
             Line {
-                style: line.style,
+                style: Style::default(),
                 alignment: line.alignment,
                 spans,
             }
@@ -1464,8 +1495,9 @@ mod test {
         ]);
 
         assert_eq!(rendered.len(), 5);
-        assert!(rendered[1].style.add_modifier.contains(Modifier::BOLD));
-        assert!(rendered[1].style.add_modifier.contains(Modifier::UNDERLINED));
+        let heading = &rendered[1].spans[0];
+        assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+        assert!(heading.style.add_modifier.contains(Modifier::UNDERLINED));
         assert!(rendered[3].spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -1547,6 +1579,50 @@ mod test {
         let bold_span = spans.iter().find(|s| s.content.as_ref() == "bold").unwrap();
         assert_eq!(bold_span.style.fg, Some(Color::Rgb(128, 128, 128)));
         assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn headings_render_pi_style_without_markers() {
+        let rendered = lines(vec![text("# One\n\n## Two"), AgentEvent::CompletionStarted]);
+
+        let one = rendered.iter().find(|l| l.spans.iter().any(|s| s.content.as_ref() == "One")).unwrap();
+        let one_span = one.spans.iter().find(|s| s.content.as_ref() == "One").unwrap();
+        assert_eq!(one_span.style.fg, Some(Color::Rgb(0xf0, 0xc6, 0x74)));
+        assert!(one_span.style.add_modifier.contains(Modifier::BOLD));
+        assert!(one_span.style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!one.to_string().contains('#'));
+
+        let two = rendered.iter().find(|l| l.spans.iter().any(|s| s.content.as_ref() == "Two")).unwrap();
+        let two_span = two.spans.iter().find(|s| s.content.as_ref() == "Two").unwrap();
+        assert_eq!(two_span.style.fg, Some(Color::Rgb(0xf0, 0xc6, 0x74)));
+        assert!(two_span.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!two_span.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn links_render_pi_style() {
+        let rendered = lines(vec![text("[label](https://example.com)"), AgentEvent::CompletionStarted]);
+
+        let label = rendered
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref() == "label"))
+            .unwrap();
+        let label_span = label.spans.iter().find(|s| s.content.as_ref() == "label").unwrap();
+        assert_eq!(label_span.style.fg, Some(Color::Rgb(0x81, 0xa2, 0xbe)));
+        assert!(label_span.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn quotes_render_gray_italic() {
+        let rendered = lines(vec![text("> quoted"), AgentEvent::CompletionStarted]);
+
+        let quoted = rendered
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref() == "quoted"))
+            .unwrap();
+        let quoted_span = quoted.spans.iter().find(|s| s.content.as_ref() == "quoted").unwrap();
+        assert_eq!(quoted_span.style.fg, Some(Color::Rgb(128, 128, 128)));
+        assert!(quoted_span.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
