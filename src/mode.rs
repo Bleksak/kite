@@ -34,7 +34,7 @@ impl Mode {
             ],
             Self::Plan => vec![
                 Tool::ReadFile(String::new(), None, None),
-                Tool::Bash(String::new()),
+                Tool::ReadOnlyBash(String::new()),
                 Tool::SubmitPlan(String::new()),
             ],
         }
@@ -91,7 +91,7 @@ mod test {
             .iter()
             .map(|tool| tool.function.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["read_file", "bash", "submit_plan"]);
+        assert_eq!(names, vec!["read_file", "readonly_bash", "submit_plan"]);
     }
 
     #[test]
@@ -103,8 +103,9 @@ mod test {
     #[test]
     fn plan_allows_its_tools_and_rejects_the_rest() {
         assert!(Mode::Plan.allows(&Tool::ReadFile("a".into(), None, None)));
-        assert!(Mode::Plan.allows(&Tool::Bash("ls".into())));
+        assert!(Mode::Plan.allows(&Tool::ReadOnlyBash("ls".into())));
         assert!(Mode::Plan.allows(&Tool::SubmitPlan("plan".into())));
+        assert!(!Mode::Plan.allows(&Tool::Bash("ls".into())));
         assert!(!Mode::Plan.allows(&Tool::WriteFile("a".into(), "x".into())));
         assert!(!Mode::Plan.allows(&Tool::EditFile("a".into(), "x".into(), "y".into())));
         assert!(!Mode::Plan.allows(&Tool::BgRun("sleep 1".into())));

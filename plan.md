@@ -32,7 +32,7 @@ works unchanged inside each stage.
 
 |          | Plan                          | Implement                  | Review               |
 | -------- | ----------------------------- | -------------------------- | -------------------- |
-| Tools    | `read_file`, `bash`, `submit_plan` | all four + `escalate` | `read_file`, `bash` |
+| Tools    | `read_file`, `readonly_bash`, `submit_plan` | all four + `escalate` | `read_file`, `readonly_bash` |
 | Terminator | `submit_plan`               | `escalate`                 | — (answer = findings) |
 | Exit     | `Terminated(submit_plan)` → gate | `Answer` → Review; `Terminated(escalate)` → Plan | `Answer` → verdict gate |
 
