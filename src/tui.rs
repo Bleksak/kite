@@ -303,7 +303,7 @@ impl TuiRenderer {
                 self.push_line(
                     Line::from(Span::styled(
                         format!("  {}", strip_vs16(line)),
-                        Style::default().dim(),
+                        Style::default().fg(Color::Rgb(208, 208, 208)),
                     )),
                     block,
                 );
@@ -704,7 +704,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(Color::Rgb(105, 105, 105))),
         );
     frame.render_widget(main, chunks[1]);
 
@@ -946,7 +946,7 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("⚙ bash".into(), Modifier::BOLD),
-                ("  ls".into(), Modifier::DIM),
+                ("  ls".into(), Modifier::empty()),
             ]
         );
     }
@@ -1025,7 +1025,7 @@ mod test {
             vec![
                 (" ".into(), Modifier::empty()),
                 ("⚙ read_file: a.txt".into(), Modifier::BOLD),
-                ("  line one".into(), Modifier::DIM),
+                ("  line one".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
             ]
         );
@@ -1059,9 +1059,9 @@ mod test {
                 ("⚙ read_file: a.txt".into(), Modifier::BOLD),
                 (" ".into(), Modifier::empty()),
                 ("⚙ read_file: b.txt".into(), Modifier::BOLD),
-                ("  alpha".into(), Modifier::DIM),
+                ("  alpha".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
-                ("  beta".into(), Modifier::DIM),
+                ("  beta".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
             ]
         );
@@ -1560,7 +1560,7 @@ mod test {
             vec![
                 (" ".into(), Modifier::empty()),
                 ("⚙ bash".into(), Modifier::BOLD),
-                ("  **cmd**".into(), Modifier::DIM),
+                ("  **cmd**".into(), Modifier::empty()),
             ]
         );
     }
