@@ -94,7 +94,7 @@ impl TuiRenderer {
                         strip_vs16(line),
                         Style::default()
                             .bold()
-                            .fg(Color::White),
+                            .fg(Color::Rgb(255, 255, 255)),
                     )),
                     BlockKind::User,
                 );
@@ -1093,7 +1093,7 @@ mod test {
 
         let line = &renderer.scrollback()[1];
         let span = &line.spans[0];
-        assert_eq!(span.style.fg, Some(Color::White));
+        assert_eq!(span.style.fg, Some(Color::Rgb(255, 255, 255)));
         assert_eq!(span.style.bg, None);
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(renderer.blocks()[1], BlockKind::User);
