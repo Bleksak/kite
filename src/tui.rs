@@ -519,15 +519,6 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     }
 }
 
-fn split_at_char(s: &str, char_offset: usize) -> (String, String) {
-    let byte = s
-        .char_indices()
-        .nth(char_offset)
-        .map(|(index, _)| index)
-        .unwrap_or(s.len());
-    (s[..byte].to_string(), s[byte..].to_string())
-}
-
 fn word_left(input: &str, cursor: usize) -> usize {
     let chars: Vec<char> = input.chars().collect();
     let mut pos = cursor;
@@ -941,13 +932,23 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     } else if let Some(error) = &session.error {
         Line::from(Span::styled(error.clone(), Style::default().red()))
     } else {
-        let (before, after) = split_at_char(&session.input, session.input_cursor);
-        Line::from(vec![
-            Span::styled("> ".to_string(), Style::default().bold()),
-            Span::raw(before),
-            Span::styled("█".to_string(), Style::default().bold()),
-            Span::raw(after),
-        ])
+        let cursor_style = Style::default()
+            .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
+            .fg(Color::Rgb(0x28, 0x28, 0x32));
+        let chars: Vec<char> = session.input.chars().collect();
+        let mut spans = vec![Span::styled("> ".to_string(), Style::default().bold())];
+        for (index, ch) in chars.iter().enumerate() {
+            let span = if index == session.input_cursor {
+                Span::styled(ch.to_string(), cursor_style)
+            } else {
+                Span::raw(ch.to_string())
+            };
+            spans.push(span);
+        }
+        if session.input_cursor == chars.len() {
+            spans.push(Span::styled("█".to_string(), cursor_style));
+        }
+        Line::from(spans)
     };
     let shared = *state.mode.lock().unwrap();
     let effective = session.stage.unwrap_or(shared);
