@@ -593,7 +593,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let chunks = Layout::new(
         Direction::Vertical,
-        [Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)],
+        [Constraint::Length(3), Constraint::Min(1), Constraint::Length(1), Constraint::Length(3)],
     )
     .split(area);
     let session = &state.sessions[state.active];
@@ -624,17 +624,6 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     status_spans.push(Span::styled(
         format!("  ·  💭 {}", thinking_level.label()),
         Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
-    ));
-    let mode = *state.mode.lock().unwrap();
-    status_spans.push(Span::styled(
-        format!("  ·  {} {}", if mode == Mode::Plan { "📋" } else { "⚒" }, mode.label()),
-        Style::default()
-            .bold()
-            .fg(if mode == Mode::Plan {
-                Color::Rgb(0xb5, 0xbd, 0x68)
-            } else {
-                Color::Rgb(0x81, 0xa2, 0xbe)
-            }),
     ));
     let status = Line::from(status_spans);
     frame.render_widget(
@@ -873,6 +862,25 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         }
     }
 
+    let mode = *state.mode.lock().unwrap();
+    let mode_line = Line::from(vec![
+        Span::styled("mode  ".to_string(), Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe))),
+        Span::styled(
+            format!("{} {}", if mode == Mode::Plan { "📋" } else { "⚒" }, mode.label()),
+            Style::default()
+                .bold()
+                .fg(if mode == Mode::Plan {
+                    Color::Rgb(0xb5, 0xbd, 0x68)
+                } else {
+                    Color::Rgb(0xd4, 0xd4, 0xd4)
+                }),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(mode_line).block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
+
     let input_line = if session.running {
         Line::from(Span::styled("working…".to_string(), Style::default().dim()))
     } else if let Some(error) = &session.error {
@@ -886,7 +894,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     };
     frame.render_widget(
         Paragraph::new(input_line).block(Block::default().borders(Borders::ALL)),
-        chunks[2],
+        chunks[3],
     );
 }
 
