@@ -570,6 +570,7 @@ fn display_lines(
                         .collect(),
                 };
             }
+            let text_background = text_background.or(block_background);
             let mut spans: Vec<Span> = line
                 .spans
                 .iter()
@@ -1109,7 +1110,7 @@ mod test {
         let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
         let user = &display[1];
         assert_eq!(user.width(), 40);
-        assert_eq!(user.spans[0].style.bg, None);
+        assert_eq!(user.spans[0].style.bg, Some(Color::Rgb(192, 192, 192)));
         assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::Rgb(192, 192, 192)));
         let thinking = &display[4];
         assert_eq!(thinking.width(), 40);
