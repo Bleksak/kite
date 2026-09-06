@@ -35,9 +35,18 @@ pub enum TuiEvent {
     TurnError(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BlockKind {
+    User,
+    Thinking,
+    Answer,
+    Other,
+}
+
 pub struct TuiRenderer {
     gate: AnswerGate,
     scrollback: Vec<Line<'static>>,
+    blocks: Vec<BlockKind>,
     thinking: String,
     answer: String,
     turn_answer: String,
@@ -50,6 +59,7 @@ impl TuiRenderer {
         TuiRenderer {
             gate: AnswerGate::new(),
             scrollback: Vec::new(),
+            blocks: Vec::new(),
             thinking: String::new(),
             answer: String::new(),
             turn_answer: String::new(),
@@ -62,24 +72,35 @@ impl TuiRenderer {
         &self.scrollback
     }
 
+    pub fn blocks(&self) -> &[BlockKind] {
+        &self.blocks
+    }
+
+    fn push_line(&mut self, line: Line<'static>, block: BlockKind) {
+        self.scrollback.push(line);
+        self.blocks.push(block);
+    }
+
     pub fn push_user(&mut self, text: &str) {
         self.close_thinking();
         self.tool_header = None;
-        self.scrollback.push(padding_line());
+        self.push_line(padding_line(), BlockKind::User);
         for line in text.split('\n') {
             if line.is_empty() {
-                self.scrollback.push(Line::default());
+                self.push_line(Line::default(), BlockKind::User);
             } else {
-                self.scrollback.push(Line::from(Span::styled(
-                    strip_vs16(line),
-                    Style::default()
-                        .bold()
-                        .fg(Color::White)
-                        .bg(Color::DarkGray),
-                )));
+                self.push_line(
+                    Line::from(Span::styled(
+                        strip_vs16(line),
+                        Style::default()
+                            .bold()
+                            .fg(Color::White),
+                    )),
+                    BlockKind::User,
+                );
             }
         }
-        self.scrollback.push(padding_line());
+        self.push_line(padding_line(), BlockKind::User);
     }
 
     pub fn on_event(&mut self, event: AgentEvent) {
@@ -100,7 +121,7 @@ impl TuiRenderer {
                     && let Some(thinking) = &chunk.thinking
                 {
                     if self.thinking.is_empty() && !thinking.is_empty() {
-                        self.scrollback.push(padding_line());
+                        self.push_line(padding_line(), BlockKind::Thinking);
                     }
                     self.thinking.push_str(thinking);
                 }
@@ -114,8 +135,10 @@ impl TuiRenderer {
                 self.end_answer_block();
                 self.close_thinking();
                 self.tool_header = Some(header.clone());
-                self.scrollback
-                    .push(Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())));
+                self.push_line(
+                    Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())),
+                    BlockKind::Other,
+                );
                 if let Some(body) = body {
                     self.push_indented(&body);
                 }
@@ -124,8 +147,10 @@ impl TuiRenderer {
                 self.flush_answer();
                 if self.tool_header.as_deref() != Some(header.as_str()) {
                     self.tool_header = Some(header.clone());
-                    self.scrollback
-                        .push(Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())));
+                    self.push_line(
+                        Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())),
+                        BlockKind::Other,
+                    );
                 }
                 self.push_indented(&body);
                 self.tool_header = None;
@@ -148,7 +173,7 @@ impl TuiRenderer {
         let had_answer = self.answer_start.is_some();
         self.render_answer_markdown();
         if had_answer {
-            self.scrollback.push(padding_line());
+            self.push_line(padding_line(), BlockKind::Answer);
         }
     }
 
@@ -160,13 +185,15 @@ impl TuiRenderer {
         let thinking = mem::take(&mut self.thinking);
         for line in thinking.split('\n') {
             if line.is_empty() {
-                self.scrollback.push(Line::default());
+                self.push_line(Line::default(), BlockKind::Thinking);
             } else {
-                self.scrollback
-                    .push(Line::from(Span::styled(strip_vs16(line), Style::default().dim())));
+                self.push_line(
+                    Line::from(Span::styled(strip_vs16(line), Style::default().fg(Color::Black))),
+                    BlockKind::Thinking,
+                );
             }
         }
-        self.scrollback.push(padding_line());
+        self.push_line(padding_line(), BlockKind::Thinking);
     }
 
     fn push_answer_text(&mut self, text: &str) {
@@ -175,13 +202,13 @@ impl TuiRenderer {
             let line = strip_vs16(&self.answer[..index]);
             self.answer.drain(..=index);
             if self.answer_start.is_none() {
-                self.scrollback.push(padding_line());
+                self.push_line(padding_line(), BlockKind::Answer);
             }
             self.mark_answer_start();
             if line.is_empty() {
-                self.scrollback.push(Line::default());
+                self.push_line(Line::default(), BlockKind::Answer);
             } else {
-                self.scrollback.push(Line::from(line));
+                self.push_line(Line::from(line), BlockKind::Answer);
             }
         }
     }
@@ -192,10 +219,10 @@ impl TuiRenderer {
         }
         let line = strip_vs16(&mem::take(&mut self.answer));
         if self.answer_start.is_none() {
-            self.scrollback.push(padding_line());
+            self.push_line(padding_line(), BlockKind::Answer);
         }
         self.mark_answer_start();
-        self.scrollback.push(Line::from(line));
+        self.push_line(Line::from(line), BlockKind::Answer);
     }
 
     fn mark_answer_start(&mut self) {
@@ -247,7 +274,12 @@ impl TuiRenderer {
                 }
             })
             .collect();
+        let count = lines.len();
         self.scrollback.splice(start.., lines);
+        self.blocks.splice(
+            start..,
+            std::iter::repeat(BlockKind::Answer).take(count).collect::<Vec<_>>(),
+        );
         self.turn_answer.clear();
         self.answer_start = None;
     }
@@ -255,12 +287,15 @@ impl TuiRenderer {
     fn push_indented(&mut self, body: &str) {
         for line in body.split('\n') {
             if line.is_empty() {
-                self.scrollback.push(Line::default());
+                self.push_line(Line::default(), BlockKind::Other);
             } else {
-                self.scrollback.push(Line::from(Span::styled(
-                    format!("  {}", strip_vs16(line)),
-                    Style::default().dim(),
-                )));
+                self.push_line(
+                    Line::from(Span::styled(
+                        format!("  {}", strip_vs16(line)),
+                        Style::default().dim(),
+                    )),
+                    BlockKind::Other,
+                );
             }
         }
     }
@@ -495,6 +530,58 @@ fn tail_start(len: usize, lines: &[Line<'static>], width: u16, viewport: usize) 
     lo
 }
 
+fn display_lines(
+    scrollback: &[Line<'static>],
+    blocks: &[BlockKind],
+    width: usize,
+) -> Vec<Line<'static>> {
+    scrollback
+        .iter()
+        .zip(blocks.iter())
+        .map(|(line, block)| {
+            let background = match block {
+                BlockKind::User => Some(Style::default().bg(Color::DarkGray)),
+                BlockKind::Thinking => Some(Style::default().bg(Color::Gray)),
+                _ => None,
+            };
+            let Some(background) = background else {
+                return Line {
+                    style: line.style,
+                    alignment: line.alignment,
+                    spans: line
+                        .spans
+                        .iter()
+                        .map(|span| Span {
+                            content: std::borrow::Cow::Owned(span.content.to_string()),
+                            style: span.style,
+                        })
+                        .collect(),
+                };
+            };
+            let mut spans: Vec<Span> = line
+                .spans
+                .iter()
+                .map(|span| Span {
+                    content: std::borrow::Cow::Owned(span.content.to_string()),
+                    style: span.style.patch(background),
+                })
+                .collect();
+            let current = line.width();
+            if current < width {
+                spans.push(Span::styled(
+                    " ".repeat(width - current),
+                    background,
+                ));
+            }
+            Line {
+                style: line.style,
+                alignment: line.alignment,
+                spans,
+            }
+        })
+        .collect()
+}
+
 pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let chunks = Layout::new(
@@ -515,8 +602,9 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         chunks[0],
     );
 
-    let scrollback = state.renderer.scrollback();
-    let main = Paragraph::new(&scrollback[start..])
+    let display = display_lines(state.renderer.scrollback(), state.renderer.blocks(), state.pane_width);
+    let display = &display[start.min(display.len())..];
+    let main = Paragraph::new(display)
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(main, chunks[1]);
@@ -711,7 +799,7 @@ mod test {
             described,
             vec![
                 (" ".into(), Modifier::empty()),
-                ("Let me think. ".into(), Modifier::DIM),
+                ("Let me think. ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("42".into(), Modifier::empty()),
@@ -732,7 +820,7 @@ mod test {
             described,
             vec![
                 (" ".into(), Modifier::empty()),
-                ("reasoning ".into(), Modifier::DIM),
+                ("reasoning ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("answer".into(), Modifier::empty()),
@@ -755,7 +843,7 @@ mod test {
             described,
             vec![
                 (" ".into(), Modifier::empty()),
-                ("thinking".into(), Modifier::DIM),
+                ("thinking".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("⚙ bash".into(), Modifier::BOLD),
                 ("  ls".into(), Modifier::DIM),
@@ -778,13 +866,13 @@ mod test {
             described,
             vec![
                 (" ".into(), Modifier::empty()),
-                ("glued".into(), Modifier::DIM),
+                ("glued".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("narration".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
-                ("next round".into(), Modifier::DIM),
+                ("next round".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
             ]
         );
@@ -804,13 +892,13 @@ mod test {
             described,
             vec![
                 (" ".into(), Modifier::empty()),
-                ("first ".into(), Modifier::DIM),
+                ("first ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("narration".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
-                ("second ".into(), Modifier::DIM),
+                ("second ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("answer".into(), Modifier::empty()),
@@ -968,7 +1056,7 @@ mod test {
     }
 
     #[test]
-    fn user_block_gets_gray_background_and_white_text() {
+    fn user_block_stores_white_text_and_the_block_kind() {
         let mut renderer = TuiRenderer::new();
         renderer.push_user("do the thing");
         renderer.finish();
@@ -976,8 +1064,29 @@ mod test {
         let line = &renderer.scrollback()[1];
         let span = &line.spans[0];
         assert_eq!(span.style.fg, Some(Color::White));
-        assert_eq!(span.style.bg, Some(Color::DarkGray));
+        assert_eq!(span.style.bg, None);
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(renderer.blocks()[1], BlockKind::User);
+    }
+
+    #[test]
+    fn display_lines_pad_user_and_thinking_blocks_to_full_width() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_user("hi");
+        renderer.on_event(thinking("think"));
+        renderer.on_event(text("ans"));
+        renderer.finish();
+
+        let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
+        let user = &display[1];
+        assert_eq!(user.width(), 40);
+        assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::DarkGray));
+        let thinking = &display[4];
+        assert_eq!(thinking.width(), 40);
+        assert_eq!(thinking.spans.last().unwrap().style.bg, Some(Color::Gray));
+        assert_eq!(thinking.spans[0].style.fg, Some(Color::Black));
+        let answer = &display[7];
+        assert!(answer.spans.iter().all(|s| s.style.bg.is_none()));
     }
 
     #[test]
@@ -1110,7 +1219,7 @@ mod test {
             described,
             vec![
                 (" ".into(), Modifier::empty()),
-                ("**not** rendered".into(), Modifier::DIM),
+                ("**not** rendered".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("done".into(), Modifier::empty()),
