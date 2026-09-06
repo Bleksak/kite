@@ -29,6 +29,18 @@ pub enum ToolError {
         seconds: u64,
     },
 
+    #[error("webfetch of {url} failed: {source}")]
+    WebFetchFailed {
+        url: String,
+        source: reqwest::Error,
+    },
+
+    #[error("webfetch of {url} failed with status {status}")]
+    WebFetchStatus {
+        url: String,
+        status: u16,
+    },
+
     #[error("expected exactly one occurrence of old content in {path}, found {occurrences}")]
     AmbiguousEdit { path: String, occurrences: usize },
 
@@ -46,9 +58,11 @@ pub enum ToolError {
 #[derive(Debug, PartialEq)]
 pub enum Tool {
     Bash(String),
+    ReadOnlyBash(String),
     ReadFile(String, Option<usize>, Option<usize>),
     WriteFile(String, String),
     EditFile(String, String, String),
+    WebFetch(String),
 }
 
 pub enum ToolOutput<'a> {
@@ -74,15 +88,18 @@ impl Tool {
     pub fn label(&self) -> &'static str {
         match &self {
             Tool::Bash(_) => "bash",
+            Tool::ReadOnlyBash(_) => "readonly_bash",
             Tool::ReadFile(..) => "read_file",
             Tool::WriteFile(_, _) => "write_file",
             Tool::EditFile(_, _, _) => "edit_file",
+            Tool::WebFetch(_) => "webfetch",
         }
     }
 
     pub fn header(&self) -> String {
         match self {
             Tool::Bash(_) => "bash".to_string(),
+            Tool::ReadOnlyBash(_) => "readonly_bash".to_string(),
             Tool::ReadFile(path, start, end) => {
                 let range = match (start, end) {
                     (None, None) => None,
@@ -97,33 +114,38 @@ impl Tool {
             }
             Tool::WriteFile(path, _) => format!("write_file: {path}"),
             Tool::EditFile(path, _, _) => format!("edit_file: {path}"),
+            Tool::WebFetch(url) => format!("webfetch: {url}"),
         }
     }
 
     pub fn output(&self) -> ToolOutput<'_> {
         match self {
             Tool::Bash(cmd) => ToolOutput::Before(cmd),
+            Tool::ReadOnlyBash(cmd) => ToolOutput::Before(cmd),
             Tool::ReadFile(..) => ToolOutput::After,
             Tool::WriteFile(_, content) => ToolOutput::Before(content),
             Tool::EditFile(..) => ToolOutput::Hidden,
+            Tool::WebFetch(url) => ToolOutput::Before(url),
         }
     }
 
     pub fn description(&self) -> &'static str {
         match &self {
             Tool::Bash(_) => "Run a bash script",
+            Tool::ReadOnlyBash(_) => "Run a bash script in a read-only sandbox; the working directory is the current directory, /tmp is writable",
             Tool::ReadFile(_, _, _) => {
                 "Read a file, optionally a line range (1-based start and end line, both inclusive)"
             }
             Tool::WriteFile(_, _) => "Write a file",
             Tool::EditFile(_, _, _) => "Edit a file",
+            Tool::WebFetch(_) => "Fetch a URL and return the response body",
         }
     }
 
     pub async fn invoke(&self, timeout: Duration) -> Result<String, ToolError> {
         match &self {
             Tool::Bash(script) => {
-                let mut child = Command::new("bash")
+                let child = Command::new("bash")
                     .arg("-c")
                     .arg(script)
                     .stdin(Stdio::null())
@@ -131,54 +153,26 @@ impl Tool {
                     .stderr(Stdio::piped())
                     .spawn()
                     .map_err(ToolError::Io)?;
-
-                let collected = tokio::time::timeout(timeout, async {
-                    let mut stdout = Vec::new();
-                    let mut stderr = Vec::new();
-                    if let Some(mut out) = child.stdout.take() {
-                        out.read_to_end(&mut stdout).await.map_err(ToolError::Io)?;
-                    }
-                    if let Some(mut err) = child.stderr.take() {
-                        err.read_to_end(&mut stderr).await.map_err(ToolError::Io)?;
-                    }
-                    let status = child.wait().await.map_err(ToolError::Io)?;
-                    Ok::<(std::process::ExitStatus, Vec<u8>, Vec<u8>), ToolError>((
-                        status, stdout, stderr,
-                    ))
-                })
-                .await;
-
-                let (status, stdout, stderr) = match collected {
-                    Ok(Ok(value)) => value,
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => {
-                        let _ = child.kill().await;
-                        return Err(ToolError::TimedOut {
-                            tool: self.label(),
-                            seconds: timeout.as_secs(),
-                        });
-                    }
-                };
-
-                if !status.success() {
-                    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
-                    let stderr = String::from_utf8_lossy(&stderr).into_owned();
-                    if !stderr.is_empty() {
-                        if !combined.is_empty() {
-                            combined.push('\n');
-                        }
-                        combined.push_str(&stderr);
-                    }
-                    return Err(ToolError::NonZeroExit {
-                        tool: self.label(),
-                        status: status.code().unwrap_or(-1),
-                        output: cap_output(combined),
-                    });
-                }
-
-                Ok(cap_output(
-                    String::from_utf8_lossy(&stdout).into_owned(),
-                ))
+                Self::run_captured(child, timeout, self.label()).await
+            }
+            Tool::ReadOnlyBash(script) => {
+                let cwd = std::env::current_dir().map_err(ToolError::Io)?;
+                let child = Command::new("bwrap")
+                    .args(["--ro-bind", "/", "/", "--ro-bind"])
+                    .arg(&cwd)
+                    .arg(&cwd)
+                    .args(["--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--chdir"])
+                    .arg(&cwd)
+                    .args(["--unshare-pid", "--unshare-ipc", "--unshare-uts"])
+                    .arg("bash")
+                    .arg("-c")
+                    .arg(script)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(ToolError::Io)?;
+                Self::run_captured(child, timeout, self.label()).await
             }
             Tool::ReadFile(file, start, end) => {
                 let contents = tokio::fs::read_to_string(file).await.map_err(ToolError::Io)?;
@@ -229,7 +223,100 @@ impl Tool {
                 tokio::fs::write(file, contents).await.map_err(ToolError::Io)?;
                 Ok(format!("edited {file}"))
             }
+            Tool::WebFetch(url) => {
+                let collected = tokio::time::timeout(timeout, async {
+                    let response = reqwest::Client::new()
+                        .get(url.as_str())
+                        .send()
+                        .await
+                        .map_err(|source| ToolError::WebFetchFailed {
+                            url: url.clone(),
+                            source,
+                        })?;
+                    let status = response.status().as_u16();
+                    let body = response.text().await.map_err(|source| ToolError::WebFetchFailed {
+                        url: url.clone(),
+                        source,
+                    })?;
+                    Ok::<(u16, String), ToolError>((status, body))
+                })
+                .await;
+
+                let (status, body) = match collected {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(ToolError::TimedOut {
+                            tool: self.label(),
+                            seconds: timeout.as_secs(),
+                        });
+                    }
+                };
+
+                if status >= 400 {
+                    return Err(ToolError::WebFetchStatus {
+                        url: url.clone(),
+                        status,
+                    });
+                }
+
+                Ok(cap_output(body))
+            }
         }
+    }
+
+    async fn run_captured(
+        mut child: tokio::process::Child,
+        timeout: Duration,
+        tool: &'static str,
+    ) -> Result<String, ToolError> {
+        let collected = tokio::time::timeout(timeout, async {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut out) = child.stdout.take() {
+                out.read_to_end(&mut stdout).await.map_err(ToolError::Io)?;
+            }
+            if let Some(mut err) = child.stderr.take() {
+                err.read_to_end(&mut stderr).await.map_err(ToolError::Io)?;
+            }
+            let status = child.wait().await.map_err(ToolError::Io)?;
+            Ok::<(std::process::ExitStatus, Vec<u8>, Vec<u8>), ToolError>((
+                status, stdout, stderr,
+            ))
+        })
+        .await;
+
+        let (status, stdout, stderr) = match collected {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(ToolError::TimedOut {
+                    tool,
+                    seconds: timeout.as_secs(),
+                });
+            }
+        };
+
+        if !status.success() {
+            let mut combined = String::from_utf8_lossy(&stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&stderr).into_owned();
+            if !stderr.is_empty() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&stderr);
+            }
+            return Err(ToolError::NonZeroExit {
+                tool,
+                status: status.code().unwrap_or(-1),
+                output: cap_output(combined),
+            });
+        }
+
+        Ok(cap_output(
+            String::from_utf8_lossy(&stdout).into_owned(),
+        ))
     }
 }
 
@@ -262,6 +349,11 @@ struct EditFileArgs {
     new_content: String,
 }
 
+#[derive(Deserialize)]
+struct WebFetchArgs {
+    url: String,
+}
+
 fn parse_args<A: serde::de::DeserializeOwned>(name: &str, arguments: &str) -> Result<A, ToolError> {
     serde_json::from_str(arguments).map_err(|source| ToolError::InvalidArguments {
         name: name.to_string(),
@@ -283,12 +375,16 @@ impl TryFrom<OpenAIToolCall> for Tool {
         match function.name.as_str() {
             "bash" => parse_args::<BashArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::Bash(a.command)),
+            "readonly_bash" => parse_args::<BashArgs>(&function.name, &function.arguments)
+                .map(|a| Tool::ReadOnlyBash(a.command)),
             "read_file" => parse_args::<ReadFileArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::ReadFile(a.path, a.start, a.end)),
             "write_file" => parse_args::<WriteFileArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::WriteFile(a.path, a.content)),
             "edit_file" => parse_args::<EditFileArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::EditFile(a.path, a.old_content, a.new_content)),
+            "webfetch" => parse_args::<WebFetchArgs>(&function.name, &function.arguments)
+                .map(|a| Tool::WebFetch(a.url)),
             other => Err(ToolError::UnknownTool {
                 name: other.to_string(),
             }),
@@ -299,9 +395,11 @@ impl TryFrom<OpenAIToolCall> for Tool {
 pub fn tool_definitions() -> Vec<OpenAITool> {
     let tools = [
         Tool::Bash(String::new()),
+        Tool::ReadOnlyBash(String::new()),
         Tool::ReadFile(String::new(), None, None),
         Tool::WriteFile(String::new(), String::new()),
         Tool::EditFile(String::new(), String::new(), String::new()),
+        Tool::WebFetch(String::new()),
     ];
 
     tools
@@ -319,7 +417,7 @@ pub fn tool_definitions() -> Vec<OpenAITool> {
 
 fn parameters(tool: &Tool) -> serde_json::Value {
     match tool {
-        Tool::Bash(_) => json!({
+        Tool::Bash(_) | Tool::ReadOnlyBash(_) => json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "the shell command to run" }
@@ -352,6 +450,13 @@ fn parameters(tool: &Tool) -> serde_json::Value {
             },
             "required": ["path", "old_content", "new_content"]
         }),
+        Tool::WebFetch(_) => json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "the URL to fetch" }
+            },
+            "required": ["url"]
+        }),
     }
 }
 
@@ -359,6 +464,7 @@ fn parameters(tool: &Tool) -> serde_json::Value {
 mod test {
     use crate::tool::{tool_definitions, Tool, ToolError};
     use openai_oxide::types::chat::{FunctionCall, ToolCall as OpenAIToolCall};
+    use std::io::{Read, Write};
     use std::time::Duration;
     use test_files::TestFiles;
 
@@ -408,6 +514,63 @@ mod test {
         let result = tool.invoke(timeout()).await.unwrap();
 
         assert_eq!(result, "hello world\n");
+    }
+
+    #[tokio::test]
+    async fn readonly_bash_runs_the_script() {
+        let tool = Tool::ReadOnlyBash("echo sandbox-ok".into());
+
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "sandbox-ok\n");
+    }
+
+    #[tokio::test]
+    async fn readonly_bash_writes_to_cwd_fail() {
+        let cwd = std::env::current_dir().unwrap();
+        let tool = Tool::ReadOnlyBash(format!("touch {}/probe", cwd.display()));
+
+        let error = tool.invoke(timeout()).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::NonZeroExit { status: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn readonly_bash_writes_to_tmp_succeed() {
+        let tool = Tool::ReadOnlyBash("touch /tmp/probe && echo ok".into());
+
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "ok\n");
+    }
+
+    #[tokio::test]
+    async fn readonly_bash_reads_cwd_files() {
+        let cwd = std::env::current_dir().unwrap();
+        let tool = Tool::ReadOnlyBash(format!("cat {}/Cargo.toml", cwd.display()));
+
+        let output = tool.invoke(timeout()).await.unwrap();
+        assert!(output.starts_with("[package]"));
+    }
+
+    #[tokio::test]
+    async fn readonly_bash_hypothesis_test_against_memory_db() {
+        let tool = Tool::ReadOnlyBash(
+            "python3 -c \"import sqlite3; sqlite3.connect(':memory:').execute('SELECT 1')\" && echo ok".into(),
+        );
+
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "ok\n");
+    }
+
+    #[tokio::test]
+    async fn readonly_bash_timeout_kills_the_sandbox() {
+        let tool = Tool::ReadOnlyBash("sleep 5".into());
+
+        let error = tool.invoke(Duration::from_secs(1)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::TimedOut { tool: "readonly_bash", seconds: 1 }
+        ));
     }
 
     #[tokio::test]
@@ -810,6 +973,13 @@ version: 3"#,
     }
 
     #[test]
+    fn try_from_readonly_bash() {
+        let tool =
+            Tool::try_from(call("readonly_bash", r#"{"command":"ls"}"#)).unwrap();
+        assert_eq!(tool, Tool::ReadOnlyBash("ls".into()));
+    }
+
+    #[test]
     fn try_from_read_file_full() {
         let tool = Tool::try_from(call("read_file", r#"{"path":"a.txt"}"#)).unwrap();
         assert_eq!(tool, Tool::ReadFile("a.txt".into(), None, None));
@@ -837,6 +1007,13 @@ version: 3"#,
         ))
         .unwrap();
         assert_eq!(tool, Tool::EditFile("a.txt".into(), "a".into(), "b".into()));
+    }
+
+    #[test]
+    fn try_from_webfetch() {
+        let tool =
+            Tool::try_from(call("webfetch", r#"{"url":"https://example.com"}"#)).unwrap();
+        assert_eq!(tool, Tool::WebFetch("https://example.com".into()));
     }
 
     #[test]
@@ -878,6 +1055,77 @@ version: 3"#,
     fn try_from_ignores_hallucinated_fields() {
         let tool = Tool::try_from(call("bash", r#"{"command":"ls","vibes":42}"#)).unwrap();
         assert_eq!(tool, Tool::Bash("ls".into()));
+    }
+
+    fn serve_once(response: &str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = response.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn webfetch_returns_the_body() {
+        let (url, handle) = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world",
+        );
+
+        let tool = Tool::WebFetch(url);
+
+        assert_eq!(tool.invoke(timeout()).await.unwrap(), "hello world");
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn webfetch_error_status_is_error() {
+        let (url, handle) = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
+        );
+
+        let tool = Tool::WebFetch(url);
+
+        let error = tool.invoke(timeout()).await.unwrap_err();
+        assert!(matches!(error, ToolError::WebFetchStatus { status: 404, .. }));
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn webfetch_connection_refused_is_error() {
+        let tool = Tool::WebFetch("http://127.0.0.1:1".into());
+
+        let error = tool.invoke(timeout()).await.unwrap_err();
+
+        assert!(matches!(error, ToolError::WebFetchFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn webfetch_hanging_server_is_timed_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = released.recv();
+        });
+
+        let tool = Tool::WebFetch(format!("http://{addr}"));
+
+        let error = tool.invoke(Duration::from_secs(1)).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::TimedOut { tool: "webfetch", seconds: 1 }
+        ));
+        let _ = release.send(());
+        handle.join().unwrap();
     }
 
     #[test]

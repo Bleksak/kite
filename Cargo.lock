@@ -1192,6 +1192,8 @@ dependencies = [
  "futures-util",
  "openai-oxide",
  "ratatui",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "test-files",

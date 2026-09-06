@@ -9,6 +9,8 @@ crossterm = "0.29"
 futures-util = "0.3"
 openai-oxide = "0.17"
 ratatui = "0.30"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

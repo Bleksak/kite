@@ -775,10 +775,10 @@ mod test {
         assert_eq!(text, "hello");
 
         let tools = request.tools.as_ref().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 6);
         assert_eq!(
             tools.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>(),
-            vec!["bash", "read_file", "write_file", "edit_file"]
+            vec!["bash", "readonly_bash", "read_file", "write_file", "edit_file", "webfetch"]
         );
     }
 
