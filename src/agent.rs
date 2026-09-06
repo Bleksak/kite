@@ -31,7 +31,7 @@ pub struct Agent {
     pub client: OpenAI,
     pub model: String,
     pub context: Context,
-    pub mode: Mode,
+    pub mode: Arc<Mutex<Mode>>,
     pub thinking: Option<(Arc<Mutex<ThinkingLevel>>, Option<bool>)>,
     pub bash_timeout: Duration,
     bg_seen: std::collections::HashSet<String>,
@@ -44,14 +44,15 @@ impl Agent {
     pub fn new(
         client: OpenAI,
         model: impl Into<String>,
-        mode: Mode,
+        mode: Arc<Mutex<Mode>>,
         max_tokens: u64,
         bash_timeout: Duration,
     ) -> Agent {
+        let system_prompt = mode.lock().unwrap().system_prompt().to_string();
         Agent {
             client,
             model: model.into(),
-            context: Context::new(mode.system_prompt(), max_tokens),
+            context: Context::new(system_prompt, max_tokens),
             mode,
             thinking: None,
             bash_timeout,
@@ -96,6 +97,7 @@ impl Agent {
         &mut self,
         on_event: &mut impl FnMut(AgentEvent),
     ) -> Result<ChatOutcome, Box<dyn std::error::Error>> {
+        self.context.system_prompt = self.mode.lock().unwrap().system_prompt().to_string();
         let mut round = 0;
         loop {
             round += 1;
@@ -116,7 +118,7 @@ impl Agent {
                 .await?;
             self.context.record_usage(usage.0, usage.1);
 
-            if let Some(terminator) = self.mode.terminator()
+            if let Some(terminator) = self.mode.lock().unwrap().terminator()
                 && let Message::Assistant { tool_calls, .. } = &message
                 && let Some(call) = tool_calls.iter().find(|c| c.function.name == terminator)
             {
@@ -207,11 +209,11 @@ impl Agent {
         for call in calls {
             match Tool::try_from(call.clone()) {
                 Ok(tool) => {
-                    if !self.mode.allows(&tool) {
+                    if !self.mode.lock().unwrap().allows(&tool) {
                         slots.push(Err(format!(
                             "{} is not allowed in mode {}",
                             tool.label(),
-                            self.mode.label()
+                            self.mode.lock().unwrap().label()
                         )));
                         continue;
                     }
@@ -271,7 +273,7 @@ impl Agent {
             self.model.clone(),
             self.context.build_messages(),
         );
-        request.tools = Some(tool_definitions(&self.mode.base_tools()));
+        request.tools = Some(tool_definitions(&self.mode.lock().unwrap().base_tools()));
         request
     }
 
@@ -386,7 +388,7 @@ mod test {
         let client = OpenAI::with_config(
             openai_oxide::ClientConfig::new("local").base_url(base_url),
         );
-        Agent::new(client, "test-model", crate::mode::Mode::Plan, 10000, Duration::from_secs(30))
+        Agent::new(client, "test-model", Arc::new(Mutex::new(crate::mode::Mode::Plan)), 10000, Duration::from_secs(30))
     }
 
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
@@ -401,7 +403,7 @@ mod test {
     }
 
     fn agent() -> Agent {
-        Agent::new(OpenAI::new("test-key"), "test-model", Mode::Yolo, 10000, Duration::from_secs(30))
+        Agent::new(OpenAI::new("test-key"), "test-model", Arc::new(Mutex::new(Mode::Yolo)), 10000, Duration::from_secs(30))
     }
 
     async fn run_tool_call(
@@ -505,7 +507,7 @@ mod test {
         let client = OpenAI::with_config(
             openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
         );
-        let mut agent = Agent::new(client, "test-model", Mode::Yolo, 10000, Duration::from_secs(30));
+        let mut agent = Agent::new(client, "test-model", Arc::new(Mutex::new(Mode::Yolo)), 10000, Duration::from_secs(30));
 
         let mut events = vec![];
         run_tool_call(
@@ -866,7 +868,7 @@ mod test {
             openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
         );
         let cell = Arc::new(Mutex::new(ThinkingLevel::Off));
-        let mut agent = Agent::new(client, "test-model", Mode::Yolo, 10000, Duration::from_secs(30))
+        let mut agent = Agent::new(client, "test-model", Arc::new(Mutex::new(Mode::Yolo)), 10000, Duration::from_secs(30))
             .with_thinking(cell.clone(), None);
 
         let mut turn = async |agent: &mut Agent| {
@@ -951,7 +953,7 @@ mod test {
         let client = OpenAI::with_config(
             openai_oxide::ClientConfig::new("local").base_url(base_url),
         );
-        let mut agent = Agent::new(client, "test-model", crate::mode::Mode::Yolo, 10000, Duration::from_secs(30));
+        let mut agent = Agent::new(client, "test-model", Arc::new(Mutex::new(crate::mode::Mode::Yolo)), 10000, Duration::from_secs(30));
         let mut events = Vec::new();
 
         let outcome = agent.chat("do it", &mut |event| events.push(event)).await.unwrap();

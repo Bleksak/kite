@@ -18,6 +18,7 @@ use ratatui::{Frame, Terminal};
 
 use crate::agent::Agent;
 use crate::thinking::ThinkingLevel;
+use crate::mode::Mode;
 use crate::context::Context;
 use crate::paths::CONTEXT_DIR;
 use crate::session::{Cursor, Scroller, Session};
@@ -38,6 +39,7 @@ pub struct TuiState {
     pub pane_width: usize,
     pub model: String,
     pub thinking: Arc<Mutex<ThinkingLevel>>,
+    pub mode: Arc<Mutex<Mode>>,
     pub picker_open: bool,
     pub picker_cursor: Cursor,
     pub picker_query: String,
@@ -58,6 +60,7 @@ impl TuiState {
             pane_width: 118,
             model,
             thinking: Arc::new(std::sync::Mutex::new(ThinkingLevel::Off)),
+            mode: Arc::new(std::sync::Mutex::new(Mode::Yolo)),
             picker_open: false,
             picker_cursor: Cursor::default(),
             picker_query: String::new(),
@@ -76,6 +79,11 @@ impl TuiState {
 
     pub fn with_thinking(mut self, cell: Arc<Mutex<ThinkingLevel>>) -> TuiState {
         self.thinking = cell;
+        self
+    }
+
+    pub fn with_mode(mut self, cell: Arc<Mutex<Mode>>) -> TuiState {
+        self.mode = cell;
         self
     }
 
@@ -410,6 +418,11 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             _ => KeyAction::None,
         };
     }
+    if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::CONTROL) {
+        let mut mode = state.mode.lock().unwrap();
+        *mode = mode.next();
+        return KeyAction::None;
+    }
     let (pane_width, viewport) = (state.pane_width, state.viewport);
     let session = state.session();
     if session.running {
@@ -611,6 +624,17 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     status_spans.push(Span::styled(
         format!("  ·  💭 {}", thinking_level.label()),
         Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
+    ));
+    let mode = *state.mode.lock().unwrap();
+    status_spans.push(Span::styled(
+        format!("  ·  {} {}", if mode == Mode::Plan { "📋" } else { "⚒" }, mode.label()),
+        Style::default()
+            .bold()
+            .fg(if mode == Mode::Plan {
+                Color::Rgb(0xb5, 0xbd, 0x68)
+            } else {
+                Color::Rgb(0x81, 0xa2, 0xbe)
+            }),
     ));
     let status = Line::from(status_spans);
     frame.render_widget(
@@ -935,6 +959,7 @@ pub async fn run(
     new_agent: impl Fn() -> Agent + Send + Sync + 'static,
     model: String,
     thinking: Arc<Mutex<ThinkingLevel>>,
+    mode: Arc<Mutex<Mode>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
@@ -965,7 +990,8 @@ pub async fn run(
     });
 
     let mut state = TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
-        .with_thinking(thinking);
+        .with_thinking(thinking)
+        .with_mode(mode);
     let mut inputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<String>> = HashMap::new();
     let mut handles: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
 
@@ -1944,6 +1970,18 @@ mod test {
         assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::XHigh);
         handle_key(&mut state, &event);
         assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Off);
+    }
+
+    #[test]
+    fn tab_switches_the_mode() {
+        let mut state = TuiState::new("model".into());
+        let event = TermEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(*state.mode.lock().unwrap(), crate::mode::Mode::Yolo);
+        handle_key(&mut state, &event);
+        assert_eq!(*state.mode.lock().unwrap(), crate::mode::Mode::Plan);
+        handle_key(&mut state, &event);
+        assert_eq!(*state.mode.lock().unwrap(), crate::mode::Mode::Yolo);
     }
 
     #[test]

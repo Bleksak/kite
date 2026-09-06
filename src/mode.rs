@@ -7,6 +7,13 @@ pub enum Mode {
 }
 
 impl Mode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Yolo => Self::Plan,
+            Self::Plan => Self::Yolo,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Yolo => "yolo",
