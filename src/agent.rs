@@ -350,22 +350,21 @@ impl Agent {
         calls: &[ToolCall],
         on_event: &mut impl FnMut(AgentEvent),
     ) {
-        let mut slots: Vec<Result<(Tool, bool, String), String>> = Vec::new();
+        let mut slots: Vec<Result<(Tool, String), String>> = Vec::new();
         for call in calls {
             match Tool::try_from(call.clone()) {
                 Ok(tool) => {
                     let header = tool.header();
                     let output = tool.output();
-                    let (body, show_result) = match &output {
-                        ToolOutput::Before(body) => (Some(body.to_string()), true),
-                        ToolOutput::After => (None, true),
-                        ToolOutput::Hidden => (None, false),
+                    let body = match &output {
+                        ToolOutput::Before(body) => Some(body.to_string()),
+                        ToolOutput::After => None,
                     };
                     on_event(AgentEvent::ToolStarted {
                         header: header.clone(),
                         body,
                     });
-                    slots.push(Ok((tool, show_result, header)));
+                    slots.push(Ok((tool, header)));
                 }
                 Err(error) => slots.push(Err(error.to_string())),
             }
@@ -373,24 +372,22 @@ impl Agent {
 
         let futures: Vec<_> = slots
             .iter()
-            .filter_map(|slot| slot.as_ref().ok().map(|(tool, _, _)| tool.invoke(self.bash_timeout)))
+            .filter_map(|slot| slot.as_ref().ok().map(|(tool, _)| tool.invoke(self.bash_timeout)))
             .collect();
         let outputs = join_all(futures).await;
 
         let mut outputs = outputs.into_iter();
         for (call, slot) in calls.iter().zip(slots) {
             let content = match slot {
-                Ok((_, show_result, header)) => {
+                Ok((_, header)) => {
                     let content = match outputs.next().unwrap() {
                         Ok(output) => output,
                         Err(error) => error.to_string(),
                     };
-                    if show_result {
-                        on_event(AgentEvent::ToolResult {
-                            header,
-                            body: content.clone(),
-                        });
-                    }
+                    on_event(AgentEvent::ToolResult {
+                        header,
+                        body: content.clone(),
+                    });
                     content
                 }
                 Err(error) => error,

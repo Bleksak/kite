@@ -198,7 +198,11 @@ impl TuiRenderer {
                         );
                     }
                 }
-                self.push_indented(&body, BlockKind::ToolDone);
+                if header.starts_with("edit_file") {
+                    self.push_diff(&body, BlockKind::ToolDone);
+                } else {
+                    self.push_indented(&body, BlockKind::ToolDone);
+                }
                 self.push_line(padding_line(), BlockKind::ToolDone);
             }
         }
@@ -340,6 +344,57 @@ impl TuiRenderer {
             }
         }
     }
+
+    fn push_diff(&mut self, body: &str, block: BlockKind) {
+        let gray = Color::Rgb(128, 128, 128);
+        let mut old_line: Option<usize> = None;
+        let mut new_line: Option<usize> = None;
+        for raw in body.trim_end_matches('\n').split('\n') {
+            let line = strip_vs16(raw);
+            if let Some(hunk) = line.strip_prefix("@@ ") {
+                let range = hunk.strip_suffix(" @@").unwrap_or(hunk);
+                let mut parts = range.split(' ');
+                old_line = parts.next().and_then(|p| hunk_start(p, '-'));
+                new_line = parts.next().and_then(|p| hunk_start(p, '+'));
+                continue;
+            }
+            if line.starts_with("--- ") || line.starts_with("+++ ") {
+                continue;
+            }
+            let is_marker = line.starts_with('\\');
+            let (style, bump_old, bump_new, sign, content) = match line.chars().next() {
+                Some('+') => (Color::Rgb(0xb5, 0xbd, 0x68), false, true, "+", &line[1..]),
+                Some('-') => (Color::Rgb(0xcc, 0x66, 0x66), true, false, "-", &line[1..]),
+                _ if is_marker => (gray, false, false, "", line.as_str()),
+                _ => (gray, true, true, "", line.as_str()),
+            };
+            let number = if is_marker {
+                String::new()
+            } else if bump_old {
+                num(old_line)
+            } else if bump_new {
+                num(new_line)
+            } else {
+                String::new()
+            };
+            let field = if sign.is_empty() {
+                format!("{:>5}", number)
+            } else {
+                format!("{sign}{:>4}", number)
+            };
+            let rendered = format!("{}  {}", field, content);
+            self.push_line(
+                Line::from(Span::styled(rendered, Style::default().fg(style))),
+                block,
+            );
+            if bump_old {
+                old_line = old_line.map(|n| n + 1);
+            }
+            if bump_new {
+                new_line = new_line.map(|n| n + 1);
+            }
+        }
+    }
 }
 
 fn padding_line() -> Line<'static> {
@@ -435,6 +490,14 @@ fn strip_vs16(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+fn num(n: Option<usize>) -> String {
+    n.map(|n| n.to_string()).unwrap_or_default()
+}
+
+fn hunk_start(part: &str, sign: char) -> Option<usize> {
+    part.strip_prefix(sign)?.split(',').next()?.parse().ok()
 }
 
 fn has_markdown(text: &str) -> bool {
@@ -543,6 +606,19 @@ pub enum KeyAction {
 const PAGE: usize = 10;
 
 pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
+    if let TermEvent::Mouse(mouse) = event {
+        return match mouse.kind {
+            event::MouseEventKind::ScrollUp => {
+                mouse_up(state);
+                KeyAction::None
+            }
+            event::MouseEventKind::ScrollDown => {
+                mouse_down(state);
+                KeyAction::None
+            }
+            _ => KeyAction::None,
+        };
+    }
     let TermEvent::Key(key) = event else {
         return KeyAction::None;
     };
@@ -603,6 +679,19 @@ fn page_up(state: &mut TuiState) {
 fn page_down(state: &mut TuiState) {
     let max = state.max_scroll();
     state.scroll = (state.scroll + PAGE).min(max);
+    state.following = state.scroll == max;
+}
+
+const MOUSE: usize = 3;
+
+fn mouse_up(state: &mut TuiState) {
+    state.scroll = state.scroll.saturating_sub(MOUSE);
+    state.following = false;
+}
+
+fn mouse_down(state: &mut TuiState) {
+    let max = state.max_scroll();
+    state.scroll = (state.scroll + MOUSE).min(max);
     state.following = state.scroll == max;
 }
 
@@ -775,10 +864,12 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
     std::io::stdout().execute(terminal::EnterAlternateScreen)?;
     std::io::stdout().execute(cursor::Hide)?;
     terminal::enable_raw_mode()?;
+    std::io::stdout().execute(event::EnableMouseCapture)?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = std::io::stdout().execute(terminal::LeaveAlternateScreen);
         let _ = std::io::stdout().execute(cursor::Show);
+        let _ = std::io::stdout().execute(event::DisableMouseCapture);
         default_hook(info);
     }));
 
@@ -877,6 +968,7 @@ pub async fn run(agent: Agent, model: String) -> Result<(), Box<dyn std::error::
     }
 
     agent_task.abort();
+    std::io::stdout().execute(event::DisableMouseCapture)?;
     std::io::stdout().execute(terminal::LeaveAlternateScreen)?;
     std::io::stdout().execute(cursor::Show)?;
     terminal::disable_raw_mode()?;
@@ -930,6 +1022,40 @@ mod test {
 
     fn key(code: KeyCode) -> TermEvent {
         TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn mouse(kind: event::MouseEventKind) -> TermEvent {
+        TermEvent::Mouse(event::MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_viewport() {
+        let mut state = TuiState::new("model".into());
+        for i in 0..30 {
+            state.renderer.on_event(text(&format!("line {i}\n")));
+        }
+        state.renderer.finish();
+        let max = state.max_scroll();
+        assert!(max > 0);
+
+        handle_key(&mut state, &mouse(event::MouseEventKind::ScrollDown));
+        assert_eq!(state.scroll, 3);
+        assert!(!state.following);
+
+        handle_key(&mut state, &mouse(event::MouseEventKind::ScrollUp));
+        assert_eq!(state.scroll, 0);
+        assert!(!state.following);
+
+        for _ in 0..20 {
+            handle_key(&mut state, &mouse(event::MouseEventKind::ScrollDown));
+        }
+        assert_eq!(state.scroll, max);
+        assert!(state.following);
     }
 
     #[test]
@@ -988,6 +1114,58 @@ mod test {
                 ("  ls".into(), Modifier::empty()),
             ]
         );
+    }
+
+    fn colored(lines: &[Line<'static>]) -> Vec<(String, Option<Color>)> {
+        lines
+            .iter()
+            .map(|line| {
+                let span = line.spans.first().cloned().unwrap_or_default();
+                (span.content.to_string(), span.style.fg)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edit_file_result_renders_colored_diff_with_line_numbers() {
+        let diff = "--- a.txt\n+++ a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+        let described = colored(&lines(vec![
+            AgentEvent::ToolStarted {
+                header: "edit_file: a.txt".into(),
+                body: None,
+            },
+            AgentEvent::ToolResult {
+                header: "edit_file: a.txt".into(),
+                body: diff.into(),
+            },
+        ]));
+
+        assert!(described.iter().any(|(c, col)| c == "    1   one" && col == &Some(Color::Rgb(128, 128, 128))));
+        assert!(described.iter().any(|(c, col)| c == "-   2  two" && col == &Some(Color::Rgb(0xcc, 0x66, 0x66))));
+        assert!(described.iter().any(|(c, col)| c == "+   2  TWO" && col == &Some(Color::Rgb(0xb5, 0xbd, 0x68))));
+        assert!(described.iter().any(|(c, _)| c == "    3   three"));
+        assert!(!described.iter().any(|(c, _)| c.starts_with("--- a.txt")));
+        assert!(!described.iter().any(|(c, _)| c.starts_with("@@")));
+    }
+
+    #[test]
+    fn edit_file_diff_line_numbers_reset_per_hunk() {
+        let diff = "--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n-a\n+b\n@@ -10,2 +10,2 @@\n-x\n+y\n";
+        let described = colored(&lines(vec![
+            AgentEvent::ToolStarted {
+                header: "edit_file: a.txt".into(),
+                body: None,
+            },
+            AgentEvent::ToolResult {
+                header: "edit_file: a.txt".into(),
+                body: diff.into(),
+            },
+        ]));
+
+        assert!(described.iter().any(|(c, _)| c == "-   1  a"));
+        assert!(described.iter().any(|(c, _)| c == "+   1  b"));
+        assert!(described.iter().any(|(c, _)| c == "-  10  x"));
+        assert!(described.iter().any(|(c, _)| c == "+  10  y"));
     }
 
     #[test]

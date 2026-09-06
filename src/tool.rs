@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
+use similar::TextDiff;
+
 use openai_oxide::types::chat::{
     FunctionDef, Tool as OpenAITool, ToolCall as OpenAIToolCall,
 };
@@ -68,7 +70,6 @@ pub enum Tool {
 pub enum ToolOutput<'a> {
     Before(&'a str),
     After,
-    Hidden,
 }
 
 const OUTPUT_LIMIT: usize = 10_000;
@@ -124,7 +125,7 @@ impl Tool {
             Tool::ReadOnlyBash(cmd) => ToolOutput::Before(cmd),
             Tool::ReadFile(..) => ToolOutput::After,
             Tool::WriteFile(_, content) => ToolOutput::Before(content),
-            Tool::EditFile(..) => ToolOutput::Hidden,
+            Tool::EditFile(..) => ToolOutput::After,
             Tool::WebFetch(url) => ToolOutput::Before(url),
         }
     }
@@ -189,6 +190,7 @@ impl Tool {
             }
             Tool::EditFile(file, old_content, new_content) => {
                 let mut contents = tokio::fs::read_to_string(file).await.map_err(ToolError::Io)?;
+                let original = contents.clone();
                 let crlf = contents.contains("\r\n");
                 let old = if crlf {
                     old_content.replace('\n', "\r\n")
@@ -220,8 +222,13 @@ impl Tool {
 
                 contents.replace_range(first_index..first_index + old.len(), &new);
 
+                let text_diff = TextDiff::from_lines(&original, &contents);
+                let mut unified = text_diff.unified_diff();
+                unified.header(file, file);
+                let diff = unified.to_string();
+
                 tokio::fs::write(file, contents).await.map_err(ToolError::Io)?;
-                Ok(format!("edited {file}"))
+                Ok(diff)
             }
             Tool::WebFetch(url) => {
                 let collected = tokio::time::timeout(timeout, async {
@@ -701,7 +708,11 @@ version: 3"#,
 
         let result = tool.invoke(timeout()).await.unwrap();
 
-        assert_eq!(result, format!("edited {}", file.to_string_lossy()));
+        let path = file.to_string_lossy().to_string();
+        assert!(result.starts_with(&format!("--- {path}\n+++ {path}\n")));
+        assert!(result.contains("@@"));
+        assert!(result.contains("----"));
+        assert!(result.contains("+test"));
         assert!(file.exists());
         assert_eq!(std::fs::read_to_string(file).unwrap(), "testsion: 3");
     }
@@ -720,7 +731,8 @@ version: 3"#,
 
         let result = tool.invoke(timeout()).await.unwrap();
 
-        assert_eq!(result, format!("edited {}", file.to_string_lossy()));
+        assert!(result.contains("-line one"));
+        assert!(result.contains("+line ONE"));
         assert_eq!(
             std::fs::read_to_string(file).unwrap(),
             "line ONE\r\nline two\r\n"
@@ -745,6 +757,25 @@ version: 3"#,
             std::fs::read_to_string(file).unwrap(),
             "line ONE\r\nline two\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_file_output_is_unified_diff() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("a.txt", "one\ntwo\nthree\n");
+        let file = temp_dir.path().join("a.txt");
+
+        let tool = Tool::EditFile(file.to_string_lossy().into(), "two".into(), "TWO".into());
+
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        let path = file.to_string_lossy().to_string();
+        assert!(result.starts_with(&format!("--- {path}\n+++ {path}\n")));
+        assert!(result.contains("@@ -1,3 +1,3 @@"));
+        assert!(result.contains(" one\n"));
+        assert!(result.contains("-two\n"));
+        assert!(result.contains("+TWO\n"));
+        assert!(result.contains(" three\n"));
     }
 
     #[tokio::test]
