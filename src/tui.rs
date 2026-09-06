@@ -305,7 +305,7 @@ impl TuiRenderer {
     }
 
     fn push_indented(&mut self, body: &str, block: BlockKind) {
-        for line in body.split('\n') {
+        for line in body.trim_end_matches('\n').split('\n') {
             if line.is_empty() {
                 self.push_line(Line::default(), block);
             } else {
@@ -1235,6 +1235,22 @@ mod test {
             body: "beta".into(),
         });
         assert!(renderer.blocks().iter().all(|b| *b == BlockKind::ToolDone));
+    }
+
+    #[test]
+    fn a_trailing_newline_in_a_tool_result_is_not_pushed() {
+        let mut renderer = TuiRenderer::new();
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "bash".into(),
+            body: Some("echo out".into()),
+        });
+        renderer.on_event(AgentEvent::ToolResult {
+            header: "bash".into(),
+            body: "out\n".into(),
+        });
+
+        assert_eq!(renderer.scrollback().len(), 5);
+        assert_eq!(renderer.scrollback()[3].spans[0].content.as_ref(), "  out");
     }
 
     #[test]
