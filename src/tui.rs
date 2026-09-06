@@ -548,12 +548,18 @@ fn display_lines(
         .iter()
         .zip(blocks.iter())
         .map(|(line, block)| {
-            let background = match block {
-                BlockKind::User => Some(Style::default().bg(Color::DarkGray)),
-                BlockKind::Thinking => Some(Style::default().bg(Color::Rgb(128, 128, 128))),
-                _ => None,
+            let (text_background, block_background) = match block {
+                BlockKind::User => (
+                    Some(Color::DarkGray),
+                    Some(Color::DarkGray),
+                ),
+                BlockKind::Thinking => (
+                    Some(Color::Rgb(128, 128, 128)),
+                    Some(Color::Rgb(128, 128, 128)),
+                ),
+                _ => (None, None),
             };
-            let Some(background) = background else {
+            if text_background.is_none() && block_background.is_none() {
                 return Line {
                     style: line.style,
                     alignment: line.alignment,
@@ -566,21 +572,34 @@ fn display_lines(
                         })
                         .collect(),
                 };
-            };
+            }
             let mut spans: Vec<Span> = line
                 .spans
                 .iter()
-                .map(|span| Span {
-                    content: std::borrow::Cow::Owned(span.content.to_string()),
-                    style: span.style.patch(background),
+                .map(|span| {
+                    let style = match text_background {
+                        Some(bg) => span.style.patch(Style::default().bg(bg)),
+                        None => span.style,
+                    };
+                    Span {
+                        content: std::borrow::Cow::Owned(span.content.to_string()),
+                        style,
+                    }
                 })
                 .collect();
             let current = line.width();
             if current < width {
-                spans.push(Span::styled(
-                    " ".repeat(width - current),
-                    background,
-                ));
+                if let Some(bg) = block_background {
+                    spans.push(Span::styled(
+                        " ".repeat(width - current),
+                        Style::default().bg(bg),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        " ".repeat(width - current),
+                        Style::default(),
+                    ));
+                }
             }
             Line {
                 style: line.style,
@@ -615,7 +634,11 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let display = &display[start.min(display.len())..];
     let main = Paragraph::new(display)
         .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
     frame.render_widget(main, chunks[1]);
 
     let input_line = if state.running {
