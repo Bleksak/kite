@@ -1,0 +1,1 @@
+let's have each message block padding - 1 row up, 1 row bottom, and background color - thinking block will have no background-color, but some text-color, the model output will have none, the user - slightly gray-ish and white text

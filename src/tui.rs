@@ -70,7 +70,7 @@ impl TuiRenderer {
                 self.scrollback.push(Line::default());
             } else {
                 self.scrollback
-                    .push(Line::from(Span::styled(line.to_string(), Style::default().bold())));
+                    .push(Line::from(Span::styled(strip_vs16(line), Style::default().bold())));
             }
         }
     }
@@ -81,7 +81,7 @@ impl TuiRenderer {
                 self.close_thinking();
                 if let Some(remaining) = self.gate.finish() {
                     self.push_answer_text(&remaining);
-                    self.turn_answer.push_str(&remaining);
+                    self.turn_answer.push_str(&strip_vs16(&remaining));
                 }
                 self.flush_answer();
                 self.render_answer_markdown();
@@ -98,7 +98,7 @@ impl TuiRenderer {
                 if let Some(text) = text {
                     self.close_thinking();
                     self.push_answer_text(&text);
-                    self.turn_answer.push_str(&text);
+                    self.turn_answer.push_str(&strip_vs16(&text));
                 }
             }
             AgentEvent::ToolStarted { header, body } => {
@@ -129,7 +129,7 @@ impl TuiRenderer {
         self.tool_header = None;
         if let Some(remaining) = self.gate.finish() {
             self.push_answer_text(&remaining);
-            self.turn_answer.push_str(&remaining);
+            self.turn_answer.push_str(&strip_vs16(&remaining));
         }
         self.flush_answer();
         self.render_answer_markdown();
@@ -146,7 +146,7 @@ impl TuiRenderer {
                 self.scrollback.push(Line::default());
             } else {
                 self.scrollback
-                    .push(Line::from(Span::styled(line.to_string(), Style::default().dim())));
+                    .push(Line::from(Span::styled(strip_vs16(line), Style::default().dim())));
             }
         }
     }
@@ -154,7 +154,7 @@ impl TuiRenderer {
     fn push_answer_text(&mut self, text: &str) {
         self.answer.push_str(text);
         while let Some(index) = self.answer.find('\n') {
-            let line = self.answer[..index].to_string();
+            let line = strip_vs16(&self.answer[..index]);
             self.answer.drain(..=index);
             self.mark_answer_start();
             if line.is_empty() {
@@ -169,7 +169,7 @@ impl TuiRenderer {
         if self.answer.is_empty() {
             return;
         }
-        let line = mem::take(&mut self.answer);
+        let line = strip_vs16(&mem::take(&mut self.answer));
         self.mark_answer_start();
         self.scrollback.push(Line::from(line));
     }
@@ -233,10 +233,20 @@ impl TuiRenderer {
             if line.is_empty() {
                 self.scrollback.push(Line::default());
             } else {
-                self.scrollback
-                    .push(Line::from(Span::styled(format!("  {line}"), Style::default().dim())));
+                self.scrollback.push(Line::from(Span::styled(
+                    format!("  {}", strip_vs16(line)),
+                    Style::default().dim(),
+                )));
             }
         }
+    }
+}
+
+fn strip_vs16(text: &str) -> String {
+    if text.contains('\u{FE0F}') {
+        text.replace('\u{FE0F}', "")
+    } else {
+        text.to_string()
     }
 }
 
@@ -1140,6 +1150,78 @@ mod test {
             .iter()
             .any(|line| line.spans.iter().any(|span| span.style.fg.is_some()));
         assert!(has_color);
+    }
+
+
+
+
+    #[test]
+    fn scroll_does_not_leave_stale_cells() {
+        let backend = TestBackend::new(40, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                Paragraph::new(vec![Line::from(
+                    "a very long line of text that wraps around the corner",
+                )])
+                .wrap(Wrap { trim: false })
+                .render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+        terminal
+            .draw(|frame| {
+                Paragraph::new(vec![Line::from("short")])
+                    .wrap(Wrap { trim: false })
+                    .render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..5 {
+            for x in 5..40 {
+                let cell = buffer.cell((x, y)).unwrap();
+                assert_eq!(
+                    cell.symbol(),
+                    " ",
+                    "stale cell at ({x}, {y}): {}",
+                    cell.symbol()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vs16_emoji_are_stripped_from_the_scrollback() {
+        let rendered = lines(vec![
+            text("# \u{23F8}\u{FE0F} Note\n\nbody"),
+            AgentEvent::CompletionStarted,
+        ]);
+        let described: Vec<String> = rendered.iter().map(|l| l.to_string()).collect();
+
+        assert!(
+            !described.iter().any(|l| l.contains('\u{FE0F}')),
+            "VS16 selector must not reach the scrollback: {described:?}"
+        );
+        assert!(
+            described.iter().any(|l| l.contains("\u{23F8}")),
+            "the emoji itself must survive: {described:?}"
+        );
+    }
+
+    #[test]
+    fn vs16_emoji_are_stripped_from_live_answer_lines() {
+        let mut renderer = TuiRenderer::new();
+        renderer.on_event(text("line with \u{23F8}\u{FE0F} emoji\n"));
+        renderer.finish();
+
+        let described: Vec<String> = renderer
+            .scrollback()
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            !described.iter().any(|l| l.contains('\u{FE0F}')),
+            "VS16 selector must not reach the scrollback: {described:?}"
+        );
     }
 
     #[test]
