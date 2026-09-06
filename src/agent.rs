@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -17,11 +19,100 @@ enum Step {
     Done(String),
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ThinkingLevel {
+    Off,
+    Low,
+    Medium,
+    XHigh,
+}
+
+impl ThinkingLevel {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::XHigh,
+            Self::XHigh => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::XHigh => "xhigh",
+        }
+    }
+
+    pub fn body(self, base: Option<bool>) -> Option<serde_json::Value> {
+        match self {
+            Self::Off => base.is_some().then(|| {
+                serde_json::json!({ "chat_template_kwargs": { "enable_thinking": false } })
+            }),
+            Self::Low => Some(serde_json::json!({
+                "chat_template_kwargs": { "enable_thinking": true },
+                "reasoning_effort": "low"
+            })),
+            Self::Medium => Some(serde_json::json!({
+                "chat_template_kwargs": { "enable_thinking": true },
+                "reasoning_effort": "medium"
+            })),
+            Self::XHigh => Some(serde_json::json!({
+                "chat_template_kwargs": { "enable_thinking": true },
+                "reasoning_effort": "xhigh"
+            })),
+        }
+    }
+}
+
+pub struct ThinkingLevelCell {
+    value: AtomicU8,
+}
+
+impl ThinkingLevelCell {
+    pub fn new(level: ThinkingLevel) -> ThinkingLevelCell {
+        ThinkingLevelCell {
+            value: AtomicU8::new(match level {
+                ThinkingLevel::Off => 0,
+                ThinkingLevel::Low => 1,
+                ThinkingLevel::Medium => 2,
+                ThinkingLevel::XHigh => 3,
+            }),
+        }
+    }
+
+    pub fn get(&self) -> ThinkingLevel {
+        match self.value.load(Ordering::SeqCst) {
+            1 => ThinkingLevel::Low,
+            2 => ThinkingLevel::Medium,
+            3 => ThinkingLevel::XHigh,
+            _ => ThinkingLevel::Off,
+        }
+    }
+
+    pub fn set(&self, level: ThinkingLevel) {
+        self.value.store(match level {
+            ThinkingLevel::Off => 0,
+            ThinkingLevel::Low => 1,
+            ThinkingLevel::Medium => 2,
+            ThinkingLevel::XHigh => 3,
+        }, Ordering::SeqCst);
+    }
+}
+
+impl Default for ThinkingLevelCell {
+    fn default() -> Self {
+        Self::new(ThinkingLevel::Off)
+    }
+}
+
 pub struct Agent {
     pub client: OpenAI,
     pub model: String,
     pub context: Context,
-    pub extra_body: Option<serde_json::Value>,
+    pub thinking: Option<(Arc<ThinkingLevelCell>, Option<bool>)>,
     pub bash_timeout: Duration,
     bg_seen: std::collections::HashSet<String>,
     bg_mine: std::collections::HashSet<String>,
@@ -41,15 +132,15 @@ impl Agent {
             client,
             model: model.into(),
             context: Context::new(system_prompt, max_tokens),
-            extra_body: None,
+            thinking: None,
             bash_timeout,
             bg_seen: std::collections::HashSet::new(),
             bg_mine: std::collections::HashSet::new(),
         }
     }
 
-    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Agent {
-        self.extra_body = Some(extra);
+    pub fn with_thinking(mut self, cell: Arc<ThinkingLevelCell>, base: Option<bool>) -> Agent {
+        self.thinking = Some((cell, base));
         self
     }
 
@@ -247,7 +338,11 @@ impl Agent {
             include_usage: Some(true),
         });
 
-        let mut stream = if let Some(extra) = &self.extra_body {
+        let extra = self
+            .thinking
+            .as_ref()
+            .and_then(|(cell, base)| cell.get().body(*base));
+        let mut stream = if let Some(extra) = extra {
             let mut body = serde_json::to_value(&request)?;
             if let (Some(map), Some(extra_map)) = (body.as_object_mut(), extra.as_object()) {
                 for (key, value) in extra_map {
@@ -699,6 +794,119 @@ mod test {
             tools.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>(),
             vec!["bash", "readonly_bash", "read_file", "write_file", "edit_file", "webfetch", "bg_run"]
         );
+    }
+
+    fn thinking_cycle_wraps_around() {
+        let level = ThinkingLevel::Off;
+        assert_eq!(level.next(), ThinkingLevel::Low);
+        assert_eq!(ThinkingLevel::Low.next(), ThinkingLevel::Medium);
+        assert_eq!(ThinkingLevel::Medium.next(), ThinkingLevel::XHigh);
+        assert_eq!(ThinkingLevel::XHigh.next(), ThinkingLevel::Off);
+    }
+
+    fn off_with_auto_sends_no_override() {
+        assert_eq!(ThinkingLevel::Off.body(None), None);
+    }
+
+    fn off_with_explicit_base_sends_thinking_disabled() {
+        assert_eq!(
+            ThinkingLevel::Off.body(Some(false)),
+            Some(serde_json::json!({ "chat_template_kwargs": { "enable_thinking": false } }))
+        );
+    }
+
+    fn each_level_sends_thinking_enabled_with_its_effort() {
+        let cases = [
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::XHigh, "xhigh"),
+        ];
+        for (level, effort) in cases {
+            let body = level.body(None).unwrap();
+            assert_eq!(
+                body["chat_template_kwargs"]["enable_thinking"], true
+            );
+            assert_eq!(body["reasoning_effort"], effort);
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_level_changes_at_runtime_reach_the_next_request() {
+        fn complete_request(data: &[u8]) -> Option<String> {
+            let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
+            let headers = std::str::from_utf8(&data[..header_end]).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })?;
+            let body_start = header_end + 4;
+            if data.len() < body_start + length {
+                return None;
+            }
+            Some(String::from_utf8_lossy(&data[body_start..body_start + length]).into_owned())
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                data.extend_from_slice(&buf[..n]);
+                                if let Some(body) = complete_request(&data) {
+                                    let _ = tx.send(body);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
+        );
+        let cell = Arc::new(ThinkingLevelCell::new(ThinkingLevel::Off));
+        let mut agent = Agent::new(client, "test-model", "be concise", 10000, Duration::from_secs(30))
+            .with_thinking(cell.clone(), None);
+
+        let mut turn = async |agent: &mut Agent| {
+            let answer = agent.chat("hi", &mut |event| {}).await.unwrap();
+            assert_eq!(answer, "ok");
+            rx.recv().await.unwrap()
+        };
+
+        let body = turn(&mut agent).await;
+        assert!(!body.contains("reasoning_effort"), "auto + off must send no override: {body}");
+        assert!(!body.contains("chat_template_kwargs"), "auto + off must send no override: {body}");
+
+        cell.set(ThinkingLevel::Low);
+        let body = turn(&mut agent).await;
+        assert!(body.contains("\"reasoning_effort\":\"low\""), "{body}");
+        assert!(body.contains("\"enable_thinking\":true"), "{body}");
+
+        cell.set(ThinkingLevel::XHigh);
+        let body = turn(&mut agent).await;
+        assert!(body.contains("\"reasoning_effort\":\"xhigh\""), "{body}");
     }
 
 }

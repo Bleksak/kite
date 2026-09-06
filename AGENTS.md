@@ -15,6 +15,8 @@
 
 - C-s: open/close the session picker
 - C-q: open/close the background tasks overlay
+- C-t: cycle the thinking level (off → low → medium → xhigh → off; shown in the
+  status bar while on)
 - C-c: quit
 - Picker: C-j/↓ down, C-k/↑ up, enter select, esc cancel, C-n new session,
   C-x close the session under the cursor, C-r rename it, typing searches

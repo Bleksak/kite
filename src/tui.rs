@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::mem;
 use std::path::Path;
+use std::sync::Arc;
 
 use crossterm::cursor;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyModifiers};
@@ -15,7 +16,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Widget};
 use ratatui::{Frame, Terminal};
 
 
-use crate::agent::Agent;
+use crate::agent::{Agent, ThinkingLevelCell};
 use crate::context::Context;
 use crate::paths::CONTEXT_DIR;
 use crate::session::{Cursor, Scroller, Session};
@@ -35,6 +36,7 @@ pub struct TuiState {
     pub viewport: usize,
     pub pane_width: usize,
     pub model: String,
+    pub thinking: Arc<ThinkingLevelCell>,
     pub picker_open: bool,
     pub picker_cursor: Cursor,
     pub picker_query: String,
@@ -54,6 +56,7 @@ impl TuiState {
             viewport: 22,
             pane_width: 118,
             model,
+            thinking: Arc::new(ThinkingLevelCell::default()),
             picker_open: false,
             picker_cursor: Cursor::default(),
             picker_query: String::new(),
@@ -68,6 +71,11 @@ impl TuiState {
 
     pub fn session(&mut self) -> &mut Session {
         &mut self.sessions[self.active]
+    }
+
+    pub fn with_thinking(mut self, cell: Arc<ThinkingLevelCell>) -> TuiState {
+        self.thinking = cell;
+        self
     }
 
     pub fn with_sessions(model: String, loaded: Vec<(u64, SessionFile)>) -> TuiState {
@@ -393,6 +401,10 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 state.tasks_cursor.set(0);
                 KeyAction::None
             }
+            KeyCode::Char('t') => {
+                state.thinking.set(state.thinking.get().next());
+                KeyAction::None
+            }
             _ => KeyAction::None,
         };
     }
@@ -590,6 +602,13 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     if running_bg > 0 {
         status_spans.push(Span::styled(
             format!("  ·  ⏺{running_bg} bg"),
+            Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
+        ));
+    }
+    let thinking_level = state.thinking.get();
+    if thinking_level != crate::agent::ThinkingLevel::Off {
+        status_spans.push(Span::styled(
+            format!("  ·  💭 {}", thinking_level.label()),
             Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
         ));
     }
@@ -915,6 +934,7 @@ fn spawn_agent(
 pub async fn run(
     new_agent: impl Fn() -> Agent + Send + Sync + 'static,
     model: String,
+    thinking: Arc<ThinkingLevelCell>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
@@ -944,7 +964,8 @@ pub async fn run(
         }
     });
 
-    let mut state = TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)));
+    let mut state = TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
+        .with_thinking(thinking);
     let mut inputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<String>> = HashMap::new();
     let mut handles: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
 
@@ -1905,6 +1926,22 @@ mod test {
         let event = TermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
         assert_eq!(handle_key(&mut state, &event), KeyAction::Quit);
+    }
+
+    #[test]
+    fn c_t_cycles_the_thinking_level() {
+        let mut state = TuiState::new("model".into());
+        let event = TermEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+
+        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::Off);
+        handle_key(&mut state, &event);
+        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::Low);
+        handle_key(&mut state, &event);
+        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::Medium);
+        handle_key(&mut state, &event);
+        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::XHigh);
+        handle_key(&mut state, &event);
+        assert_eq!(state.thinking.get(), crate::agent::ThinkingLevel::Off);
     }
 
     #[test]
