@@ -285,6 +285,7 @@ mod test {
     use openai_oxide::types::chat::{FunctionCall, ToolCall};
     use test_files::TestFiles;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::thinking::ThinkingLevel;
 
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {

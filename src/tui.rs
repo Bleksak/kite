@@ -607,12 +607,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         ));
     }
     let thinking_level = state.thinking.get();
-    if thinking_level != crate::thinking::ThinkingLevel::Off {
-        status_spans.push(Span::styled(
-            format!("  ·  💭 {}", thinking_level.label()),
-            Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
-        ));
-    }
+    status_spans.push(Span::styled(
+        format!("  ·  💭 {}", thinking_level.label()),
+        Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
+    ));
     let status = Line::from(status_spans);
     frame.render_widget(
         Paragraph::new(status).block(Block::default().borders(Borders::ALL)),
