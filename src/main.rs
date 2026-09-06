@@ -34,6 +34,9 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ThinkingLevel::XHigh)]
     thinking: ThinkingLevel,
 
+    #[arg(long, value_enum, default_value_t = Mode::Yolo)]
+    mode: Mode,
+
     #[arg(long, default_value_t = 300)]
     bash_timeout: u64,
 }
@@ -43,6 +46,7 @@ fn build_agent(
     model: &str,
     thinking: ThinkingLevel,
     thinking_cell: Arc<Mutex<ThinkingLevel>>,
+    mode: Mode,
     context_window: u64,
     bash_timeout: u64,
 ) -> Agent {
@@ -50,7 +54,7 @@ fn build_agent(
     Agent::new(
         client.clone(),
         model,
-        Mode::Yolo,
+        mode,
         context_window,
         std::time::Duration::from_secs(bash_timeout),
     )
@@ -76,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &model,
                     cli.thinking,
                     cell.clone(),
+                    cli.mode,
                     cli.context_window,
                     cli.bash_timeout,
                 )

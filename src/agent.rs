@@ -16,6 +16,12 @@ use crate::thinking::ThinkingLevel;
 use crate::tool::{tool_definitions, Tool, ToolOutput};
 
 #[derive(Debug, PartialEq)]
+pub enum ChatOutcome {
+    Answer(String),
+    Terminated { tool: String, arguments: String },
+}
+
+#[derive(Debug, PartialEq)]
 enum Step {
     Continue,
     Done(String),
@@ -68,7 +74,7 @@ impl Agent {
         &mut self,
         user_message: &str,
         on_event: &mut impl FnMut(AgentEvent),
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<ChatOutcome, Box<dyn std::error::Error>> {
         self.context.messages.push(Message::User {
             content: user_message.to_string(),
         });
@@ -78,7 +84,7 @@ impl Agent {
     pub async fn bg_turn(
         &mut self,
         on_event: &mut impl FnMut(AgentEvent),
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<ChatOutcome, Box<dyn std::error::Error>> {
         self.run_turns(on_event).await
     }
 
@@ -89,7 +95,7 @@ impl Agent {
     async fn run_turns(
         &mut self,
         on_event: &mut impl FnMut(AgentEvent),
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<ChatOutcome, Box<dyn std::error::Error>> {
         let mut round = 0;
         loop {
             round += 1;
@@ -110,8 +116,27 @@ impl Agent {
                 .await?;
             self.context.record_usage(usage.0, usage.1);
 
+            if let Some(terminator) = self.mode.terminator()
+                && let Message::Assistant { tool_calls, .. } = &message
+                && let Some(call) = tool_calls.iter().find(|c| c.function.name == terminator)
+            {
+                self.context.messages.push(message.clone());
+                let body = match Tool::try_from(call.clone()) {
+                    Ok(Tool::SubmitPlan(plan)) => Some(plan),
+                    _ => None,
+                };
+                on_event(AgentEvent::ToolStarted {
+                    header: terminator.to_string(),
+                    body,
+                });
+                return Ok(ChatOutcome::Terminated {
+                    tool: terminator.to_string(),
+                    arguments: call.function.arguments.clone(),
+                });
+            }
+
             if let Step::Done(text) = self.handle_response(message, on_event).await {
-                return Ok(text);
+                return Ok(ChatOutcome::Answer(text));
             }
         }
     }
@@ -298,6 +323,72 @@ mod test {
     use test_files::TestFiles;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn complete_request(data: &[u8]) -> Option<String> {
+        let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&data[..header_end]).unwrap();
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })?;
+        let body_start = header_end + 4;
+        if data.len() < body_start + length {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&data[body_start..body_start + length]).into_owned())
+    }
+
+    async fn mock_server(responses: Vec<String>) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let responses = Arc::new(Mutex::new(responses.into_iter()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                data.extend_from_slice(&buf[..n]);
+                                if let Some(body) = complete_request(&data) {
+                                    let _ = tx.send(body);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let sse = responses
+                        .lock()
+                        .unwrap()
+                        .next()
+                        .unwrap_or_else(|| "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".to_string());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn plan_agent(base_url: String) -> Agent {
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(base_url),
+        );
+        Agent::new(client, "test-model", crate::mode::Mode::Plan, 10000, Duration::from_secs(30))
+    }
+
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -445,7 +536,7 @@ mod test {
         assert!(agent.owns_and_unseen(&id));
 
         let answer = agent.bg_turn(&mut |event| events.push(event)).await.unwrap();
-        assert_eq!(answer, "tests reported");
+        assert_eq!(answer, ChatOutcome::Answer("tests reported".into()));
 
         let request = rx.recv().await.unwrap();
         assert!(request.contains("Background task"));
@@ -780,7 +871,7 @@ mod test {
 
         let mut turn = async |agent: &mut Agent| {
             let answer = agent.chat("hi", &mut |event| {}).await.unwrap();
-            assert_eq!(answer, "ok");
+            assert_eq!(answer, ChatOutcome::Answer("ok".into()));
             rx.recv().await.unwrap()
         };
 
@@ -796,6 +887,80 @@ mod test {
         *cell.lock().unwrap() = ThinkingLevel::XHigh;
         let body = turn(&mut agent).await;
         assert!(body.contains("\"reasoning_effort\":\"xhigh\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_terminator_ends_the_turn_and_captures_the_payload() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, _requests) = mock_server(vec![sse.to_string()]).await;
+        let mut agent = plan_agent(base_url);
+        let mut events = Vec::new();
+
+        let outcome = agent.chat("plan this", &mut |event| events.push(event)).await.unwrap();
+        assert_eq!(
+            outcome,
+            ChatOutcome::Terminated {
+                tool: "submit_plan".into(),
+                arguments: "{\"plan\":\"step one\"}".into()
+            }
+        );
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolStarted { header, .. } if header == "submit_plan")
+        }));
+    }
+
+    #[tokio::test]
+    async fn sibling_calls_are_dropped_when_the_terminator_is_called() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n"
+            .to_string()
+            + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\n"
+            + "data: [DONE]\n\n";
+        let (base_url, _requests) = mock_server(vec![sse]).await;
+        let mut agent = plan_agent(base_url);
+        let mut events = Vec::new();
+
+        let outcome = agent.chat("plan this", &mut |event| events.push(event)).await.unwrap();
+        assert!(matches!(outcome, ChatOutcome::Terminated { .. }));
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolStarted { header, .. } if header == "submit_plan")
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolStarted { header, .. } if header.starts_with("read_file"))
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolResult { .. })
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_plain_answer_in_plan_mode_is_the_plan_payload() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"step one, step two\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, _requests) = mock_server(vec![sse.to_string()]).await;
+        let mut agent = plan_agent(base_url);
+        let mut events = Vec::new();
+
+        let outcome = agent.chat("plan this", &mut |event| events.push(event)).await.unwrap();
+        assert_eq!(outcome, ChatOutcome::Answer("step one, step two".into()));
+    }
+
+    #[tokio::test]
+    async fn yolo_rejects_submit_plan_at_execution_time() {
+        let tool_call_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let answer_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, _requests) = mock_server(vec![tool_call_sse.to_string(), answer_sse.to_string()]).await;
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(base_url),
+        );
+        let mut agent = Agent::new(client, "test-model", crate::mode::Mode::Yolo, 10000, Duration::from_secs(30));
+        let mut events = Vec::new();
+
+        let outcome = agent.chat("do it", &mut |event| events.push(event)).await.unwrap();
+        assert_eq!(outcome, ChatOutcome::Answer("done".into()));
+        let rejection = agent.history().iter().any(|message| {
+            matches!(message, Message::Tool { content, .. }
+                if content.contains("submit_plan is not allowed in mode yolo"))
+        });
+        assert!(rejection);
     }
 
 }

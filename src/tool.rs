@@ -30,6 +30,9 @@ pub enum ToolError {
         seconds: u64,
     },
 
+    #[error("terminator tools are intercepted and never executed")]
+    TerminatorNotExecutable,
+
     #[error("webfetch of {url} failed: {source}")]
     WebFetchFailed {
         url: String,
@@ -65,6 +68,7 @@ pub enum Tool {
     EditFile(String, String, String),
     WebFetch(String),
     BgRun(String),
+    SubmitPlan(String),
 }
 
 pub enum ToolOutput<'a> {
@@ -95,6 +99,7 @@ impl Tool {
             Tool::EditFile(_, _, _) => "edit_file",
             Tool::WebFetch(_) => "webfetch",
             Tool::BgRun(_) => "bg_run",
+            Tool::SubmitPlan(_) => "submit_plan",
         }
     }
 
@@ -118,6 +123,7 @@ impl Tool {
             Tool::EditFile(path, _, _) => format!("edit_file: {path}"),
             Tool::WebFetch(url) => format!("webfetch: {url}"),
             Tool::BgRun(_) => "bg_run".to_string(),
+            Tool::SubmitPlan(_) => "submit_plan".to_string(),
         }
     }
 
@@ -130,6 +136,7 @@ impl Tool {
             Tool::EditFile(..) => ToolOutput::After,
             Tool::WebFetch(url) => ToolOutput::Before(url),
             Tool::BgRun(command) => ToolOutput::Before(command),
+            Tool::SubmitPlan(plan) => ToolOutput::Before(plan),
         }
     }
 
@@ -146,6 +153,7 @@ impl Tool {
             Tool::BgRun(_) => {
                 "Run a long-running command in the background (tests, builds, dev servers). Returns a task id immediately; the task's result is reported automatically when it finishes"
             }
+            Tool::SubmitPlan(_) => "Submit the final plan. Call this alone, without other tools.",
         }
     }
 
@@ -281,6 +289,7 @@ impl Tool {
                     .map_err(|source| ToolError::Io(std::io::Error::other(source.to_string())))?;
                 Ok(format!("task {id} started; its result will be reported when it finishes"))
             }
+            Tool::SubmitPlan(_) => Err(ToolError::TerminatorNotExecutable),
         }
     }
 
@@ -386,6 +395,11 @@ struct WebFetchArgs {
     url: String,
 }
 
+#[derive(Deserialize)]
+struct SubmitPlanArgs {
+    plan: String,
+}
+
 fn parse_args<A: serde::de::DeserializeOwned>(name: &str, arguments: &str) -> Result<A, ToolError> {
     serde_json::from_str(arguments).map_err(|source| ToolError::InvalidArguments {
         name: name.to_string(),
@@ -419,6 +433,8 @@ impl TryFrom<OpenAIToolCall> for Tool {
                 .map(|a| Tool::WebFetch(a.url)),
             "bg_run" => parse_args::<BashArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::BgRun(a.command)),
+            "submit_plan" => parse_args::<SubmitPlanArgs>(&function.name, &function.arguments)
+                .map(|a| Tool::SubmitPlan(a.plan)),
             other => Err(ToolError::UnknownTool {
                 name: other.to_string(),
             }),
@@ -467,6 +483,13 @@ fn parameters(tool: &Tool) -> serde_json::Value {
                 "url": { "type": "string", "description": "the URL to fetch" }
             },
             "required": ["url"]
+        }),
+        Tool::SubmitPlan(_) => json!({
+            "type": "object",
+            "properties": {
+                "plan": { "type": "string", "description": "the complete, step-by-step implementation plan" }
+            },
+            "required": ["plan"]
         }),
     }
 }
