@@ -1938,6 +1938,8 @@ mod test {
         handle_key(&mut state, &event);
         assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Medium);
         handle_key(&mut state, &event);
+        assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::High);
+        handle_key(&mut state, &event);
         assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::XHigh);
         handle_key(&mut state, &event);
         assert_eq!(state.thinking.get(), crate::thinking::ThinkingLevel::Off);

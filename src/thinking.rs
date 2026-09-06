@@ -5,6 +5,7 @@ pub enum ThinkingLevel {
     Off,
     Low,
     Medium,
+    High,
     XHigh,
 }
 
@@ -13,7 +14,8 @@ impl ThinkingLevel {
         match self {
             Self::Off => Self::Low,
             Self::Low => Self::Medium,
-            Self::Medium => Self::XHigh,
+            Self::Medium => Self::High,
+            Self::High => Self::XHigh,
             Self::XHigh => Self::Off,
         }
     }
@@ -23,6 +25,7 @@ impl ThinkingLevel {
             Self::Off => "off",
             Self::Low => "low",
             Self::Medium => "medium",
+            Self::High => "high",
             Self::XHigh => "xhigh",
         }
     }
@@ -39,6 +42,10 @@ impl ThinkingLevel {
             Self::Medium => Some(serde_json::json!({
                 "chat_template_kwargs": { "enable_thinking": true },
                 "reasoning_effort": "medium"
+            })),
+            Self::High => Some(serde_json::json!({
+                "chat_template_kwargs": { "enable_thinking": true },
+                "reasoning_effort": "high"
             })),
             Self::XHigh => Some(serde_json::json!({
                 "chat_template_kwargs": { "enable_thinking": true },
@@ -59,7 +66,8 @@ impl ThinkingLevelCell {
                 ThinkingLevel::Off => 0,
                 ThinkingLevel::Low => 1,
                 ThinkingLevel::Medium => 2,
-                ThinkingLevel::XHigh => 3,
+                ThinkingLevel::High => 3,
+                ThinkingLevel::XHigh => 4,
             }),
         }
     }
@@ -68,7 +76,8 @@ impl ThinkingLevelCell {
         match self.value.load(Ordering::SeqCst) {
             1 => ThinkingLevel::Low,
             2 => ThinkingLevel::Medium,
-            3 => ThinkingLevel::XHigh,
+            3 => ThinkingLevel::High,
+            4 => ThinkingLevel::XHigh,
             _ => ThinkingLevel::Off,
         }
     }
@@ -78,7 +87,8 @@ impl ThinkingLevelCell {
             ThinkingLevel::Off => 0,
             ThinkingLevel::Low => 1,
             ThinkingLevel::Medium => 2,
-            ThinkingLevel::XHigh => 3,
+            ThinkingLevel::High => 3,
+            ThinkingLevel::XHigh => 4,
         }, Ordering::SeqCst);
     }
 }
@@ -98,7 +108,8 @@ mod test {
         let level = ThinkingLevel::Off;
         assert_eq!(level.next(), ThinkingLevel::Low);
         assert_eq!(ThinkingLevel::Low.next(), ThinkingLevel::Medium);
-        assert_eq!(ThinkingLevel::Medium.next(), ThinkingLevel::XHigh);
+        assert_eq!(ThinkingLevel::Medium.next(), ThinkingLevel::High);
+        assert_eq!(ThinkingLevel::High.next(), ThinkingLevel::XHigh);
         assert_eq!(ThinkingLevel::XHigh.next(), ThinkingLevel::Off);
     }
 
@@ -120,6 +131,7 @@ mod test {
         let cases = [
             (ThinkingLevel::Low, "low"),
             (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
             (ThinkingLevel::XHigh, "xhigh"),
         ];
         for (level, effort) in cases {

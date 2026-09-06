@@ -31,7 +31,7 @@ struct Cli {
     #[arg(long, default_value_t = 24000)]
     context_window: u64,
 
-    #[arg(long, value_enum, default_value_t = ThinkingLevel::Off)]
+    #[arg(long, value_enum, default_value_t = ThinkingLevel::XHigh)]
     thinking: ThinkingLevel,
 
     #[arg(long, default_value_t = 300)]
