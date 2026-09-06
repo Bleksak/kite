@@ -86,19 +86,23 @@ impl TuiRenderer {
     pub fn push_user(&mut self, text: &str) {
         self.close_thinking();
         self.push_line(padding_line(), BlockKind::User);
-        for line in text.trim_end_matches('\n').split('\n') {
-            if line.is_empty() {
-                self.push_line(Line::default(), BlockKind::User);
-            } else {
-                self.push_line(
-                    Line::from(Span::styled(
-                        strip_vs16(line),
-                        Style::default()
-                            .bold()
-                            .fg(Color::Rgb(255, 255, 255)),
-                    )),
-                    BlockKind::User,
-                );
+        if has_markdown(text) {
+            self.push_markdown(text, BlockKind::User);
+        } else {
+            for line in text.trim_end_matches('\n').split('\n') {
+                if line.is_empty() {
+                    self.push_line(Line::default(), BlockKind::User);
+                } else {
+                    self.push_line(
+                        Line::from(Span::styled(
+                            strip_vs16(line),
+                            Style::default()
+                                .bold()
+                                .fg(Color::Rgb(255, 255, 255)),
+                        )),
+                        BlockKind::User,
+                    );
+                }
             }
         }
         self.push_line(padding_line(), BlockKind::User);
@@ -194,17 +198,19 @@ impl TuiRenderer {
         }
         self.flush_answer();
         let thinking = mem::take(&mut self.thinking);
-        for line in thinking
-            .trim_start_matches('\n')
-            .trim_end_matches('\n')
-            .split('\n') {
-            if line.is_empty() {
-                self.push_line(Line::default(), BlockKind::Thinking);
-            } else {
-                self.push_line(
-                    Line::from(Span::styled(strip_vs16(line), Style::default().fg(Color::Black))),
-                    BlockKind::Thinking,
-                );
+        let trimmed = thinking.trim_start_matches('\n').trim_end_matches('\n');
+        if has_markdown(trimmed) {
+            self.push_markdown(trimmed, BlockKind::Thinking);
+        } else {
+            for line in trimmed.split('\n') {
+                if line.is_empty() {
+                    self.push_line(Line::default(), BlockKind::Thinking);
+                } else {
+                    self.push_line(
+                        Line::from(Span::styled(strip_vs16(line), Style::default().fg(Color::Black))),
+                        BlockKind::Thinking,
+                    );
+                }
             }
         }
         self.push_line(padding_line(), BlockKind::Thinking);
@@ -263,37 +269,7 @@ impl TuiRenderer {
             self.answer_start = None;
             return;
         }
-        let (prepared, restore) = prepare_markdown(&self.turn_answer);
-        let rendered = from_str_with_options(&prepared, &MD_OPTIONS);
-        let lines: Vec<Line<'static>> = rendered
-            .lines
-            .iter()
-            .map(|line| {
-                let original = line.to_string();
-                let spans: Vec<Span> = match restore.get(&original) {
-                    Some(rule) => {
-                        let style = line.spans.first().map(|s| s.style).unwrap_or_default();
-                        vec![Span {
-                            content: std::borrow::Cow::Owned(rule.clone()),
-                            style,
-                        }]
-                    }
-                    None => line
-                        .spans
-                        .iter()
-                        .map(|span| Span {
-                            content: std::borrow::Cow::Owned(span.content.to_string()),
-                            style: span.style,
-                        })
-                        .collect(),
-                };
-                Line {
-                    style: line.style,
-                    alignment: line.alignment,
-                    spans,
-                }
-            })
-            .collect();
+        let lines = render_markdown_lines(&self.turn_answer);
         let count = lines.len();
         self.scrollback.splice(start.., lines);
         self.blocks.splice(
@@ -302,6 +278,12 @@ impl TuiRenderer {
         );
         self.turn_answer.clear();
         self.answer_start = None;
+    }
+
+    fn push_markdown(&mut self, text: &str, block: BlockKind) {
+        for line in render_markdown_lines(text) {
+            self.push_line(line, block);
+        }
     }
 
     fn push_indented(&mut self, body: &str, block: BlockKind) {
@@ -326,6 +308,42 @@ fn padding_line() -> Line<'static> {
         " ".to_string(),
         Style::default().fg(Color::Red),
     ))
+}
+
+fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
+    let (prepared, restore) = prepare_markdown(markdown);
+    let rendered = from_str_with_options(&prepared, &MD_OPTIONS);
+    rendered
+        .lines
+        .iter()
+        .map(|line| {
+            let original = line.to_string();
+            let spans: Vec<Span> = match restore.get(&original) {
+                Some(rule) => {
+                    let style = line.spans.first().map(|s| s.style).unwrap_or_default();
+                    vec![Span {
+                        content: std::borrow::Cow::Owned(strip_vs16(rule)),
+                        style,
+                    }]
+                }
+                None => line
+                    .spans
+                    .iter()
+                    .map(|span| Span {
+                        content: std::borrow::Cow::Owned(strip_vs16(
+                            &span.content.to_string(),
+                        )),
+                        style: span.style,
+                    })
+                    .collect(),
+            };
+            Line {
+                style: line.style,
+                alignment: line.alignment,
+                spans,
+            }
+        })
+        .collect()
 }
 
 fn strip_vs16(text: &str) -> String {
@@ -1397,20 +1415,67 @@ mod test {
     }
 
     #[test]
-    fn thinking_is_not_markdown_rendered() {
-        let described = describe(&lines(vec![thinking("**not** rendered"), text("done")]));
+    fn thinking_with_markdown_is_rendered() {
+        let rendered = lines(vec![thinking("**bold** thinking"), text("done")]);
+
+        let thinking_line = &rendered[1];
+        assert!(thinking_line.spans.iter().any(|s| {
+            s.content.as_ref() == "bold"
+                && s.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn plain_thinking_is_not_reparsed() {
+        let described = describe(&lines(vec![thinking("just thinking"), text("done")]));
 
         assert_eq!(
             described,
             vec![
                 (" ".into(), Modifier::empty()),
-                ("**not** rendered".into(), Modifier::empty()),
+                ("just thinking".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("done".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
             ]
         );
+    }
+
+    #[test]
+    fn user_input_with_markdown_is_rendered() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_user("make it **bold**");
+        renderer.finish();
+
+        let line = &renderer.scrollback()[1];
+        assert!(line.spans.iter().any(|s| {
+            s.content.as_ref() == "bold" && s.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn plain_user_input_is_not_reparsed() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_user("just a question");
+        renderer.finish();
+
+        let line = &renderer.scrollback()[1];
+        assert_eq!(line.spans[0].content.as_ref(), "just a question");
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn markdown_rendering_strips_vs16() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_user("icon \u{23F8}\u{FE0F} note");
+        renderer.finish();
+
+        for line in renderer.scrollback() {
+            for span in &line.spans {
+                assert!(!span.content.to_string().contains('\u{FE0F}'));
+            }
+        }
     }
 
     #[test]
