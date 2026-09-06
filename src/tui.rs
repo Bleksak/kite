@@ -272,7 +272,11 @@ impl TuiRenderer {
             self.answer_start = None;
             return;
         }
-        let lines = style_markdown_lines(render_markdown_lines(&self.turn_answer), None);
+        let lines = style_markdown_lines(
+            render_markdown_lines(&self.turn_answer),
+            None,
+            Some(Color::Yellow),
+        );
         let count = lines.len();
         self.scrollback.splice(start.., lines);
         self.blocks.splice(
@@ -284,12 +288,15 @@ impl TuiRenderer {
     }
 
     fn push_markdown(&mut self, text: &str, block: BlockKind) {
-        let base = match block {
-            BlockKind::User => Some(Color::Rgb(255, 255, 255)),
-            BlockKind::Thinking => Some(Color::Black),
-            _ => None,
+        let (base, bold) = match block {
+            BlockKind::User => (
+                Some(Color::Rgb(255, 255, 255)),
+                Some(Color::Yellow),
+            ),
+            BlockKind::Thinking => (Some(Color::Black), None),
+            _ => (None, Some(Color::Yellow)),
         };
-        let lines = style_markdown_lines(render_markdown_lines(text), base);
+        let lines = style_markdown_lines(render_markdown_lines(text), base, bold);
         for line in lines {
             self.push_line(line, block);
         }
@@ -322,6 +329,7 @@ fn padding_line() -> Line<'static> {
 fn style_markdown_lines(
     lines: Vec<Line<'static>>,
     base: Option<Color>,
+    bold: Option<Color>,
 ) -> Vec<Line<'static>> {
     lines
         .into_iter()
@@ -330,11 +338,18 @@ fn style_markdown_lines(
                 .spans
                 .iter()
                 .map(|span| {
-                    let style = match base {
-                        Some(base) if span.style.fg.is_none() => {
-                            span.style.patch(Style::default().fg(base))
+                    let style = if span.style.fg.is_none() {
+                        let color = if span.style.add_modifier.contains(Modifier::BOLD) {
+                            bold.or(base)
+                        } else {
+                            base
+                        };
+                        match color {
+                            Some(color) => span.style.patch(Style::default().fg(color)),
+                            None => span.style,
                         }
-                        _ => span.style,
+                    } else {
+                        span.style
                     };
                     Span {
                         content: std::borrow::Cow::Owned(span.content.to_string()),
@@ -1507,7 +1522,7 @@ mod test {
     }
 
     #[test]
-    fn user_markdown_gets_white_base_and_white_bold() {
+    fn user_markdown_gets_white_base_and_yellow_bold() {
         let mut renderer = TuiRenderer::new();
         renderer.push_user("plain **bold** and `code`");
         renderer.finish();
@@ -1516,7 +1531,7 @@ mod test {
         let spans = &line.spans;
         assert_eq!(spans[0].style.fg, Some(Color::Rgb(255, 255, 255)));
         let bold_span = spans.iter().find(|s| s.content.as_ref() == "bold").unwrap();
-        assert_eq!(bold_span.style.fg, Some(Color::Rgb(255, 255, 255)));
+        assert_eq!(bold_span.style.fg, Some(Color::Yellow));
         assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
         let code_span = spans.iter().find(|s| s.content.as_ref() == "code").unwrap();
         assert_eq!(code_span.style.fg, Some(Color::Rgb(0, 159, 159)));
