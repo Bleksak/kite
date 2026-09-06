@@ -445,12 +445,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             KeyAction::None
         }
         KeyCode::Char(c) => {
-            if c == 'q' && session.input.is_empty() {
-                KeyAction::Quit
-            } else {
-                session.input.push(c);
-                KeyAction::None
-            }
+            session.input.push(c);
+            KeyAction::None
         }
         _ => KeyAction::None,
     }
@@ -1904,9 +1900,10 @@ mod test {
     }
 
     #[test]
-    fn q_quits_only_with_empty_input() {
+    fn q_is_typed_not_a_quit_key() {
         let mut state = TuiState::new("model".into());
-        assert_eq!(handle_key(&mut state, &key(KeyCode::Char('q'))), KeyAction::Quit);
+        assert_eq!(handle_key(&mut state, &key(KeyCode::Char('q'))), KeyAction::None);
+        assert_eq!(state.session().input, "q");
 
         state.session().input = "x".into();
         assert_eq!(handle_key(&mut state, &key(KeyCode::Char('q'))), KeyAction::None);
