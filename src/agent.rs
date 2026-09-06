@@ -9,10 +9,11 @@ use openai_oxide::types::chat::{ChatCompletionRequest, StreamOptions, ToolCall};
 
 use crate::context::Context;
 use crate::message::Message;
+use crate::mode::Mode;
 use crate::stream::{AgentEvent, ChunkTokens, StreamAccumulator, StreamChunk};
 use crate::thinking::ThinkingLevel;
 
-use crate::tool::{TOOL_DEFINITIONS, Tool, ToolOutput};
+use crate::tool::{tool_definitions, Tool, ToolOutput};
 
 #[derive(Debug, PartialEq)]
 enum Step {
@@ -24,6 +25,7 @@ pub struct Agent {
     pub client: OpenAI,
     pub model: String,
     pub context: Context,
+    pub mode: Mode,
     pub thinking: Option<(Arc<Mutex<ThinkingLevel>>, Option<bool>)>,
     pub bash_timeout: Duration,
     bg_seen: std::collections::HashSet<String>,
@@ -36,14 +38,15 @@ impl Agent {
     pub fn new(
         client: OpenAI,
         model: impl Into<String>,
-        system_prompt: impl Into<String>,
+        mode: Mode,
         max_tokens: u64,
         bash_timeout: Duration,
     ) -> Agent {
         Agent {
             client,
             model: model.into(),
-            context: Context::new(system_prompt, max_tokens),
+            context: Context::new(mode.system_prompt(), max_tokens),
+            mode,
             thinking: None,
             bash_timeout,
             bg_seen: std::collections::HashSet::new(),
@@ -179,6 +182,14 @@ impl Agent {
         for call in calls {
             match Tool::try_from(call.clone()) {
                 Ok(tool) => {
+                    if !self.mode.allows(&tool) {
+                        slots.push(Err(format!(
+                            "{} is not allowed in mode {}",
+                            tool.label(),
+                            self.mode.label()
+                        )));
+                        continue;
+                    }
                     let header = tool.header();
                     let output = tool.output();
                     let body = match &output {
@@ -235,7 +246,7 @@ impl Agent {
             self.model.clone(),
             self.context.build_messages(),
         );
-        request.tools = Some((*TOOL_DEFINITIONS).clone());
+        request.tools = Some(tool_definitions(&self.mode.base_tools()));
         request
     }
 
@@ -299,7 +310,7 @@ mod test {
     }
 
     fn agent() -> Agent {
-        Agent::new(OpenAI::new("test-key"), "test-model", "be concise", 10000, Duration::from_secs(30))
+        Agent::new(OpenAI::new("test-key"), "test-model", Mode::Yolo, 10000, Duration::from_secs(30))
     }
 
     async fn run_tool_call(
@@ -403,7 +414,7 @@ mod test {
         let client = OpenAI::with_config(
             openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
         );
-        let mut agent = Agent::new(client, "test-model", "be concise", 10000, Duration::from_secs(30));
+        let mut agent = Agent::new(client, "test-model", Mode::Yolo, 10000, Duration::from_secs(30));
 
         let mut events = vec![];
         run_tool_call(
@@ -688,7 +699,7 @@ mod test {
         else {
             panic!("expected system message first");
         };
-        assert_eq!(content, "be concise");
+        assert_eq!(content, Mode::Yolo.system_prompt());
 
         let openai_oxide::types::chat::ChatCompletionMessageParam::User { content, .. } =
             &request.messages[1]
@@ -764,7 +775,7 @@ mod test {
             openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
         );
         let cell = Arc::new(Mutex::new(ThinkingLevel::Off));
-        let mut agent = Agent::new(client, "test-model", "be concise", 10000, Duration::from_secs(30))
+        let mut agent = Agent::new(client, "test-model", Mode::Yolo, 10000, Duration::from_secs(30))
             .with_thinking(cell.clone(), None);
 
         let mut turn = async |agent: &mut Agent| {

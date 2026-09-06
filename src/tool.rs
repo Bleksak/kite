@@ -1,5 +1,4 @@
 use std::process::Stdio;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -340,7 +339,20 @@ impl Tool {
     }
 }
 
-pub static TOOL_DEFINITIONS: LazyLock<Vec<OpenAITool>> = LazyLock::new(tool_definitions);
+pub fn tool_definitions(tools: &[Tool]) -> Vec<OpenAITool> {
+    tools
+        .iter()
+        .map(|tool| OpenAITool {
+            type_: "function".to_string(),
+            function: FunctionDef {
+                name: tool.label().to_string(),
+                description: Some(tool.description().to_string()),
+                parameters: Some(parameters(tool)),
+                strict: None,
+            },
+        })
+        .collect()
+}
 
 #[derive(Deserialize)]
 struct BashArgs {
@@ -412,30 +424,6 @@ impl TryFrom<OpenAIToolCall> for Tool {
             }),
         }
     }
-}
-
-pub fn tool_definitions() -> Vec<OpenAITool> {
-    let tools = [
-        Tool::Bash(String::new()),
-        Tool::ReadOnlyBash(String::new()),
-        Tool::ReadFile(String::new(), None, None),
-        Tool::WriteFile(String::new(), String::new()),
-        Tool::EditFile(String::new(), String::new(), String::new()),
-        Tool::WebFetch(String::new()),
-        Tool::BgRun(String::new()),
-    ];
-
-    tools
-        .map(|tool| OpenAITool {
-            type_: "function".to_string(),
-            function: FunctionDef {
-                name: tool.label().to_string(),
-                description: Some(tool.description().to_string()),
-                parameters: Some(parameters(&tool)),
-                strict: None,
-            },
-        })
-        .to_vec()
 }
 
 fn parameters(tool: &Tool) -> serde_json::Value {
@@ -1177,7 +1165,16 @@ version: 3"#,
 
     #[test]
     fn schemas_are_consistent_with_parser() {
-        for definition in tool_definitions() {
+        let all = [
+            Tool::Bash(String::new()),
+            Tool::ReadOnlyBash(String::new()),
+            Tool::ReadFile(String::new(), None, None),
+            Tool::WriteFile(String::new(), String::new()),
+            Tool::EditFile(String::new(), String::new(), String::new()),
+            Tool::WebFetch(String::new()),
+            Tool::BgRun(String::new()),
+        ];
+        for definition in tool_definitions(&all) {
             let properties = definition
                 .function
                 .parameters

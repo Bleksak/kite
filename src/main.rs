@@ -2,6 +2,7 @@ mod agent;
 mod bg;
 mod context;
 mod message;
+mod mode;
 mod paths;
 mod session;
 mod session_store;
@@ -13,11 +14,11 @@ mod tui;
 
 
 use agent::Agent;
+use clap::Parser;
+use mode::Mode;
+use openai_oxide::client::OpenAI;
 use std::sync::{Arc, Mutex};
 use thinking::ThinkingLevel;
-use clap::Parser;
-use openai_oxide::client::OpenAI;
-const SYSTEM_PROMPT: &str = "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them.";
 
 #[derive(Parser)]
 struct Cli {
@@ -49,7 +50,7 @@ fn build_agent(
     Agent::new(
         client.clone(),
         model,
-        SYSTEM_PROMPT,
+        Mode::Yolo,
         context_window,
         std::time::Duration::from_secs(bash_timeout),
     )
