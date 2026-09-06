@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::mem;
 use std::sync::LazyLock;
 
@@ -191,21 +192,35 @@ impl TuiRenderer {
             self.answer_start = None;
             return;
         }
-        let rendered = from_str_with_options(&self.turn_answer, &MD_OPTIONS);
+        let (prepared, restore) = prepare_markdown(&self.turn_answer);
+        let rendered = from_str_with_options(&prepared, &MD_OPTIONS);
         let lines: Vec<Line<'static>> = rendered
             .lines
             .iter()
-            .map(|line| Line {
-                style: line.style,
-                alignment: line.alignment,
-                spans: line
-                    .spans
-                    .iter()
-                    .map(|span| Span {
-                        content: std::borrow::Cow::Owned(span.content.to_string()),
-                        style: span.style,
-                    })
-                    .collect(),
+            .map(|line| {
+                let original = line.to_string();
+                let spans: Vec<Span> = match restore.get(&original) {
+                    Some(rule) => {
+                        let style = line.spans.first().map(|s| s.style).unwrap_or_default();
+                        vec![Span {
+                            content: std::borrow::Cow::Owned(rule.clone()),
+                            style,
+                        }]
+                    }
+                    None => line
+                        .spans
+                        .iter()
+                        .map(|span| Span {
+                            content: std::borrow::Cow::Owned(span.content.to_string()),
+                            style: span.style,
+                        })
+                        .collect(),
+                };
+                Line {
+                    style: line.style,
+                    alignment: line.alignment,
+                    spans,
+                }
             })
             .collect();
         self.scrollback.splice(start.., lines);
@@ -228,6 +243,63 @@ impl TuiRenderer {
 fn has_markdown(text: &str) -> bool {
     const MARKERS: [&str; 7] = ["**", "`", "# ", "```", "- ", "[", "> "];
     MARKERS.iter().any(|marker| text.contains(marker))
+}
+
+fn prepare_markdown(text: &str) -> (String, HashMap<String, String>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut restore: HashMap<String, String> = HashMap::new();
+    let mut in_fence = false;
+    let mut fence_marker = "";
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        let body = trimmed.trim_start();
+        let indent = trimmed.len() - body.len();
+        let fence = if body.starts_with("```") {
+            "```"
+        } else if body.starts_with("~~~") {
+            "~~~"
+        } else {
+            ""
+        };
+        if !fence.is_empty() {
+            if in_fence {
+                if fence == fence_marker {
+                    in_fence = false;
+                }
+            } else {
+                in_fence = true;
+                fence_marker = fence;
+            }
+            out.push(trimmed.to_string());
+            continue;
+        }
+        if in_fence {
+            out.push(trimmed.to_string());
+            continue;
+        }
+        let compact = body.replace(' ', "");
+        let is_rule = compact.len() >= 3
+            && indent < 4
+            && (compact.chars().all(|c| c == '*') || compact.chars().all(|c| c == '_'));
+        if is_rule {
+            if out.last().is_some_and(|last| !last.trim().is_empty()) {
+                out.push(String::new());
+            }
+            let token = format!("kiterule{}", restore.len());
+            restore.insert(token.clone(), body.to_string());
+            out.push(token);
+        } else {
+            out.push(trimmed.to_string());
+        }
+    }
+    let mut joined: Vec<String> = Vec::with_capacity(out.len() + 1);
+    for (i, line) in out.iter().enumerate() {
+        joined.push(line.clone());
+        if line.starts_with("kiterule") && i + 1 < out.len() && !out[i + 1].trim().is_empty() {
+            joined.push(String::new());
+        }
+    }
+    (joined.join("\n"), restore)
 }
 
 pub struct TuiState {
@@ -993,6 +1065,68 @@ mod test {
         for line in &rendered {
             assert!(!line.to_string().contains("```"));
         }
+    }
+
+    #[test]
+    fn asterisk_horizontal_rule_is_preserved() {
+        let rendered = lines(vec![
+            text("para\n\n***\n\nnext"),
+            AgentEvent::CompletionStarted,
+        ]);
+        let described: Vec<String> = rendered.iter().map(|l| l.to_string()).collect();
+
+        assert!(described.contains(&"***".into()), "{described:?}");
+        assert!(!described.iter().any(|l| l == "---"), "{described:?}");
+    }
+
+    #[test]
+    fn dash_horizontal_rule_stays_a_dash_rule() {
+        let rendered = lines(vec![
+            text("para\n\n---\n\nnext"),
+            AgentEvent::CompletionStarted,
+        ]);
+        let described: Vec<String> = rendered.iter().map(|l| l.to_string()).collect();
+
+        assert!(described.contains(&"---".into()), "{described:?}");
+    }
+
+    #[test]
+    fn rule_adjacent_to_paragraph_is_not_merged() {
+        let rendered = lines(vec![
+            text("para\n***\nnext"),
+            AgentEvent::CompletionStarted,
+        ]);
+        let described: Vec<String> = rendered.iter().map(|l| l.to_string()).collect();
+
+        assert!(described.contains(&"***".into()), "{described:?}");
+        assert!(
+            !described.iter().any(|l| l.contains("para ***") || l.contains("*** next")),
+            "{described:?}"
+        );
+    }
+
+    #[test]
+    fn rule_like_line_inside_code_fence_is_untouched() {
+        let rendered = lines(vec![
+            text("```bash\n***\n```
+"),
+            AgentEvent::CompletionStarted,
+        ]);
+        let described: Vec<String> = rendered.iter().map(|l| l.to_string()).collect();
+
+        assert!(described.contains(&"***".into()), "{described:?}");
+    }
+
+    #[test]
+    fn underscore_rule_is_preserved() {
+        let rendered = lines(vec![
+            text("para\n\n___\n\nnext"),
+            AgentEvent::CompletionStarted,
+        ]);
+        let described: Vec<String> = rendered.iter().map(|l| l.to_string()).collect();
+
+        assert!(described.contains(&"___".into()), "{described:?}");
+        assert!(!described.iter().any(|l| l == "---"), "{described:?}");
     }
 
     #[test]
