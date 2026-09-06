@@ -399,6 +399,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         };
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
+        let session = state.session();
         return match key.code {
             KeyCode::Char('s') => {
                 state.picker_open = true;
@@ -415,6 +416,18 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             KeyCode::Char('t') => {
                 let mut level = state.thinking.lock().unwrap();
                 *level = level.next();
+                KeyAction::None
+            }
+            KeyCode::Left => {
+                if !session.running {
+                    session.input_cursor = word_left(&session.input, session.input_cursor);
+                }
+                KeyAction::None
+            }
+            KeyCode::Right => {
+                if !session.running {
+                    session.input_cursor = word_right(&session.input, session.input_cursor);
+                }
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -454,6 +467,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 KeyAction::None
             } else {
                 let task = mem::take(&mut session.input);
+                session.input_cursor = 0;
                 if !task.is_empty() && session.label.is_empty() {
                     session.label = task.trim().chars().take(24).collect();
                 }
@@ -462,7 +476,20 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             }
         }
         KeyCode::Backspace => {
-            session.input.pop();
+            if session.input_cursor > 0 {
+                session.input_cursor -= 1;
+                let mut chars: Vec<char> = session.input.chars().collect();
+                chars.remove(session.input_cursor);
+                session.input = chars.into_iter().collect();
+            }
+            KeyAction::None
+        }
+        KeyCode::Left => {
+            session.input_cursor = session.input_cursor.saturating_sub(1);
+            KeyAction::None
+        }
+        KeyCode::Right => {
+            session.input_cursor = (session.input_cursor + 1).min(session.input.chars().count());
             KeyAction::None
         }
         KeyCode::PageUp => {
@@ -482,11 +509,48 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             KeyAction::None
         }
         KeyCode::Char(c) => {
-            session.input.push(c);
+            let mut chars: Vec<char> = session.input.chars().collect();
+            chars.insert(session.input_cursor, c);
+            session.input = chars.into_iter().collect();
+            session.input_cursor += 1;
             KeyAction::None
         }
         _ => KeyAction::None,
     }
+}
+
+fn split_at_char(s: &str, char_offset: usize) -> (String, String) {
+    let byte = s
+        .char_indices()
+        .nth(char_offset)
+        .map(|(index, _)| index)
+        .unwrap_or(s.len());
+    (s[..byte].to_string(), s[byte..].to_string())
+}
+
+fn word_left(input: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = input.chars().collect();
+    let mut pos = cursor;
+    while pos > 0 && chars[pos - 1].is_whitespace() {
+        pos -= 1;
+    }
+    while pos > 0 && !chars[pos - 1].is_whitespace() {
+        pos -= 1;
+    }
+    pos
+}
+
+fn word_right(input: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut pos = cursor;
+    while pos < len && !chars[pos].is_whitespace() {
+        pos += 1;
+    }
+    while pos < len && chars[pos].is_whitespace() {
+        pos += 1;
+    }
+    pos
 }
 
 fn page_up(session: &mut Session) {
@@ -877,10 +941,12 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     } else if let Some(error) = &session.error {
         Line::from(Span::styled(error.clone(), Style::default().red()))
     } else {
+        let (before, after) = split_at_char(&session.input, session.input_cursor);
         Line::from(vec![
             Span::styled("> ".to_string(), Style::default().bold()),
-            Span::raw(session.input.clone()),
+            Span::raw(before),
             Span::styled("█".to_string(), Style::default().bold()),
+            Span::raw(after),
         ])
     };
     let shared = *state.mode.lock().unwrap();
@@ -1393,6 +1459,10 @@ mod test {
 
     fn ctrl(c: char) -> TermEvent {
         TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+    }
+
+    fn ctrl_key(code: KeyCode) -> TermEvent {
+        TermEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
     }
 
     #[test]
@@ -2094,9 +2164,11 @@ mod test {
     fn backspace_pops_the_input() {
         let mut state = TuiState::new("model".into());
         state.session().input = "ab".into();
+        state.session().input_cursor = 2;
 
         assert_eq!(handle_key(&mut state, &key(KeyCode::Backspace)), KeyAction::None);
         assert_eq!(state.session().input, "a");
+        assert_eq!(state.session().input_cursor, 1);
     }
 
     #[test]
@@ -2463,6 +2535,93 @@ mod test {
     fn enter_with_empty_input_is_a_noop_without_a_gate() {
         let mut state = TuiState::new("model".into());
         assert_eq!(handle_key(&mut state, &key(KeyCode::Enter)), KeyAction::None);
+    }
+
+    #[test]
+    fn typing_inserts_at_the_cursor_and_moves_it() {
+        let mut state = TuiState::new("model".into());
+        for c in "hello".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Left));
+        assert_eq!(state.session().input_cursor, 3);
+        handle_key(&mut state, &key(KeyCode::Char('X')));
+        assert_eq!(state.session().input, "helXlo");
+        assert_eq!(state.session().input_cursor, 4);
+    }
+
+    #[test]
+    fn backspace_deletes_before_the_cursor() {
+        let mut state = TuiState::new("model".into());
+        for c in "hello".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Backspace));
+        assert_eq!(state.session().input, "helo");
+        assert_eq!(state.session().input_cursor, 3);
+        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Backspace));
+        assert_eq!(state.session().input, "helo");
+        assert_eq!(state.session().input_cursor, 0);
+    }
+
+    #[test]
+    fn arrows_move_the_cursor_by_char_and_clamp() {
+        let mut state = TuiState::new("model".into());
+        for c in "hello".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        assert_eq!(state.session().input_cursor, 5);
+        handle_key(&mut state, &key(KeyCode::Right));
+        assert_eq!(state.session().input_cursor, 5);
+        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Left));
+        assert_eq!(state.session().input_cursor, 3);
+        for _ in 0..10 {
+            handle_key(&mut state, &key(KeyCode::Left));
+        }
+        assert_eq!(state.session().input_cursor, 0);
+    }
+
+    #[test]
+    fn ctrl_arrows_move_the_cursor_by_word() {
+        let mut state = TuiState::new("model".into());
+        for c in "hello world foo".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        assert_eq!(state.session().input_cursor, 15);
+        handle_key(&mut state, &ctrl_key(KeyCode::Left));
+        assert_eq!(state.session().input_cursor, 12);
+        handle_key(&mut state, &ctrl_key(KeyCode::Left));
+        assert_eq!(state.session().input_cursor, 6);
+        handle_key(&mut state, &ctrl_key(KeyCode::Left));
+        assert_eq!(state.session().input_cursor, 0);
+        handle_key(&mut state, &ctrl_key(KeyCode::Right));
+        assert_eq!(state.session().input_cursor, 6);
+        handle_key(&mut state, &ctrl_key(KeyCode::Right));
+        assert_eq!(state.session().input_cursor, 12);
+        handle_key(&mut state, &ctrl_key(KeyCode::Right));
+        assert_eq!(state.session().input_cursor, 15);
+    }
+
+    #[test]
+    fn ctrl_left_from_inside_a_word_lands_on_its_start() {
+        let mut state = TuiState::new("model".into());
+        for c in "hello world".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        for _ in 0..3 {
+            handle_key(&mut state, &key(KeyCode::Left));
+        }
+        assert_eq!(state.session().input_cursor, 8);
+        handle_key(&mut state, &ctrl_key(KeyCode::Left));
+        assert_eq!(state.session().input_cursor, 6);
+        handle_key(&mut state, &ctrl_key(KeyCode::Left));
+        assert_eq!(state.session().input_cursor, 0);
     }
 
     #[test]

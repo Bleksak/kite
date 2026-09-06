@@ -20,6 +20,7 @@ pub struct Session {
     pub context: Option<Context>,
     pub gate: bool,
     pub stage: Option<Mode>,
+    pub input_cursor: usize,
     tail_cache: (usize, usize, usize, usize),
 }
 
@@ -38,6 +39,7 @@ impl Session {
             context: None,
             gate: false,
             stage: None,
+            input_cursor: 0,
             tail_cache: (0, 0, 0, 0),
         }
     }
