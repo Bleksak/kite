@@ -42,7 +42,6 @@ pub enum BlockKind {
     Answer,
     ToolRunning,
     ToolDone,
-    Other,
 }
 
 pub struct TuiRenderer {
