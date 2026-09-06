@@ -2,17 +2,21 @@ mod agent;
 mod bg;
 mod context;
 mod message;
+mod paths;
+mod repl;
 mod render;
+mod session;
+mod session_store;
+mod stream;
+mod transcript;
 mod tool;
 mod tui;
 
-use std::io::{IsTerminal, Write};
 
 use agent::Agent;
+use std::io::IsTerminal;
 use clap::{Parser, ValueEnum};
 use openai_oxide::client::OpenAI;
-use render::Renderer;
-use tokio::io::AsyncBufReadExt;
 
 const SYSTEM_PROMPT: &str = "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them.";
 
@@ -105,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
     } else {
-        run_plain(build_agent(
+        repl::run_plain(build_agent(
             &client,
             &model,
             cli.thinking,
@@ -114,59 +118,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .await
     }
-}
-
-async fn run_plain(mut agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
-    let out_tty = std::io::stdout().is_terminal();
-    let err_tty = std::io::stderr().is_terminal();
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
-    let mut bg_rx = crate::bg::REGISTRY.subscribe();
-
-    loop {
-        print!("> ");
-        std::io::stdout().flush()?;
-        tokio::select! {
-            result = stdin.read_line(&mut line) => {
-                if result? == 0 {
-                    break;
-                }
-                let input = line.trim().to_string();
-                line.clear();
-                if input.is_empty() {
-                    continue;
-                }
-                let mut renderer = Renderer::new(out_tty, err_tty, std::io::stdout(), std::io::stderr());
-                match agent.chat(&input, &mut |event| renderer.on_event(event)).await {
-                    Ok(_) => renderer.finish(),
-                    Err(error) => {
-                        renderer.finish();
-                        eprintln!("error: {error}");
-                    }
-                }
-            }
-            signal = bg_rx.recv() => {
-                if let Ok(id) = signal
-                    && agent.owns_and_unseen(&id)
-                {
-                    let mut renderer = Renderer::new(out_tty, err_tty, std::io::stdout(), std::io::stderr());
-                    match agent.bg_turn(&mut |event| renderer.on_event(event)).await {
-                        Ok(_) => renderer.finish(),
-                        Err(error) => {
-                            renderer.finish();
-                            eprintln!("error: {error}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    println!(
-        "session over: {} prompt / {} completion tokens",
-        agent.context.total_prompt_tokens,
-        agent.context.total_completion_tokens
-    );
-
-    Ok(())
 }

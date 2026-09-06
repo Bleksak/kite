@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crate::agent::{AgentEvent, AnswerGate, ThinkingMode};
+use crate::stream::{AgentEvent, AnswerGate, ThinkingMode};
 
 pub struct Renderer<W: Write, E: Write> {
     out_tty: bool,
@@ -149,7 +149,7 @@ impl<W: Write, E: Write> Renderer<W, E> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::agent::ChunkTokens;
+    use crate::stream::ChunkTokens;
 
     fn render(out_tty: bool, err_tty: bool, events: Vec<AgentEvent>) -> (String, String) {
         let mut out = Vec::new();

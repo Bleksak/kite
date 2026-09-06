@@ -1,756 +1,32 @@
 use std::collections::HashMap;
 use std::mem;
 use std::path::Path;
-use std::sync::LazyLock;
 
 use crossterm::cursor;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyModifiers};
 use crossterm::terminal;
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::{Buffer, Cell};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Widget};
 use ratatui::{Frame, Terminal};
 
-use tui_markdown::{from_str_with_options, Options, StyleSheet};
-use serde::{Deserialize, Serialize};
 
+use crate::agent::Agent;
 use crate::context::Context;
-
-const SESSIONS_DIR: &str = ".kite/sessions";
-
-#[derive(Clone)]
-struct TuiStyleSheet;
-
-impl StyleSheet for TuiStyleSheet {
-    fn code_block_fence(&self) -> &str {
-        ""
-    }
-
-    fn heading(&self, level: u8) -> Style {
-        let style = Style::default()
-            .fg(Color::Rgb(0xf0, 0xc6, 0x74))
-            .bold();
-        if level == 1 {
-            style.underlined()
-        } else {
-            style
-        }
-    }
-
-    fn heading_marker(&self, _level: u8) -> &str {
-        ""
-    }
-
-    fn link(&self) -> Style {
-        Style::default()
-            .fg(Color::Rgb(0x81, 0xa2, 0xbe))
-            .underlined()
-    }
-
-    fn code(&self) -> Style {
-        Style::default().fg(Color::Rgb(138, 190, 183))
-    }
-
-    fn blockquote(&self) -> Style {
-        Style::default()
-            .fg(Color::Rgb(128, 128, 128))
-            .italic()
-    }
-}
-
-static MD_OPTIONS: LazyLock<Options<TuiStyleSheet>> = LazyLock::new(|| Options::new(TuiStyleSheet));
-
-use crate::agent::{Agent, AgentEvent, AnswerGate, ChunkTokens, ThinkingMode};
-use crate::message::Message;
-use crate::tool::{Tool, ToolOutput};
+use crate::paths::CONTEXT_DIR;
+use crate::session::{Scroller, Session};
+use crate::session_store::{self, SessionFile};
+use crate::stream::AgentEvent;
+use crate::transcript::BlockKind;
 
 pub enum TuiEvent {
     Agent { session: u64, event: AgentEvent },
     TurnDone { session: u64, context: Context },
     TurnError { session: u64, message: String },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum BlockKind {
-    User,
-    Thinking,
-    Answer,
-    ToolRunning,
-    ToolDone,
-}
-
-pub struct TuiRenderer {
-    gate: AnswerGate,
-    scrollback: Vec<Line<'static>>,
-    blocks: Vec<BlockKind>,
-    thinking: String,
-    answer: String,
-    turn_answer: String,
-    answer_start: Option<usize>,
-    tool_blocks: std::collections::HashMap<String, (usize, usize)>,
-}
-
-impl TuiRenderer {
-    pub fn new() -> TuiRenderer {
-        TuiRenderer {
-            gate: AnswerGate::new(),
-            scrollback: Vec::new(),
-            blocks: Vec::new(),
-            thinking: String::new(),
-            answer: String::new(),
-            turn_answer: String::new(),
-            answer_start: None,
-            tool_blocks: std::collections::HashMap::new(),
-        }
-    }
-
-    pub fn scrollback(&self) -> &[Line<'static>] {
-        &self.scrollback
-    }
-
-    pub fn blocks(&self) -> &[BlockKind] {
-        &self.blocks
-    }
-
-    fn push_line(&mut self, line: Line<'static>, block: BlockKind) {
-        self.scrollback.push(line);
-        self.blocks.push(block);
-    }
-
-    pub fn push_user(&mut self, text: &str) {
-        self.close_thinking();
-        self.push_line(padding_line(), BlockKind::User);
-        if has_markdown(text) {
-            self.push_markdown(text, BlockKind::User);
-        } else {
-            for line in text.trim_end_matches('\n').split('\n') {
-                if line.is_empty() {
-                    self.push_line(Line::default(), BlockKind::User);
-                } else {
-                    self.push_line(
-                        Line::from(Span::styled(
-                            strip_vs16(line),
-                            Style::default()
-                                .bold()
-                                .fg(Color::Rgb(212, 212, 212)),
-                        )),
-                        BlockKind::User,
-                    );
-                }
-            }
-        }
-        self.push_line(padding_line(), BlockKind::User);
-    }
-
-    pub fn replay_context(&mut self, context: &Context) {
-        let mut tool_headers: HashMap<String, String> = HashMap::new();
-        for message in &context.messages {
-            match message {
-                Message::System { .. } => {}
-                Message::User { content } => self.push_user(content),
-                Message::Assistant { content, tool_calls } => {
-                    if let Some(text) = content {
-                        self.on_event(AgentEvent::Tokens(ChunkTokens {
-                            thinking: None,
-                            text: Some(text.clone()),
-                        }));
-                        self.on_event(AgentEvent::CompletionStarted);
-                    }
-                    for call in tool_calls {
-                        if let Ok(tool) = Tool::try_from(call.clone()) {
-                            let header = tool.header();
-                            tool_headers.insert(call.id.clone(), header.clone());
-                            let body = match tool.output() {
-                                ToolOutput::Before(body) => Some(body.to_string()),
-                                _ => None,
-                            };
-                            self.on_event(AgentEvent::ToolStarted { header, body });
-                        }
-                    }
-                }
-                Message::Tool { tool_call_id, content } => {
-                    if let Some(header) = tool_headers.get(tool_call_id).cloned() {
-                        self.on_event(AgentEvent::ToolResult {
-                            header,
-                            body: content.clone(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn on_event(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::CompletionStarted => {
-                self.close_thinking();
-                self.end_answer_block();
-                self.gate = AnswerGate::new();
-            }
-            AgentEvent::Tokens(chunk) => {
-                let (mode, text) = self.gate.on_chunk(&chunk);
-                if mode == ThinkingMode::Live
-                    && let Some(thinking) = &chunk.thinking
-                {
-                    if self.thinking.is_empty() && !thinking.is_empty() {
-                        self.push_line(padding_line(), BlockKind::Thinking);
-                    }
-                    self.thinking.push_str(thinking);
-                }
-                if let Some(text) = text {
-                    self.close_thinking();
-                    self.push_answer_text(&text);
-                    self.turn_answer.push_str(&strip_vs16(&text));
-                }
-            }
-            AgentEvent::ToolStarted { header, body } => {
-                self.end_answer_block();
-                self.close_thinking();
-                self.tool_blocks.insert(header.clone(), (self.scrollback.len(), self.scrollback.len()));
-                self.push_line(padding_line(), BlockKind::ToolRunning);
-                self.push_line(
-                    Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold().fg(Color::Rgb(212, 212, 212)))),
-                    BlockKind::ToolRunning,
-                );
-                if let Some(body) = body {
-                    self.push_indented(&body, BlockKind::ToolRunning);
-                }
-                if let Some(entry) = self.tool_blocks.get_mut(&header) {
-                    entry.1 = self.scrollback.len();
-                }
-            }
-            AgentEvent::ToolResult { header, body } => {
-                self.flush_answer();
-                match self.tool_blocks.remove(&header) {
-                    Some((start, end)) => {
-                        for block in &mut self.blocks[start..end] {
-                            if *block == BlockKind::ToolRunning {
-                                *block = BlockKind::ToolDone;
-                            }
-                        }
-                    }
-                    None => {
-                        self.push_line(
-                            Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold().fg(Color::Rgb(212, 212, 212)))),
-                            BlockKind::ToolDone,
-                        );
-                    }
-                }
-                if header.starts_with("edit_file") {
-                    self.push_diff(&body, BlockKind::ToolDone);
-                } else {
-                    self.push_indented(&body, BlockKind::ToolDone);
-                }
-                self.push_line(padding_line(), BlockKind::ToolDone);
-            }
-            AgentEvent::BgTaskDone { id, command, code } => {
-                let status = match code {
-                    Some(0) => "exit 0".to_string(),
-                    Some(code) => format!("exit {code}"),
-                    None => "killed".to_string(),
-                };
-                self.push_line(
-                    Line::from(Span::styled(
-                        format!("⏺ task {id} ({command}) finished — {status}"),
-                        Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
-                    )),
-                    BlockKind::ToolDone,
-                );
-            }
-        }
-    }
-
-    pub fn finish(&mut self) {
-        self.close_thinking();
-        self.end_answer_block();
-    }
-
-    fn end_answer_block(&mut self) {
-        self.flush_answer();
-        let had_answer = self.answer_start.is_some();
-        self.render_answer_markdown();
-        if had_answer {
-            self.push_line(padding_line(), BlockKind::Answer);
-        }
-    }
-
-    fn close_thinking(&mut self) {
-        if self.thinking.is_empty() {
-            return;
-        }
-        self.flush_answer();
-        let thinking = mem::take(&mut self.thinking);
-        let trimmed = thinking.trim_start_matches('\n').trim_end_matches('\n');
-        if has_markdown(trimmed) {
-            self.push_markdown(trimmed, BlockKind::Thinking);
-        } else {
-            for line in trimmed.split('\n') {
-                if line.is_empty() {
-                    self.push_line(Line::default(), BlockKind::Thinking);
-                } else {
-                    self.push_line(
-                        Line::from(Span::styled(strip_vs16(line), Style::default().fg(Color::Rgb(128, 128, 128)))),
-                        BlockKind::Thinking,
-                    );
-                }
-            }
-        }
-    }
-
-    fn push_answer_text(&mut self, text: &str) {
-        self.answer.push_str(text);
-        while let Some(index) = self.answer.find('\n') {
-            let line = strip_vs16(&self.answer[..index]);
-            self.answer.drain(..=index);
-            if line.trim().is_empty() && self.answer_start.is_none() {
-                continue;
-            }
-            if self.answer_start.is_none() {
-                self.push_line(padding_line(), BlockKind::Answer);
-            }
-            self.mark_answer_start();
-            if line.is_empty() {
-                self.push_line(Line::default(), BlockKind::Answer);
-            } else {
-                self.push_line(Line::from(line), BlockKind::Answer);
-            }
-        }
-    }
-
-    fn flush_answer(&mut self) {
-        if self.answer.is_empty() {
-            return;
-        }
-        let line = strip_vs16(&mem::take(&mut self.answer));
-        if line.trim().is_empty() && self.answer_start.is_none() {
-            return;
-        }
-        if self.answer_start.is_none() {
-            self.push_line(padding_line(), BlockKind::Answer);
-        }
-        self.mark_answer_start();
-        self.push_line(Line::from(line), BlockKind::Answer);
-    }
-
-    fn mark_answer_start(&mut self) {
-        if self.answer_start.is_none() {
-            self.answer_start = Some(self.scrollback.len());
-        }
-    }
-
-    fn render_answer_markdown(&mut self) {
-        if self.turn_answer.trim().is_empty() {
-            return;
-        }
-        let Some(start) = self.answer_start else {
-            return;
-        };
-        if !has_markdown(&self.turn_answer) {
-            self.turn_answer.clear();
-            self.answer_start = None;
-            return;
-        }
-        let lines = style_markdown_lines(
-            render_markdown_lines(&self.turn_answer),
-            None,
-            None,
-        );
-        let count = lines.len();
-        self.scrollback.splice(start.., lines);
-        self.blocks.splice(
-            start..,
-            std::iter::repeat_n(BlockKind::Answer, count).collect::<Vec<_>>(),
-        );
-        self.turn_answer.clear();
-        self.answer_start = None;
-    }
-
-    fn push_markdown(&mut self, text: &str, block: BlockKind) {
-        let (base, bold) = match block {
-            BlockKind::User => (Some(Color::Rgb(212, 212, 212)), None),
-            BlockKind::Thinking => (Some(Color::Rgb(128, 128, 128)), None),
-            _ => (None, None),
-        };
-        let lines = style_markdown_lines(render_markdown_lines(text), base, bold);
-        for line in lines {
-            self.push_line(line, block);
-        }
-    }
-
-    fn push_indented(&mut self, body: &str, block: BlockKind) {
-        for line in body.trim_end_matches('\n').split('\n') {
-            if line.is_empty() {
-                self.push_line(Line::default(), block);
-            } else {
-                self.push_line(
-                    Line::from(Span::styled(
-                        format!("  {}", strip_vs16(line)),
-                        Style::default().fg(Color::Rgb(128, 128, 128)),
-                    )),
-                    block,
-                );
-            }
-        }
-    }
-
-    fn push_diff(&mut self, body: &str, block: BlockKind) {
-        let gray = Color::Rgb(128, 128, 128);
-        let mut old_line: Option<usize> = None;
-        let mut new_line: Option<usize> = None;
-        for raw in body.trim_end_matches('\n').split('\n') {
-            let line = strip_vs16(raw);
-            if let Some(hunk) = line.strip_prefix("@@ ") {
-                let range = hunk.strip_suffix(" @@").unwrap_or(hunk);
-                let mut parts = range.split(' ');
-                old_line = parts.next().and_then(|p| hunk_start(p, '-'));
-                new_line = parts.next().and_then(|p| hunk_start(p, '+'));
-                continue;
-            }
-            if line.starts_with("--- ") || line.starts_with("+++ ") {
-                continue;
-            }
-            let is_marker = line.starts_with('\\');
-            let (style, bump_old, bump_new, sign, content) = match line.chars().next() {
-                Some('+') => (Color::Rgb(0xb5, 0xbd, 0x68), false, true, "+", &line[1..]),
-                Some('-') => (Color::Rgb(0xcc, 0x66, 0x66), true, false, "-", &line[1..]),
-                _ if is_marker => (gray, false, false, "", line.as_str()),
-                _ => (gray, true, true, "", line.as_str()),
-            };
-            let number = if is_marker {
-                String::new()
-            } else if bump_old {
-                num(old_line)
-            } else if bump_new {
-                num(new_line)
-            } else {
-                String::new()
-            };
-            let field = if sign.is_empty() {
-                format!("{:>5}", number)
-            } else {
-                format!("{sign}{:>4}", number)
-            };
-            let rendered = format!("{}  {}", field, content);
-            self.push_line(
-                Line::from(Span::styled(rendered, Style::default().fg(style))),
-                block,
-            );
-            if bump_old {
-                old_line = old_line.map(|n| n + 1);
-            }
-            if bump_new {
-                new_line = new_line.map(|n| n + 1);
-            }
-        }
-    }
-}
-
-fn padding_line() -> Line<'static> {
-    Line::from(Span::styled(
-        " ".to_string(),
-        Style::default().fg(Color::Red),
-    ))
-}
-
-fn style_markdown_lines(
-    lines: Vec<Line<'static>>,
-    base: Option<Color>,
-    bold: Option<Color>,
-) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .map(|line| {
-            let spans: Vec<Span> = line
-                .spans
-                .iter()
-                .map(|span| {
-                    let style = if span.style.fg.is_none() {
-                        let color = if span.style.add_modifier.contains(Modifier::BOLD) {
-                            bold.or(base)
-                        } else {
-                            base
-                        };
-                        match color {
-                            Some(color) => span.style.patch(Style::default().fg(color)),
-                            None => span.style,
-                        }
-                    } else {
-                        span.style
-                    };
-                    Span {
-                        content: std::borrow::Cow::Owned(span.content.to_string()),
-                        style,
-                    }
-                })
-                .collect();
-            Line {
-                style: line.style,
-                alignment: line.alignment,
-                spans,
-            }
-        })
-        .collect()
-}
-
-fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
-    let (prepared, restore) = prepare_markdown(markdown);
-    let rendered = from_str_with_options(&prepared, &MD_OPTIONS);
-    rendered
-        .lines
-        .iter()
-        .map(|line| {
-            let original = line.to_string();
-            let spans: Vec<Span> = match restore.get(&original) {
-                Some(rule) => {
-                    let style = line
-                        .spans
-                        .first()
-                        .map(|s| s.style.patch(line.style))
-                        .unwrap_or(line.style);
-                    vec![Span {
-                        content: std::borrow::Cow::Owned(strip_vs16(rule)),
-                        style,
-                    }]
-                }
-                None => line
-                    .spans
-                    .iter()
-                    .map(|span| Span {
-                        content: std::borrow::Cow::Owned(strip_vs16(
-                            span.content.as_ref(),
-                        )),
-                        style: span.style.patch(line.style),
-                    })
-                    .collect(),
-            };
-            Line {
-                style: Style::default(),
-                alignment: line.alignment,
-                spans,
-            }
-        })
-        .collect()
-}
-
-fn strip_vs16(text: &str) -> String {
-    if text.contains('\u{FE0F}') {
-        text.replace('\u{FE0F}', "")
-    } else {
-        text.to_string()
-    }
-}
-
-fn num(n: Option<usize>) -> String {
-    n.map(|n| n.to_string()).unwrap_or_default()
-}
-
-fn hunk_start(part: &str, sign: char) -> Option<usize> {
-    part.strip_prefix(sign)?.split(',').next()?.parse().ok()
-}
-
-fn has_markdown(text: &str) -> bool {
-    const MARKERS: [&str; 7] = ["**", "`", "# ", "```", "- ", "[", "> "];
-    MARKERS.iter().any(|marker| text.contains(marker))
-}
-
-fn prepare_markdown(text: &str) -> (String, HashMap<String, String>) {
-    let mut out: Vec<String> = Vec::new();
-    let mut restore: HashMap<String, String> = HashMap::new();
-    let mut in_fence = false;
-    let mut fence_marker = "";
-    for line in text.lines() {
-        let trimmed = line.trim_end();
-        let body = trimmed.trim_start();
-        let indent = trimmed.len() - body.len();
-        let fence = if body.starts_with("```") {
-            "```"
-        } else if body.starts_with("~~~") {
-            "~~~"
-        } else {
-            ""
-        };
-        if !fence.is_empty() {
-            if in_fence {
-                if fence == fence_marker {
-                    in_fence = false;
-                }
-            } else {
-                in_fence = true;
-                fence_marker = fence;
-            }
-            out.push(trimmed.to_string());
-            continue;
-        }
-        if in_fence {
-            out.push(trimmed.to_string());
-            continue;
-        }
-        let compact = body.replace(' ', "");
-        let is_rule = compact.len() >= 3
-            && indent < 4
-            && (compact.chars().all(|c| c == '*') || compact.chars().all(|c| c == '_'));
-        if is_rule {
-            if out.last().is_some_and(|last| !last.trim().is_empty()) {
-                out.push(String::new());
-            }
-            let token = format!("kiterule{}", restore.len());
-            restore.insert(token.clone(), body.to_string());
-            out.push(token);
-        } else {
-            out.push(trimmed.to_string());
-        }
-    }
-    let mut joined: Vec<String> = Vec::with_capacity(out.len() + 1);
-    for (i, line) in out.iter().enumerate() {
-        joined.push(line.clone());
-        if line.starts_with("kiterule") && i + 1 < out.len() && !out[i + 1].trim().is_empty() {
-            joined.push(String::new());
-        }
-    }
-    (joined.join("\n"), restore)
-}
-
-pub struct Session {
-    id: u64,
-    pub renderer: TuiRenderer,
-    pub input: String,
-    pub running: bool,
-    pub error: Option<String>,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub scroller: Scroller,
-    pub label: String,
-    pub context: Option<Context>,
-    tail_cache: (usize, usize, usize, usize),
-}
-
-impl Session {
-    fn new(id: u64) -> Session {
-        Session {
-            id,
-            renderer: TuiRenderer::new(),
-            input: String::new(),
-            running: false,
-            error: None,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            scroller: Scroller::at_tail(),
-            label: String::new(),
-            context: None,
-            tail_cache: (0, 0, 0, 0),
-        }
-    }
-
-    fn max_scroll(&mut self, pane_width: usize, viewport: usize) -> usize {
-        let len = self.renderer.scrollback().len();
-        let (cl, cw, cv, cs) = self.tail_cache;
-        if cl == len && cw == pane_width && cv == viewport {
-            return cs;
-        }
-        let result = tail_start(len, self.renderer.scrollback(), pane_width as u16, viewport);
-        self.tail_cache = (len, pane_width, viewport, result);
-        result
-    }
-}
-
-#[derive(Default)]
-pub struct Scroller {
-    offset: usize,
-    following: bool,
-}
-
-impl Scroller {
-    fn at_tail() -> Self {
-        Scroller {
-            offset: 0,
-            following: true,
-        }
-    }
-
-    fn offset(&self) -> usize {
-        self.offset
-    }
-
-    fn following(&self) -> bool {
-        self.following
-    }
-
-    fn set_following(&mut self, following: bool) {
-        self.following = following;
-    }
-
-    fn toward_top(&mut self, n: usize) {
-        self.offset = self.offset.saturating_sub(n);
-        self.following = false;
-    }
-
-    fn toward_bottom(&mut self, n: usize, max: usize) {
-        self.offset = (self.offset + n).min(max);
-        self.following = self.offset == max;
-    }
-
-    fn home(&mut self) {
-        self.offset = 0;
-        self.following = false;
-    }
-
-    fn end(&mut self, max: usize) {
-        self.offset = max;
-        self.following = true;
-    }
-
-    fn follow_tail(&mut self, max: usize) {
-        if self.following {
-            self.offset = max;
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SessionFile {
-    label: String,
-    context: Context,
-}
-
-fn save_session(dir: &std::path::Path, id: u64, label: &str, context: &Context) {
-    if std::fs::create_dir_all(dir).is_ok() {
-        let file = SessionFile {
-            label: label.to_string(),
-            context: context.clone(),
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&file) {
-            let _ = std::fs::write(dir.join(format!("{id}.json")), json);
-        }
-    }
-}
-
-fn remove_session_file(dir: &std::path::Path, id: u64) {
-    let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
-}
-
-fn load_sessions(dir: &std::path::Path) -> Vec<(u64, SessionFile)> {
-    let mut loaded = Vec::new();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return loaded,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "json")
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-            && let Ok(id) = stem.parse::<u64>()
-            && let Ok(json) = std::fs::read_to_string(&path)
-            && let Ok(file) = serde_json::from_str::<SessionFile>(&json)
-        {
-            loaded.push((id, file));
-        }
-    }
-    loaded.sort_by_key(|(id, _)| *id);
-    loaded
 }
 
 pub struct TuiState {
@@ -1257,37 +533,7 @@ fn mouse_down(session: &mut Session, pane_width: usize, viewport: usize) {
     session.scroller.toward_bottom(MOUSE, max);
 }
 
-fn fits_viewport(lines: &[Line<'static>], width: u16, viewport: usize) -> bool {
-    if lines.is_empty() {
-        return true;
-    }
-    let area = Rect::new(0, 0, width, (viewport + 1) as u16);
-    let mut buffer = Buffer::empty(area);
-    Paragraph::new(lines).wrap(Wrap { trim: false }).render(area, &mut buffer);
-    (0..width).all(|x| {
-        buffer
-            .cell((x, viewport as u16))
-            .is_none_or(|cell| *cell == Cell::default())
-    })
-}
 
-fn tail_start(len: usize, lines: &[Line<'static>], width: u16, viewport: usize) -> usize {
-    let first = len.saturating_sub(viewport);
-    if fits_viewport(&lines[first..], width, viewport) {
-        return first;
-    }
-    let mut lo = first;
-    let mut hi = len;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if fits_viewport(&lines[mid..], width, viewport) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    lo
-}
 
 fn display_lines(
     scrollback: &[Line<'static>],
@@ -1750,7 +996,7 @@ pub async fn run(
         }
     });
 
-    let mut state = TuiState::with_sessions(model, load_sessions(Path::new(SESSIONS_DIR)));
+    let mut state = TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)));
     let mut inputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<String>> = HashMap::new();
     let mut handles: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
 
@@ -1784,9 +1030,7 @@ pub async fn run(
                     .iter()
                     .filter(|s| {
                         s.context.is_some()
-                            && !Path::new(SESSIONS_DIR)
-                                .join(format!("{}.json", s.id))
-                                .exists()
+                            && !session_store::session_file_exists(Path::new(CONTEXT_DIR), s.id)
                     })
                     .map(|s| s.id)
                     .collect();
@@ -1825,7 +1069,7 @@ pub async fn run(
                             session.completion_tokens = context.total_completion_tokens;
                             session.context = Some(context.clone());
                             if let Some(saved) = &session.context {
-                                save_session(Path::new(SESSIONS_DIR), id, &session.label, saved);
+                                session_store::save_session(Path::new(CONTEXT_DIR), id, &session.label, saved);
                             }
                         }
                     }
@@ -1872,7 +1116,7 @@ pub async fn run(
                                 handle.abort();
                             }
                             inputs.remove(&id);
-                            remove_session_file(Path::new(SESSIONS_DIR), id);
+                            session_store::remove_session_file(Path::new(CONTEXT_DIR), id);
                         }
                     }
                     KeyAction::None => {}
@@ -1897,9 +1141,9 @@ pub async fn run(
     for session in &state.sessions {
         if !session.running
             && let Some(context) = &session.context
-            && Path::new(SESSIONS_DIR).join(format!("{}.json", session.id)).exists()
+            && session_store::session_file_exists(Path::new(CONTEXT_DIR), session.id)
         {
-            save_session(Path::new(SESSIONS_DIR), session.id, &session.label, context);
+            session_store::save_session(Path::new(CONTEXT_DIR), session.id, &session.label, context);
         }
     }
     for handle in handles.values() {
@@ -1920,8 +1164,9 @@ pub async fn run(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::agent::ChunkTokens;
+    use crate::stream::ChunkTokens;
     use crate::message::Message;
+    use crate::transcript::TuiRenderer;
     use crossterm::event::KeyEvent;
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -2956,10 +2201,6 @@ mod test {
         assert_eq!(state.session().max_scroll(pw, vp), 3);
     }
 
-
-
-
-
     #[test]
     fn tail_shows_the_last_line_of_a_large_scrollback() {
         let mut state = TuiState::new("model".into());
@@ -3332,9 +2573,6 @@ mod test {
         assert!(has_color);
     }
 
-
-
-
     #[test]
     fn scroll_does_not_leave_stale_cells() {
         let backend = TestBackend::new(40, 5);
@@ -3438,49 +2676,6 @@ mod test {
         assert!(described.iter().any(|(c, _)| c.contains("ls")));
         assert!(described.iter().any(|(c, _)| c.contains("file.txt")));
         assert!(described.iter().any(|(c, _)| c.contains("done")));
-    }
-
-    #[test]
-    fn session_file_round_trip() {
-        let dir = std::env::temp_dir().join(format!("kite-session-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let mut context = Context::new("sys prompt", 100);
-        context.messages.push(Message::User { content: "hello".into() });
-        context.messages.push(Message::Assistant {
-            content: Some("hi".into()),
-            tool_calls: vec![],
-        });
-        context.total_prompt_tokens = 120;
-        context.total_completion_tokens = 34;
-
-        save_session(&dir, 7, "fix login", &context);
-        let loaded = load_sessions(&dir);
-
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].0, 7);
-        assert_eq!(loaded[0].1.label, "fix login");
-        assert_eq!(loaded[0].1.context.messages.len(), 2);
-        assert_eq!(loaded[0].1.context.total_prompt_tokens, 120);
-        assert_eq!(loaded[0].1.context.total_completion_tokens, 34);
-
-        remove_session_file(&dir, 7);
-        assert!(load_sessions(&dir).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn load_sessions_ignores_corrupt_and_unnamed_files() {
-        let dir = std::env::temp_dir().join(format!("kite-session-bad-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("3.json"), "not json").unwrap();
-        std::fs::write(dir.join("notes.txt"), "{}").unwrap();
-        std::fs::write(dir.join("x.json"), "{}").unwrap();
-
-        assert!(load_sessions(&dir).is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

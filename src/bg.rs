@@ -54,7 +54,7 @@ impl BgRegistry {
             let mut state = self.state.lock().unwrap();
             let id = state.next_id.to_string();
             state.next_id += 1;
-            let dir = Path::new(".kite/tasks").join(&self.dir_name);
+            let dir = Path::new(crate::paths::CONTEXT_DIR).join("tasks").join(&self.dir_name);
             std::fs::create_dir_all(&dir)?;
             let output_path = dir.join(format!("{id}.log"));
             state.tasks.insert(
