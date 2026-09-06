@@ -56,19 +56,16 @@ impl Context {
             .iter()
             .enumerate()
             .filter_map(|(index, message)| match message {
-                Message::Assistant { content, tool_calls }
-                    if !tool_calls.is_empty() && index < keep_from =>
-                {
-                    match content {
-                        Some(text) if !text.is_empty() => Some(Cow::Owned(
-                            Message::Assistant {
-                                content: Some(text.clone()),
-                                tool_calls: vec![],
-                            },
-                        )),
-                        _ => None,
-                    }
-                }
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                } if !tool_calls.is_empty() && index < keep_from => match content {
+                    Some(text) if !text.is_empty() => Some(Cow::Owned(Message::Assistant {
+                        content: Some(text.clone()),
+                        tool_calls: vec![],
+                    })),
+                    _ => None,
+                },
                 Message::Tool { .. } if index < keep_from => None,
                 _ => Some(Cow::Borrowed(message)),
             })
@@ -180,7 +177,9 @@ mod test {
         context.messages.push(Message::User {
             content: "make it blue".into(),
         });
-        context.messages.push(assistant_call("c1", "read_file", Some("let me check")));
+        context
+            .messages
+            .push(assistant_call("c1", "read_file", Some("let me check")));
         context.messages.push(Message::Tool {
             tool_call_id: "c1".into(),
             content: "file contents".into(),
@@ -239,7 +238,9 @@ mod test {
         context.messages.push(Message::User {
             content: "t2".into(),
         });
-        context.messages.push(assistant_call("c2", "read_file", None));
+        context
+            .messages
+            .push(assistant_call("c2", "read_file", None));
         context.messages.push(Message::Tool {
             tool_call_id: "c2".into(),
             content: "content".into(),

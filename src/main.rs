@@ -8,10 +8,9 @@ mod session;
 mod session_store;
 mod stream;
 mod thinking;
-mod transcript;
 mod tool;
+mod transcript;
 mod tui;
-
 
 use agent::Agent;
 use clap::Parser;
@@ -62,7 +61,8 @@ fn build_agent(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let client = OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(cli.api_url));
+    let client =
+        OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(cli.api_url));
     let model = cli.model.clone();
 
     let client = client.clone();

@@ -3,27 +3,26 @@ use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crossterm::ExecutableCommand;
 use crossterm::cursor;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyModifiers};
 use crossterm::terminal;
-use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
 
-
 use crate::agent::Agent;
-use crate::thinking::ThinkingLevel;
-use crate::mode::Mode;
 use crate::context::Context;
+use crate::mode::Mode;
 use crate::paths::CONTEXT_DIR;
 use crate::session::{Cursor, Scroller, Session};
 use crate::session_store::{self, SessionFile};
 use crate::stream::AgentEvent;
+use crate::thinking::ThinkingLevel;
 use crate::transcript::BlockKind;
 
 pub enum TuiEvent {
@@ -573,8 +572,6 @@ fn mouse_down(session: &mut Session, pane_width: usize, viewport: usize) {
     session.scroller.toward_bottom(MOUSE, max);
 }
 
-
-
 fn display_lines(
     scrollback: &[Line<'static>],
     blocks: &[BlockKind],
@@ -628,10 +625,7 @@ fn display_lines(
                         Style::default().bg(bg),
                     ));
                 } else {
-                    spans.push(Span::styled(
-                        " ".repeat(width - current),
-                        Style::default(),
-                    ));
+                    spans.push(Span::styled(" ".repeat(width - current), Style::default()));
                 }
             }
             Line {
@@ -658,7 +652,11 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let chunks = Layout::new(
         Direction::Vertical,
-        [Constraint::Length(3), Constraint::Min(1), Constraint::Length(3)],
+        [
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ],
     )
     .split(area);
     let session = &state.sessions[state.active];
@@ -696,15 +694,17 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         chunks[0],
     );
 
-    let display = display_lines(session.renderer.scrollback(), session.renderer.blocks(), state.pane_width);
+    let display = display_lines(
+        session.renderer.scrollback(),
+        session.renderer.blocks(),
+        state.pane_width,
+    );
     let display = &display[start.min(display.len())..];
-    let main = Paragraph::new(display)
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(95, 135, 255))),
-        );
+    let main = Paragraph::new(display).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(95, 135, 255))),
+    );
     frame.render_widget(Fill, chunks[1]);
     frame.render_widget(main, chunks[1]);
 
@@ -729,7 +729,11 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                     let selected = i == state.picker_cursor.pos;
                     let session = &state.sessions[*session_idx];
                     let marker = if selected { "›" } else { " " };
-                    let status = if session.running { "working…" } else { "idle" };
+                    let status = if session.running {
+                        "working…"
+                    } else {
+                        "idle"
+                    };
                     let style = if selected {
                         Style::default().bold().fg(Color::Rgb(95, 135, 255))
                     } else {
@@ -755,7 +759,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                         Span::styled(format!(" {marker} {}  ", session_idx + 1), style),
                         Span::styled(label, style),
                         Span::styled(
-                            format!("  {} · {} / {}", status, session.prompt_tokens, session.completion_tokens),
+                            format!(
+                                "  {} · {} / {}",
+                                status, session.prompt_tokens, session.completion_tokens
+                            ),
                             style,
                         ),
                     ])
@@ -812,12 +819,14 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                         crate::bg::BgStatus::Running => "running  ".to_string(),
                         crate::bg::BgStatus::Finished(None) => "killed   ".to_string(),
                         crate::bg::BgStatus::Finished(Some(0)) => "exit 0   ".to_string(),
-                        crate::bg::BgStatus::Finished(Some(code)) => format!("exit {code:<4}") ,
+                        crate::bg::BgStatus::Finished(Some(code)) => format!("exit {code:<4}"),
                     };
                     let duration = task
                         .finished_at
                         .map(|finished| finished.duration_since(task.started_at))
-                        .unwrap_or_else(|| std::time::Instant::now().duration_since(task.started_at));
+                        .unwrap_or_else(|| {
+                            std::time::Instant::now().duration_since(task.started_at)
+                        });
                     let style = if selected {
                         Style::default().bold().fg(Color::Rgb(95, 135, 255))
                     } else {
@@ -828,10 +837,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                     Line::from(vec![
                         Span::styled(format!(" {marker} {}  ", task.id), style),
                         Span::styled(status, style),
-                        Span::styled(
-                            format!("{}  ", crate::bg::format_duration(duration)),
-                            style,
-                        ),
+                        Span::styled(format!("{}  ", crate::bg::format_duration(duration)), style),
                         Span::styled(command, style),
                     ])
                 })
@@ -883,7 +889,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             };
             let mut body: Vec<Line> = vec![Line::from(vec![
                 Span::styled(format!("$ {}", task.command), Style::default().bold()),
-                Span::styled(format!("  ·  {}", status), Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe))),
+                Span::styled(
+                    format!("  ·  {}", status),
+                    Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
+                ),
             ])];
             if total == 0 {
                 body.push(Line::from(Span::styled(
@@ -895,22 +904,19 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                     Style::default().fg(Color::Rgb(102, 102, 102)),
                 )));
             } else {
-                body.extend(
-                    lines[start..].iter().take(visible).map(|line| {
-                        Line::from(Span::styled(
-                            *line,
-                            Style::default().fg(Color::Rgb(0x80, 0x80, 0x80)),
-                        ))
-                    }),
-                );
+                body.extend(lines[start..].iter().take(visible).map(|line| {
+                    Line::from(Span::styled(
+                        *line,
+                        Style::default().fg(Color::Rgb(0x80, 0x80, 0x80)),
+                    ))
+                }));
             }
             let hint = Line::from(Span::styled(
                 " jk scroll · q close · C-q close all",
                 Style::default().fg(Color::Rgb(102, 102, 102)),
             ));
             let output_box = Paragraph::new(
-                body
-                    .into_iter()
+                body.into_iter()
                     .chain(std::iter::once(hint))
                     .collect::<Vec<Line>>(),
             )
@@ -946,14 +952,12 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             spans.push(span);
         }
         if session.input_cursor == chars.len() {
-            spans.push(
-                Span::styled(
-                    "█".to_string(),
-                    Style::default()
-                        .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
-                        .fg(Color::Rgb(0xd4, 0xd4, 0xd4)),
-                ),
-            );
+            spans.push(Span::styled(
+                "█".to_string(),
+                Style::default()
+                    .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
+                    .fg(Color::Rgb(0xd4, 0xd4, 0xd4)),
+            ));
         }
         Line::from(spans)
     };
@@ -975,18 +979,15 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                 },
                 effective.label()
             ),
-            Style::default()
-                .bold()
-                .fg(match effective {
-                    Mode::Plan => Color::Rgb(0xb5, 0xbd, 0x68),
-                    Mode::Implement => Color::Rgb(0xe5, 0xb5, 0x67),
-                    Mode::Yolo => Color::Rgb(0xd4, 0xd4, 0xd4),
-                }),
+            Style::default().bold().fg(match effective {
+                Mode::Plan => Color::Rgb(0xb5, 0xbd, 0x68),
+                Mode::Implement => Color::Rgb(0xe5, 0xb5, 0x67),
+                Mode::Yolo => Color::Rgb(0xd4, 0xd4, 0xd4),
+            }),
         ))
     };
     frame.render_widget(
-        Paragraph::new(input_line)
-            .block(Block::default().borders(Borders::ALL).title(mode_title)),
+        Paragraph::new(input_line).block(Block::default().borders(Borders::ALL).title(mode_title)),
         chunks[2],
     );
 }
@@ -1004,25 +1005,28 @@ async fn handle_outcome(
             crate::agent::ChatOutcome::Terminated { tool, arguments } if tool == "submit_plan" => {
                 *gate = Some(crate::agent::terminator_payload(arguments, "plan"));
                 let context = agent.context.clone();
-                let _ = event_tx.send(TuiEvent::TurnDone { session: id, context });
+                let _ = event_tx.send(TuiEvent::TurnDone {
+                    session: id,
+                    context,
+                });
                 let _ = event_tx.send(TuiEvent::GatePending { session: id });
                 return;
             }
             crate::agent::ChatOutcome::Terminated { tool, arguments } if tool == "escalate" => {
                 let findings = crate::agent::terminator_payload(arguments, "findings");
                 *agent = new_agent().with_pinned_mode(Mode::Plan);
-                let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
+                let _ = event_tx.send(TuiEvent::StageChanged {
+                    session: id,
+                    mode: Some(Mode::Plan),
+                });
                 let message = format!(
                     "The implementation hit a blocker: {findings}\n\nRevise the plan, keeping what is already done, and call submit_plan."
                 );
                 let tx = event_tx.clone();
                 match agent
-                    .chat(
-                        &message,
-                        &mut |event| {
-                            let _ = tx.send(TuiEvent::Agent { session: id, event });
-                        },
-                    )
+                    .chat(&message, &mut |event| {
+                        let _ = tx.send(TuiEvent::Agent { session: id, event });
+                    })
                     .await
                 {
                     Ok(next) => {
@@ -1041,10 +1045,16 @@ async fn handle_outcome(
             _ => {
                 if agent.stage_mode() == Some(Mode::Implement) {
                     *agent = new_agent();
-                    let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: None });
+                    let _ = event_tx.send(TuiEvent::StageChanged {
+                        session: id,
+                        mode: None,
+                    });
                 }
                 let context = agent.context.clone();
-                let _ = event_tx.send(TuiEvent::TurnDone { session: id, context });
+                let _ = event_tx.send(TuiEvent::TurnDone {
+                    session: id,
+                    context,
+                });
                 return;
             }
         }
@@ -1056,7 +1066,10 @@ fn spawn_agent(
     new_agent: std::sync::Arc<dyn Fn() -> Agent + Send + Sync>,
     restored: Option<Context>,
     event_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
-) -> (tokio::sync::mpsc::UnboundedSender<String>, tokio::task::AbortHandle) {
+) -> (
+    tokio::sync::mpsc::UnboundedSender<String>,
+    tokio::task::AbortHandle,
+) {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let task = tokio::spawn(async move {
         let mut agent = new_agent();
@@ -1184,9 +1197,10 @@ pub async fn run(
         }
     });
 
-    let mut state = TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
-        .with_thinking(thinking)
-        .with_mode(mode);
+    let mut state =
+        TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
+            .with_thinking(thinking)
+            .with_mode(mode);
     state.viewport = terminal
         .size()
         .map(|size| size.height.saturating_sub(8) as usize)
@@ -1200,7 +1214,8 @@ pub async fn run(
 
     for session in &state.sessions {
         let restored = session.context.clone();
-        let (input_tx, input_handle) = spawn_agent(session.id, new_agent.clone(), restored, agent_tx.clone());
+        let (input_tx, input_handle) =
+            spawn_agent(session.id, new_agent.clone(), restored, agent_tx.clone());
         inputs.insert(session.id, input_tx);
         handles.insert(session.id, input_handle);
     }
@@ -1361,7 +1376,12 @@ pub async fn run(
             && let Some(context) = &session.context
             && session_store::session_file_exists(Path::new(CONTEXT_DIR), session.id)
         {
-            session_store::save_session(Path::new(CONTEXT_DIR), session.id, &session.label, context);
+            session_store::save_session(
+                Path::new(CONTEXT_DIR),
+                session.id,
+                &session.label,
+                context,
+            );
         }
     }
     for handle in handles.values() {
@@ -1373,8 +1393,7 @@ pub async fn run(
     terminal::disable_raw_mode()?;
     println!(
         "session over: {} prompt / {} completion tokens",
-        state.sessions[state.active].prompt_tokens,
-        state.sessions[state.active].completion_tokens
+        state.sessions[state.active].prompt_tokens, state.sessions[state.active].completion_tokens
     );
     Ok(())
 }
@@ -1382,16 +1401,16 @@ pub async fn run(
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::time::Duration;
-    use openai_oxide::client::OpenAI;
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWriteExt;
-    use crate::stream::ChunkTokens;
     use crate::message::Message;
+    use crate::stream::ChunkTokens;
     use crate::transcript::TuiRenderer;
     use crossterm::event::KeyEvent;
+    use openai_oxide::client::OpenAI;
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
 
     fn lines(events: Vec<AgentEvent>) -> Vec<Line<'static>> {
         let mut renderer = TuiRenderer::new();
@@ -1443,7 +1462,10 @@ mod test {
     fn mouse_wheel_scrolls_the_viewport() {
         let mut state = TuiState::new("model".into());
         for i in 0..30 {
-            state.session().renderer.on_event(text(&format!("line {i}\n")));
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("line {i}\n")));
         }
         state.session().renderer.finish();
         let (pw, vp) = (state.pane_width, state.viewport);
@@ -1618,11 +1640,13 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('q'));
-        state.tasks_cursor.set(crate::bg::REGISTRY
-            .list()
-.iter()
-.position(|t| t.id == id)
-.unwrap());
+        state.tasks_cursor.set(
+            crate::bg::REGISTRY
+                .list()
+                .iter()
+                .position(|t| t.id == id)
+                .unwrap(),
+        );
         assert!(state.tasks_open);
         assert!(!state.picker_open);
 
@@ -1637,7 +1661,12 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Char('x')));
         for _ in 0..200 {
             if matches!(
-                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::REGISTRY
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap()
+                    .status,
                 crate::bg::BgStatus::Finished(_)
             ) {
                 break;
@@ -1645,7 +1674,12 @@ mod test {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(matches!(
-            crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+            crate::bg::REGISTRY
+                .list()
+                .into_iter()
+                .find(|t| t.id == id)
+                .unwrap()
+                .status,
             crate::bg::BgStatus::Finished(_)
         ));
 
@@ -1671,7 +1705,12 @@ mod test {
         let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
         for _ in 0..200 {
             if matches!(
-                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::REGISTRY
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap()
+                    .status,
                 crate::bg::BgStatus::Finished(_)
             ) {
                 break;
@@ -1681,11 +1720,13 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('q'));
-        state.tasks_cursor.set(crate::bg::REGISTRY
-            .list()
-.iter()
-.position(|t| t.id == id)
-.unwrap());
+        state.tasks_cursor.set(
+            crate::bg::REGISTRY
+                .list()
+                .iter()
+                .position(|t| t.id == id)
+                .unwrap(),
+        );
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.task_output_id.as_deref(), Some(id.as_str()));
 
@@ -1717,7 +1758,12 @@ mod test {
         let id = crate::bg::REGISTRY.run("echo popup-visible").unwrap();
         for _ in 0..200 {
             if matches!(
-                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::REGISTRY
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap()
+                    .status,
                 crate::bg::BgStatus::Finished(_)
             ) {
                 break;
@@ -1734,9 +1780,7 @@ mod test {
 
         let buffer = terminal.backend().buffer();
         let joined: String = (0..24)
-            .flat_map(|y| {
-                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
-            })
+            .flat_map(|y| (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
             .collect();
         assert!(joined.contains("popup-visible"));
         assert!(joined.contains("task"));
@@ -1747,7 +1791,12 @@ mod test {
         let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
         for _ in 0..200 {
             if matches!(
-                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::REGISTRY
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap()
+                    .status,
                 crate::bg::BgStatus::Finished(_)
             ) {
                 break;
@@ -1768,9 +1817,7 @@ mod test {
 
         let buffer = terminal.backend().buffer();
         let in_popup: String = (3..21)
-            .flat_map(|y| {
-                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
-            })
+            .flat_map(|y| (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
             .collect();
         assert!(!in_popup.contains("CHATLINE"));
         assert!(in_popup.contains("30"));
@@ -1781,7 +1828,12 @@ mod test {
         let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
         for _ in 0..200 {
             if matches!(
-                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::REGISTRY
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap()
+                    .status,
                 crate::bg::BgStatus::Finished(_)
             ) {
                 break;
@@ -1803,7 +1855,12 @@ mod test {
         let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
         for _ in 0..200 {
             if matches!(
-                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::REGISTRY
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap()
+                    .status,
                 crate::bg::BgStatus::Finished(_)
             ) {
                 break;
@@ -1830,7 +1887,12 @@ mod test {
         let id = crate::bg::REGISTRY.run("seq 1 30").unwrap();
         for _ in 0..200 {
             if matches!(
-                crate::bg::REGISTRY.list().into_iter().find(|t| t.id == id).unwrap().status,
+                crate::bg::REGISTRY
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap()
+                    .status,
                 crate::bg::BgStatus::Finished(_)
             ) {
                 break;
@@ -1853,9 +1915,7 @@ mod test {
 
         let buffer = terminal.backend().buffer();
         let in_popup: String = (3..21)
-            .flat_map(|y| {
-                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
-            })
+            .flat_map(|y| (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
             .collect();
         assert!(!in_popup.contains("CHATLINE"));
         assert!(in_popup.contains("30"));
@@ -1876,9 +1936,7 @@ mod test {
 
         let buffer = terminal.backend().buffer();
         let joined: String = (0..12)
-            .flat_map(|y| {
-                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
-            })
+            .flat_map(|y| (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
             .collect();
         assert!(joined.contains("new na"));
         assert!(joined.contains("rename"));
@@ -1916,9 +1974,7 @@ mod test {
 
         let buffer = terminal.backend().buffer();
         let joined: String = (0..12)
-            .flat_map(|y| {
-                (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
-            })
+            .flat_map(|y| (0..80).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
             .collect();
         assert!(joined.contains("sessions"));
         assert!(joined.contains("working…"));
@@ -2009,9 +2065,21 @@ mod test {
             },
         ]));
 
-        assert!(described.iter().any(|(c, col)| c == "    1   one" && col == &Some(Color::Rgb(128, 128, 128))));
-        assert!(described.iter().any(|(c, col)| c == "-   2  two" && col == &Some(Color::Rgb(0xcc, 0x66, 0x66))));
-        assert!(described.iter().any(|(c, col)| c == "+   2  TWO" && col == &Some(Color::Rgb(0xb5, 0xbd, 0x68))));
+        assert!(
+            described
+                .iter()
+                .any(|(c, col)| c == "    1   one" && col == &Some(Color::Rgb(128, 128, 128)))
+        );
+        assert!(
+            described
+                .iter()
+                .any(|(c, col)| c == "-   2  two" && col == &Some(Color::Rgb(0xcc, 0x66, 0x66)))
+        );
+        assert!(
+            described
+                .iter()
+                .any(|(c, col)| c == "+   2  TWO" && col == &Some(Color::Rgb(0xb5, 0xbd, 0x68)))
+        );
         assert!(described.iter().any(|(c, _)| c == "    3   three"));
         assert!(!described.iter().any(|(c, _)| c.starts_with("--- a.txt")));
         assert!(!described.iter().any(|(c, _)| c.starts_with("@@")));
@@ -2165,7 +2233,10 @@ mod test {
     fn enter_with_empty_input_does_nothing() {
         let mut state = TuiState::new("model".into());
 
-        assert_eq!(handle_key(&mut state, &key(KeyCode::Enter)), KeyAction::None);
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Enter)),
+            KeyAction::None
+        );
     }
 
     #[test]
@@ -2174,7 +2245,10 @@ mod test {
         state.session().input = "ab".into();
         state.session().input_cursor = 2;
 
-        assert_eq!(handle_key(&mut state, &key(KeyCode::Backspace)), KeyAction::None);
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Backspace)),
+            KeyAction::None
+        );
         assert_eq!(state.session().input, "a");
         assert_eq!(state.session().input_cursor, 1);
     }
@@ -2192,17 +2266,35 @@ mod test {
         let mut state = TuiState::new("model".into());
         let event = TermEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
 
-        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Off);
+        assert_eq!(
+            *state.thinking.lock().unwrap(),
+            crate::thinking::ThinkingLevel::Off
+        );
         handle_key(&mut state, &event);
-        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Low);
+        assert_eq!(
+            *state.thinking.lock().unwrap(),
+            crate::thinking::ThinkingLevel::Low
+        );
         handle_key(&mut state, &event);
-        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Medium);
+        assert_eq!(
+            *state.thinking.lock().unwrap(),
+            crate::thinking::ThinkingLevel::Medium
+        );
         handle_key(&mut state, &event);
-        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::High);
+        assert_eq!(
+            *state.thinking.lock().unwrap(),
+            crate::thinking::ThinkingLevel::High
+        );
         handle_key(&mut state, &event);
-        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::XHigh);
+        assert_eq!(
+            *state.thinking.lock().unwrap(),
+            crate::thinking::ThinkingLevel::XHigh
+        );
         handle_key(&mut state, &event);
-        assert_eq!(*state.thinking.lock().unwrap(), crate::thinking::ThinkingLevel::Off);
+        assert_eq!(
+            *state.thinking.lock().unwrap(),
+            crate::thinking::ThinkingLevel::Off
+        );
     }
 
     #[test]
@@ -2289,7 +2381,10 @@ mod test {
         let user = &display[1];
         assert_eq!(user.width(), 40);
         assert_eq!(user.spans[0].style.bg, Some(Color::Rgb(52, 53, 65)));
-        assert_eq!(user.spans.last().unwrap().style.bg, Some(Color::Rgb(52, 53, 65)));
+        assert_eq!(
+            user.spans.last().unwrap().style.bg,
+            Some(Color::Rgb(52, 53, 65))
+        );
         let thinking = &display[4];
         assert_eq!(thinking.spans.last().unwrap().style.bg, None);
         assert_eq!(thinking.spans[0].style.fg, Some(Color::Rgb(128, 128, 128)));
@@ -2351,7 +2446,12 @@ mod test {
             header: "bash".into(),
             body: Some("ls".into()),
         });
-        assert!(renderer.blocks().iter().all(|b| *b == BlockKind::ToolRunning));
+        assert!(
+            renderer
+                .blocks()
+                .iter()
+                .all(|b| *b == BlockKind::ToolRunning)
+        );
         assert_eq!(renderer.blocks().len(), 3);
 
         renderer.on_event(AgentEvent::ToolResult {
@@ -2370,7 +2470,12 @@ mod test {
             body: None,
         });
         renderer.finish();
-        assert!(renderer.blocks().iter().all(|b| *b == BlockKind::ToolRunning));
+        assert!(
+            renderer
+                .blocks()
+                .iter()
+                .all(|b| *b == BlockKind::ToolRunning)
+        );
         assert_eq!(renderer.blocks().len(), 2);
     }
 
@@ -2431,8 +2536,14 @@ mod test {
         });
 
         let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
-        assert_eq!(display[0].spans.last().unwrap().style.bg, Some(Color::Rgb(40, 40, 50)));
-        assert_eq!(display[3].spans.last().unwrap().style.bg, Some(Color::Rgb(40, 50, 40)));
+        assert_eq!(
+            display[0].spans.last().unwrap().style.bg,
+            Some(Color::Rgb(40, 40, 50))
+        );
+        assert_eq!(
+            display[3].spans.last().unwrap().style.bg,
+            Some(Color::Rgb(40, 50, 40))
+        );
     }
 
     #[test]
@@ -2441,7 +2552,10 @@ mod test {
         state.viewport = 4;
         state.pane_width = 20;
         for _ in 0..3 {
-            state.session().renderer.on_event(text(&format!("{}\n", "a".repeat(40))));
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("{}\n", "a".repeat(40))));
         }
         state.session().renderer.finish();
         let (pw, vp) = (state.pane_width, state.viewport);
@@ -2456,7 +2570,10 @@ mod test {
         state.pane_width = 118;
         for i in 0..30 {
             let width = if i % 3 == 0 { 300 } else { 20 };
-            state.session().renderer.on_event(text(&format!("line {} {}\n", i, "x".repeat(width))));
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("line {} {}\n", i, "x".repeat(width))));
         }
         state.session().renderer.finish();
         state.session().scroller.set_following(true);
@@ -2499,15 +2616,27 @@ mod test {
         let max = state.session().max_scroll(pw, vp);
         state.session().scroller.end(max);
 
-        assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::PageUp)),
+            KeyAction::None
+        );
         assert_eq!(state.session().scroller.offset(), 2);
         assert!(!state.session().scroller.following());
-        assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::PageUp)),
+            KeyAction::None
+        );
         assert_eq!(state.session().scroller.offset(), 0);
-        assert_eq!(handle_key(&mut state, &key(KeyCode::PageDown)), KeyAction::None);
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::PageDown)),
+            KeyAction::None
+        );
         assert_eq!(state.session().scroller.offset(), 10);
         assert!(!state.session().scroller.following());
-        assert_eq!(handle_key(&mut state, &key(KeyCode::PageDown)), KeyAction::None);
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::PageDown)),
+            KeyAction::None
+        );
         assert_eq!(state.session().scroller.offset(), 12);
         assert!(state.session().scroller.following());
         assert_eq!(handle_key(&mut state, &key(KeyCode::Home)), KeyAction::None);
@@ -2524,7 +2653,10 @@ mod test {
         state.session().running = true;
         state.session().input = "keep".into();
 
-        assert_eq!(handle_key(&mut state, &key(KeyCode::Char('a'))), KeyAction::None);
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Char('a'))),
+            KeyAction::None
+        );
         assert_eq!(state.session().input, "keep");
         assert_eq!(
             handle_key(&mut state, &key(KeyCode::Enter)),
@@ -2542,7 +2674,10 @@ mod test {
     #[test]
     fn enter_with_empty_input_is_a_noop_without_a_gate() {
         let mut state = TuiState::new("model".into());
-        assert_eq!(handle_key(&mut state, &key(KeyCode::Enter)), KeyAction::None);
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Enter)),
+            KeyAction::None
+        );
     }
 
     #[test]
@@ -2561,8 +2696,16 @@ mod test {
                 if cell.symbol() == "b" {
                     found = true;
                     let style = cell.style();
-                    assert_eq!(style.bg, Some(Color::Rgb(0xd4, 0xd4, 0xd4)), "cursor cell bg missing");
-                    assert_eq!(style.fg, Some(Color::Rgb(0x28, 0x28, 0x32)), "cursor cell fg missing");
+                    assert_eq!(
+                        style.bg,
+                        Some(Color::Rgb(0xd4, 0xd4, 0xd4)),
+                        "cursor cell bg missing"
+                    );
+                    assert_eq!(
+                        style.fg,
+                        Some(Color::Rgb(0x28, 0x28, 0x32)),
+                        "cursor cell fg missing"
+                    );
                 }
             }
         }
@@ -2660,7 +2803,10 @@ mod test {
     fn enter_with_empty_input_submits_when_the_gate_is_pending() {
         let mut state = TuiState::new("model".into());
         state.session().gate = true;
-        assert_eq!(handle_key(&mut state, &key(KeyCode::Enter)), KeyAction::Submit(String::new()));
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Enter)),
+            KeyAction::Submit(String::new())
+        );
     }
 
     #[test]
@@ -2695,7 +2841,12 @@ mod test {
         assert_eq!(rendered.len(), 3);
         assert_eq!(rendered[1].spans.len(), 3);
         assert_eq!(rendered[1].spans[1].content, "bold");
-        assert!(rendered[1].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            rendered[1].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -2709,7 +2860,12 @@ mod test {
         let heading = &rendered[1].spans[0];
         assert!(heading.style.add_modifier.contains(Modifier::BOLD));
         assert!(heading.style.add_modifier.contains(Modifier::UNDERLINED));
-        assert!(rendered[3].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            rendered[3].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -2718,8 +2874,7 @@ mod test {
 
         let thinking_line = &rendered[1];
         assert!(thinking_line.spans.iter().any(|s| {
-            s.content.as_ref() == "bold"
-                && s.style.add_modifier.contains(Modifier::BOLD)
+            s.content.as_ref() == "bold" && s.style.add_modifier.contains(Modifier::BOLD)
         }));
     }
 
@@ -2795,15 +2950,29 @@ mod test {
     fn headings_render_pi_style_without_markers() {
         let rendered = lines(vec![text("# One\n\n## Two"), AgentEvent::CompletionStarted]);
 
-        let one = rendered.iter().find(|l| l.spans.iter().any(|s| s.content.as_ref() == "One")).unwrap();
-        let one_span = one.spans.iter().find(|s| s.content.as_ref() == "One").unwrap();
+        let one = rendered
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref() == "One"))
+            .unwrap();
+        let one_span = one
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "One")
+            .unwrap();
         assert_eq!(one_span.style.fg, Some(Color::Rgb(0xf0, 0xc6, 0x74)));
         assert!(one_span.style.add_modifier.contains(Modifier::BOLD));
         assert!(one_span.style.add_modifier.contains(Modifier::UNDERLINED));
         assert!(!one.to_string().contains('#'));
 
-        let two = rendered.iter().find(|l| l.spans.iter().any(|s| s.content.as_ref() == "Two")).unwrap();
-        let two_span = two.spans.iter().find(|s| s.content.as_ref() == "Two").unwrap();
+        let two = rendered
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.as_ref() == "Two"))
+            .unwrap();
+        let two_span = two
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "Two")
+            .unwrap();
         assert_eq!(two_span.style.fg, Some(Color::Rgb(0xf0, 0xc6, 0x74)));
         assert!(two_span.style.add_modifier.contains(Modifier::BOLD));
         assert!(!two_span.style.add_modifier.contains(Modifier::UNDERLINED));
@@ -2811,13 +2980,20 @@ mod test {
 
     #[test]
     fn links_render_pi_style() {
-        let rendered = lines(vec![text("[label](https://example.com)"), AgentEvent::CompletionStarted]);
+        let rendered = lines(vec![
+            text("[label](https://example.com)"),
+            AgentEvent::CompletionStarted,
+        ]);
 
         let label = rendered
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.as_ref() == "label"))
             .unwrap();
-        let label_span = label.spans.iter().find(|s| s.content.as_ref() == "label").unwrap();
+        let label_span = label
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "label")
+            .unwrap();
         assert_eq!(label_span.style.fg, Some(Color::Rgb(0x81, 0xa2, 0xbe)));
         assert!(label_span.style.add_modifier.contains(Modifier::UNDERLINED));
     }
@@ -2830,7 +3006,11 @@ mod test {
             .iter()
             .find(|l| l.spans.iter().any(|s| s.content.as_ref() == "quoted"))
             .unwrap();
-        let quoted_span = quoted.spans.iter().find(|s| s.content.as_ref() == "quoted").unwrap();
+        let quoted_span = quoted
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "quoted")
+            .unwrap();
         assert_eq!(quoted_span.style.fg, Some(Color::Rgb(128, 128, 128)));
         assert!(quoted_span.style.add_modifier.contains(Modifier::ITALIC));
     }
@@ -2874,9 +3054,19 @@ mod test {
         ]);
 
         assert_eq!(rendered.len(), 6);
-        assert!(rendered[1].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            rendered[1].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert_eq!(rendered[1].spans[1].content, "a");
-        assert!(rendered[4].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            rendered[4].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert_eq!(rendered[4].spans[1].content, "b");
     }
 
@@ -2917,15 +3107,14 @@ mod test {
 
     #[test]
     fn rule_adjacent_to_paragraph_is_not_merged() {
-        let rendered = lines(vec![
-            text("para\n***\nnext"),
-            AgentEvent::CompletionStarted,
-        ]);
+        let rendered = lines(vec![text("para\n***\nnext"), AgentEvent::CompletionStarted]);
         let described: Vec<String> = rendered.iter().map(|l| l.to_string()).collect();
 
         assert!(described.contains(&"***".into()), "{described:?}");
         assert!(
-            !described.iter().any(|l| l.contains("para ***") || l.contains("*** next")),
+            !described
+                .iter()
+                .any(|l| l.contains("para ***") || l.contains("*** next")),
             "{described:?}"
         );
     }
@@ -2933,8 +3122,10 @@ mod test {
     #[test]
     fn rule_like_line_inside_code_fence_is_untouched() {
         let rendered = lines(vec![
-            text("```bash\n***\n```
-"),
+            text(
+                "```bash\n***\n```
+",
+            ),
             AgentEvent::CompletionStarted,
         ]);
         let described: Vec<String> = rendered.iter().map(|l| l.to_string()).collect();
@@ -3041,7 +3232,9 @@ mod test {
         use openai_oxide::types::chat::{FunctionCall, ToolCall};
         let mut renderer = TuiRenderer::new();
         let mut context = Context::new("sys", 100);
-        context.messages.push(Message::User { content: "do the thing".into() });
+        context.messages.push(Message::User {
+            content: "do the thing".into(),
+        });
         context.messages.push(Message::Assistant {
             content: None,
             tool_calls: vec![ToolCall {
@@ -3075,7 +3268,9 @@ mod test {
     #[test]
     fn with_sessions_restores_and_falls_back() {
         let mut context = Context::new("sys", 100);
-        context.messages.push(Message::User { content: "hello".into() });
+        context.messages.push(Message::User {
+            content: "hello".into(),
+        });
         context.total_prompt_tokens = 50;
         context.total_completion_tokens = 5;
         let file = SessionFile {
@@ -3086,7 +3281,10 @@ mod test {
         let state = TuiState::with_sessions("model".into(), vec![(3, file)]);
         assert_eq!(state.sessions.len(), 2);
         assert_eq!(state.sessions[0].label, "fix login");
-        assert_eq!(state.sessions[0].context.as_ref().unwrap().messages.len(), 1);
+        assert_eq!(
+            state.sessions[0].context.as_ref().unwrap().messages.len(),
+            1
+        );
         assert_eq!(state.sessions[0].prompt_tokens, 50);
         assert_eq!(state.sessions[0].completion_tokens, 5);
         assert_eq!(state.sessions[1].label, "");
@@ -3115,9 +3313,7 @@ mod test {
 
         let buffer = terminal.backend().buffer();
         let joined: String = (0..12)
-            .flat_map(|y| {
-                (0..60).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string())
-            })
+            .flat_map(|y| (0..60).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
             .collect();
         assert!(joined.contains("llama"));
         assert!(joined.contains("100 prompt / 5 completion tok"));
@@ -3129,16 +3325,14 @@ mod test {
     fn complete_request(data: &[u8]) -> Option<String> {
         let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
         let headers = std::str::from_utf8(&data[..header_end]).unwrap();
-        let length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                if name.trim().eq_ignore_ascii_case("content-length") {
-                    value.trim().parse::<usize>().ok()
-                } else {
-                    None
-                }
-            })?;
+        let length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })?;
         let body_start = header_end + 4;
         if data.len() < body_start + length {
             return None;
@@ -3228,16 +3422,18 @@ mod test {
         input_tx.send("plan me a feature".to_string()).unwrap();
         let mut events = vec![];
         assert!(
-            wait_for_event(&mut event_rx, &mut events, |e| matches!(e, TuiEvent::GatePending { .. }))
-                .await
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { .. }
+            ))
+            .await
         );
         input_tx.send(String::new()).unwrap();
         assert!(
-            wait_for_event(
-                &mut event_rx,
-                &mut events,
-                |e| matches!(e, TuiEvent::StageChanged { mode: None, .. })
-            )
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::StageChanged { mode: None, .. }
+            ))
             .await
         );
         handle.abort();
@@ -3253,12 +3449,15 @@ mod test {
         assert!(implement_request.contains("step one"));
         assert!(events.iter().any(|e| matches!(
             e,
-            TuiEvent::StageChanged { mode: Some(Mode::Implement), .. }
+            TuiEvent::StageChanged {
+                mode: Some(Mode::Implement),
+                ..
+            }
         )));
-        assert!(events.iter().any(|e| matches!(
-            e,
-            TuiEvent::TurnDone { .. }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TuiEvent::TurnDone { .. }))
+        );
     }
 }
-

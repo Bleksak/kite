@@ -13,9 +13,19 @@ pub struct ChunkTokens {
 pub enum AgentEvent {
     CompletionStarted,
     Tokens(ChunkTokens),
-    ToolStarted { header: String, body: Option<String> },
-    ToolResult { header: String, body: String },
-    BgTaskDone { id: String, command: String, code: Option<i32> },
+    ToolStarted {
+        header: String,
+        body: Option<String>,
+    },
+    ToolResult {
+        header: String,
+        body: String,
+    },
+    BgTaskDone {
+        id: String,
+        command: String,
+        code: Option<i32>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -222,8 +232,20 @@ mod test {
         let t1 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"Hello "}}]}"#);
         let t2 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"world"}}]}"#);
 
-        assert_eq!(t1, vec![ChunkTokens { thinking: None, text: Some("Hello ".into()) }]);
-        assert_eq!(t2, vec![ChunkTokens { thinking: None, text: Some("world".into()) }]);
+        assert_eq!(
+            t1,
+            vec![ChunkTokens {
+                thinking: None,
+                text: Some("Hello ".into())
+            }]
+        );
+        assert_eq!(
+            t2,
+            vec![ChunkTokens {
+                thinking: None,
+                text: Some("world".into())
+            }]
+        );
         assert_eq!(
             acc.into_message(),
             Message::Assistant {
@@ -237,7 +259,10 @@ mod test {
     fn empty_content_delta_is_ignored() {
         let mut acc = StreamAccumulator::new();
 
-        let tokens = feed_json(&mut acc, r#"{"choices":[{"delta":{"role":"assistant","content":""}}]}"#);
+        let tokens = feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"role":"assistant","content":""}}]}"#,
+        );
 
         assert!(tokens.is_empty());
     }
@@ -246,11 +271,26 @@ mod test {
     fn reasoning_deltas_are_emitted_but_not_in_message() {
         let mut acc = StreamAccumulator::new();
 
-        let t1 = feed_json(&mut acc, r#"{"choices":[{"delta":{"reasoning":"Let me think. "}}]}"#);
+        let t1 = feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{"reasoning":"Let me think. "}}]}"#,
+        );
         let t2 = feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"42"}}]}"#);
 
-        assert_eq!(t1, vec![ChunkTokens { thinking: Some("Let me think. ".into()), text: None }]);
-        assert_eq!(t2, vec![ChunkTokens { thinking: None, text: Some("42".into()) }]);
+        assert_eq!(
+            t1,
+            vec![ChunkTokens {
+                thinking: Some("Let me think. ".into()),
+                text: None
+            }]
+        );
+        assert_eq!(
+            t2,
+            vec![ChunkTokens {
+                thinking: None,
+                text: Some("42".into())
+            }]
+        );
         assert_eq!(
             acc.into_message(),
             Message::Assistant {
@@ -278,7 +318,11 @@ mod test {
         );
 
         assert!(t1.is_empty() && t2.is_empty() && t3.is_empty());
-        let Message::Assistant { content, tool_calls } = acc.into_message() else {
+        let Message::Assistant {
+            content,
+            tool_calls,
+        } = acc.into_message()
+        else {
             panic!("expected assistant message");
         };
         assert_eq!(content, None);
@@ -325,10 +369,7 @@ mod test {
             panic!("expected assistant message");
         };
         assert_eq!(
-            tool_calls
-                .iter()
-                .map(|c| c.id.clone())
-                .collect::<Vec<_>>(),
+            tool_calls.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
             vec!["call_a", "call_b"]
         );
         assert_eq!(
@@ -345,7 +386,10 @@ mod test {
         let mut acc = StreamAccumulator::new();
 
         feed_json(&mut acc, r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
-        feed_json(&mut acc, r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#);
+        feed_json(
+            &mut acc,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        );
         feed_json(
             &mut acc,
             r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":7}}"#,
@@ -361,7 +405,11 @@ mod test {
         let tokens = feed_json(&mut acc, r#"{"choices":[{"index":0}]}"#);
 
         assert!(tokens.is_empty());
-        let Message::Assistant { content, tool_calls } = acc.into_message() else {
+        let Message::Assistant {
+            content,
+            tool_calls,
+        } = acc.into_message()
+        else {
             panic!("expected assistant message");
         };
         assert_eq!(content, None);

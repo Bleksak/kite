@@ -30,9 +30,9 @@ impl ThinkingLevel {
 
     pub fn body(self, base: Option<bool>) -> Option<serde_json::Value> {
         match self {
-            Self::Off => base.is_some().then(|| {
-                serde_json::json!({ "chat_template_kwargs": { "enable_thinking": false } })
-            }),
+            Self::Off => base.is_some().then(
+                || serde_json::json!({ "chat_template_kwargs": { "enable_thinking": false } }),
+            ),
             Self::Low => Some(serde_json::json!({
                 "chat_template_kwargs": { "enable_thinking": true },
                 "reasoning_effort": "low"
@@ -90,9 +90,7 @@ mod test {
         ];
         for (level, effort) in cases {
             let body = level.body(None).unwrap();
-            assert_eq!(
-                body["chat_template_kwargs"]["enable_thinking"], true
-            );
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
             assert_eq!(body["reasoning_effort"], effort);
         }
     }

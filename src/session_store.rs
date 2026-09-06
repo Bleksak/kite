@@ -71,7 +71,9 @@ mod test {
         let dir = temp_dir("session-test");
 
         let mut context = Context::new("sys prompt", 100);
-        context.messages.push(Message::User { content: "hello".into() });
+        context.messages.push(Message::User {
+            content: "hello".into(),
+        });
         context.messages.push(Message::Assistant {
             content: Some("hi".into()),
             tool_calls: vec![],

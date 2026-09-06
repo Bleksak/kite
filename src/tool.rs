@@ -6,9 +6,7 @@ use tokio::process::Command;
 
 use similar::TextDiff;
 
-use openai_oxide::types::chat::{
-    FunctionDef, Tool as OpenAITool, ToolCall as OpenAIToolCall,
-};
+use openai_oxide::types::chat::{FunctionDef, Tool as OpenAITool, ToolCall as OpenAIToolCall};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -25,25 +23,16 @@ pub enum ToolError {
     },
 
     #[error("{tool} timed out after {seconds}s")]
-    TimedOut {
-        tool: &'static str,
-        seconds: u64,
-    },
+    TimedOut { tool: &'static str, seconds: u64 },
 
     #[error("terminator tools are intercepted and never executed")]
     TerminatorNotExecutable,
 
     #[error("webfetch of {url} failed: {source}")]
-    WebFetchFailed {
-        url: String,
-        source: reqwest::Error,
-    },
+    WebFetchFailed { url: String, source: reqwest::Error },
 
     #[error("webfetch of {url} failed with status {status}")]
-    WebFetchStatus {
-        url: String,
-        status: u16,
-    },
+    WebFetchStatus { url: String, status: u16 },
 
     #[error("expected exactly one occurrence of old content in {path}, found {occurrences}")]
     AmbiguousEdit { path: String, occurrences: usize },
@@ -183,7 +172,9 @@ impl Tool {
                     .args(["--ro-bind", "/", "/", "--ro-bind"])
                     .arg(&cwd)
                     .arg(&cwd)
-                    .args(["--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--chdir"])
+                    .args([
+                        "--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev", "--chdir",
+                    ])
                     .arg(&cwd)
                     .args(["--unshare-pid", "--unshare-ipc", "--unshare-uts"])
                     .arg("bash")
@@ -197,7 +188,9 @@ impl Tool {
                 Self::run_captured(child, timeout, self.label()).await
             }
             Tool::ReadFile(file, start, end) => {
-                let contents = tokio::fs::read_to_string(file).await.map_err(ToolError::Io)?;
+                let contents = tokio::fs::read_to_string(file)
+                    .await
+                    .map_err(ToolError::Io)?;
                 let lines: Vec<&str> = contents.lines().collect();
                 let start = start.unwrap_or(1).saturating_sub(1).min(lines.len());
                 let end = end
@@ -206,11 +199,15 @@ impl Tool {
                 Ok(lines[start..end].join("\n"))
             }
             Tool::WriteFile(file, content) => {
-                tokio::fs::write(file, content).await.map_err(ToolError::Io)?;
+                tokio::fs::write(file, content)
+                    .await
+                    .map_err(ToolError::Io)?;
                 Ok(format!("wrote {} bytes to {file}", content.len()))
             }
             Tool::EditFile(file, old_content, new_content) => {
-                let mut contents = tokio::fs::read_to_string(file).await.map_err(ToolError::Io)?;
+                let mut contents = tokio::fs::read_to_string(file)
+                    .await
+                    .map_err(ToolError::Io)?;
                 let original = contents.clone();
                 let crlf = contents.contains("\r\n");
                 let old = if crlf {
@@ -248,7 +245,9 @@ impl Tool {
                 unified.header(file, file);
                 let diff = unified.to_string();
 
-                tokio::fs::write(file, contents).await.map_err(ToolError::Io)?;
+                tokio::fs::write(file, contents)
+                    .await
+                    .map_err(ToolError::Io)?;
                 Ok(diff)
             }
             Tool::WebFetch(url) => {
@@ -262,10 +261,14 @@ impl Tool {
                             source,
                         })?;
                     let status = response.status().as_u16();
-                    let body = response.text().await.map_err(|source| ToolError::WebFetchFailed {
-                        url: url.clone(),
-                        source,
-                    })?;
+                    let body =
+                        response
+                            .text()
+                            .await
+                            .map_err(|source| ToolError::WebFetchFailed {
+                                url: url.clone(),
+                                source,
+                            })?;
                     Ok::<(u16, String), ToolError>((status, body))
                 })
                 .await;
@@ -294,7 +297,9 @@ impl Tool {
                 let id = crate::bg::REGISTRY
                     .run(command)
                     .map_err(|source| ToolError::Io(std::io::Error::other(source.to_string())))?;
-                Ok(format!("task {id} started; its result will be reported when it finishes"))
+                Ok(format!(
+                    "task {id} started; its result will be reported when it finishes"
+                ))
             }
             Tool::SubmitPlan(_) => Err(ToolError::TerminatorNotExecutable),
             Tool::Escalate(_) => Err(ToolError::TerminatorNotExecutable),
@@ -316,9 +321,7 @@ impl Tool {
                 err.read_to_end(&mut stderr).await.map_err(ToolError::Io)?;
             }
             let status = child.wait().await.map_err(ToolError::Io)?;
-            Ok::<(std::process::ExitStatus, Vec<u8>, Vec<u8>), ToolError>((
-                status, stdout, stderr,
-            ))
+            Ok::<(std::process::ExitStatus, Vec<u8>, Vec<u8>), ToolError>((status, stdout, stderr))
         })
         .await;
 
@@ -350,9 +353,7 @@ impl Tool {
             });
         }
 
-        Ok(cap_output(
-            String::from_utf8_lossy(&stdout).into_owned(),
-        ))
+        Ok(cap_output(String::from_utf8_lossy(&stdout).into_owned()))
     }
 }
 
@@ -518,7 +519,7 @@ fn parameters(tool: &Tool) -> serde_json::Value {
 
 #[cfg(test)]
 mod test {
-    use crate::tool::{tool_definitions, Tool, ToolError};
+    use crate::tool::{Tool, ToolError, tool_definitions};
     use openai_oxide::types::chat::{FunctionCall, ToolCall as OpenAIToolCall};
     use std::io::{Read, Write};
     use std::time::Duration;
@@ -586,10 +587,7 @@ mod test {
 
         let error = tool.invoke(timeout()).await.unwrap_err();
 
-        assert!(matches!(
-            error,
-            ToolError::NonZeroExit { status: 1, .. }
-        ));
+        assert!(matches!(error, ToolError::NonZeroExit { status: 1, .. }));
     }
 
     #[tokio::test]
@@ -625,7 +623,10 @@ mod test {
 
         assert!(matches!(
             error,
-            ToolError::TimedOut { tool: "readonly_bash", seconds: 1 }
+            ToolError::TimedOut {
+                tool: "readonly_bash",
+                seconds: 1
+            }
         ));
     }
 
@@ -732,7 +733,10 @@ mod test {
 
         let result = tool.invoke(timeout()).await.unwrap();
 
-        assert_eq!(result, format!("wrote 11 bytes to {}", file.to_string_lossy()));
+        assert_eq!(
+            result,
+            format!("wrote 11 bytes to {}", file.to_string_lossy())
+        );
         assert!(file.exists());
     }
 
@@ -907,14 +911,14 @@ version: 3"#,
     async fn bash_timeout_kills_the_child() {
         let tool = Tool::Bash("sleep 5".into());
 
-        let error = tool
-            .invoke(Duration::from_secs(1))
-            .await
-            .unwrap_err();
+        let error = tool.invoke(Duration::from_secs(1)).await.unwrap_err();
 
         assert!(matches!(
             error,
-            ToolError::TimedOut { tool: "bash", seconds: 1 }
+            ToolError::TimedOut {
+                tool: "bash",
+                seconds: 1
+            }
         ));
     }
 
@@ -1054,8 +1058,7 @@ version: 3"#,
 
     #[test]
     fn try_from_readonly_bash() {
-        let tool =
-            Tool::try_from(call("readonly_bash", r#"{"command":"ls"}"#)).unwrap();
+        let tool = Tool::try_from(call("readonly_bash", r#"{"command":"ls"}"#)).unwrap();
         assert_eq!(tool, Tool::ReadOnlyBash("ls".into()));
     }
 
@@ -1091,8 +1094,7 @@ version: 3"#,
 
     #[test]
     fn try_from_webfetch() {
-        let tool =
-            Tool::try_from(call("webfetch", r#"{"url":"https://example.com"}"#)).unwrap();
+        let tool = Tool::try_from(call("webfetch", r#"{"url":"https://example.com"}"#)).unwrap();
         assert_eq!(tool, Tool::WebFetch("https://example.com".into()));
     }
 
@@ -1171,7 +1173,10 @@ version: 3"#,
         let tool = Tool::WebFetch(url);
 
         let error = tool.invoke(timeout()).await.unwrap_err();
-        assert!(matches!(error, ToolError::WebFetchStatus { status: 404, .. }));
+        assert!(matches!(
+            error,
+            ToolError::WebFetchStatus { status: 404, .. }
+        ));
         handle.join().unwrap();
     }
 
@@ -1202,7 +1207,10 @@ version: 3"#,
 
         assert!(matches!(
             error,
-            ToolError::TimedOut { tool: "webfetch", seconds: 1 }
+            ToolError::TimedOut {
+                tool: "webfetch",
+                seconds: 1
+            }
         ));
         let _ = release.send(());
         handle.join().unwrap();
@@ -1230,7 +1238,11 @@ version: 3"#,
 
             let mut document = serde_json::Map::new();
             for (key, value) in properties {
-                let sample = match value.get("type").and_then(serde_json::Value::as_str).unwrap() {
+                let sample = match value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap()
+                {
                     "string" => serde_json::json!("x"),
                     "integer" => serde_json::json!(1),
                     other => panic!("unexpected schema type {other}"),
@@ -1238,8 +1250,15 @@ version: 3"#,
                 document.insert(key.clone(), sample);
             }
 
-            let tool_call = call(&definition.function.name, &serde_json::to_string(&document).unwrap());
-            assert!(Tool::try_from(tool_call).is_ok(), "schema for {} does not parse", definition.function.name);
+            let tool_call = call(
+                &definition.function.name,
+                &serde_json::to_string(&document).unwrap(),
+            );
+            assert!(
+                Tool::try_from(tool_call).is_ok(),
+                "schema for {} does not parse",
+                definition.function.name
+            );
         }
     }
 }

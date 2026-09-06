@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::future::join_all;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use openai_oxide::client::OpenAI;
 use openai_oxide::error::OpenAIError;
 use openai_oxide::types::chat::{ChatCompletionRequest, StreamOptions, ToolCall};
@@ -13,7 +13,7 @@ use crate::mode::Mode;
 use crate::stream::{AgentEvent, ChunkTokens, StreamAccumulator, StreamChunk};
 use crate::thinking::ThinkingLevel;
 
-use crate::tool::{tool_definitions, Tool, ToolOutput};
+use crate::tool::{Tool, ToolOutput, tool_definitions};
 
 #[derive(Debug, PartialEq)]
 pub enum ChatOutcome {
@@ -126,10 +126,9 @@ impl Agent {
             on_event(AgentEvent::CompletionStarted);
 
             let (message, usage) = self
-                .stream_completion(
-                    self.build_request(),
-                    &mut |tokens| on_event(AgentEvent::Tokens(tokens)),
-                )
+                .stream_completion(self.build_request(), &mut |tokens| {
+                    on_event(AgentEvent::Tokens(tokens))
+                })
                 .await?;
             self.context.record_usage(usage.0, usage.1);
 
@@ -179,8 +178,16 @@ impl Agent {
         }
     }
 
-    async fn handle_response(&mut self, message: Message, on_event: &mut impl FnMut(AgentEvent)) -> Step {
-        let Message::Assistant { content, tool_calls } = message else {
+    async fn handle_response(
+        &mut self,
+        message: Message,
+        on_event: &mut impl FnMut(AgentEvent),
+    ) -> Step {
+        let Message::Assistant {
+            content,
+            tool_calls,
+        } = message
+        else {
             return Step::Done(String::new());
         };
 
@@ -200,9 +207,7 @@ impl Agent {
         let mut index = 0;
         while index < tool_calls.len() {
             let mut end = index;
-            while end < tool_calls.len()
-                && tool_calls[end].function.name == "read_file"
-            {
+            while end < tool_calls.len() && tool_calls[end].function.name == "read_file" {
                 end += 1;
             }
             if end == index {
@@ -215,11 +220,7 @@ impl Agent {
         Step::Continue
     }
 
-    async fn run_tools(
-        &mut self,
-        calls: &[ToolCall],
-        on_event: &mut impl FnMut(AgentEvent),
-    ) {
+    async fn run_tools(&mut self, calls: &[ToolCall], on_event: &mut impl FnMut(AgentEvent)) {
         let mut slots: Vec<Result<(Tool, String), String>> = Vec::new();
         for call in calls {
             match Tool::try_from(call.clone()) {
@@ -250,7 +251,11 @@ impl Agent {
 
         let futures: Vec<_> = slots
             .iter()
-            .filter_map(|slot| slot.as_ref().ok().map(|(tool, _)| tool.invoke(self.bash_timeout)))
+            .filter_map(|slot| {
+                slot.as_ref()
+                    .ok()
+                    .map(|(tool, _)| tool.invoke(self.bash_timeout))
+            })
             .collect();
         let outputs = join_all(futures).await;
 
@@ -284,10 +289,8 @@ impl Agent {
     }
 
     fn build_request(&self) -> ChatCompletionRequest {
-        let mut request = ChatCompletionRequest::new(
-            self.model.clone(),
-            self.context.build_messages(),
-        );
+        let mut request =
+            ChatCompletionRequest::new(self.model.clone(), self.context.build_messages());
         request.tools = Some(tool_definitions(&self.mode.lock().unwrap().base_tools()));
         request
     }
@@ -314,9 +317,17 @@ impl Agent {
                     map.insert(key.clone(), value.clone());
                 }
             }
-            self.client.chat().completions().create_stream_raw(&body).await?
+            self.client
+                .chat()
+                .completions()
+                .create_stream_raw(&body)
+                .await?
         } else {
-            self.client.chat().completions().create_stream_raw(&request).await?
+            self.client
+                .chat()
+                .completions()
+                .create_stream_raw(&request)
+                .await?
         };
         let mut accumulator = StreamAccumulator::new();
 
@@ -336,7 +347,12 @@ impl Agent {
 pub fn terminator_payload(arguments: &str, field: &str) -> String {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
-        .and_then(|value| value.get(field).and_then(|v| v.as_str()).map(str::to_string))
+        .and_then(|value| {
+            value
+                .get(field)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| arguments.to_string())
 }
 
@@ -350,16 +366,14 @@ mod test {
     fn complete_request(data: &[u8]) -> Option<String> {
         let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
         let headers = std::str::from_utf8(&data[..header_end]).unwrap();
-        let length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                if name.trim().eq_ignore_ascii_case("content-length") {
-                    value.trim().parse::<usize>().ok()
-                } else {
-                    None
-                }
-            })?;
+        let length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })?;
         let body_start = header_end + 4;
         if data.len() < body_start + length {
             return None;
@@ -367,7 +381,9 @@ mod test {
         Some(String::from_utf8_lossy(&data[body_start..body_start + length]).into_owned())
     }
 
-    async fn mock_server(responses: Vec<String>) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+    async fn mock_server(
+        responses: Vec<String>,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let responses = Arc::new(Mutex::new(responses.into_iter()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -396,9 +412,8 @@ mod test {
                         .unwrap()
                         .next()
                         .unwrap_or_else(|| "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".to_string());
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}"
-                    );
+                    let response =
+                        format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}");
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }
@@ -407,10 +422,15 @@ mod test {
     }
 
     fn plan_agent(base_url: String) -> Agent {
-        let client = OpenAI::with_config(
-            openai_oxide::ClientConfig::new("local").base_url(base_url),
-        );
-        Agent::new(client, "test-model", Arc::new(Mutex::new(crate::mode::Mode::Plan)), 10000, Duration::from_secs(30))
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(crate::mode::Mode::Plan)),
+            10000,
+            Duration::from_secs(30),
+        )
     }
 
     fn tool_call(id: &str, name: &str, arguments: &str) -> ToolCall {
@@ -425,13 +445,25 @@ mod test {
     }
 
     fn agent() -> Agent {
-        Agent::new(OpenAI::new("test-key"), "test-model", Arc::new(Mutex::new(Mode::Yolo)), 10000, Duration::from_secs(30))
+        Agent::new(
+            OpenAI::new("test-key"),
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        )
     }
 
     #[test]
     fn pinned_mode_is_unaffected_by_the_shared_cell() {
         let shared = Arc::new(Mutex::new(Mode::Yolo));
-        let mut agent = Agent::new(OpenAI::new("test-key"), "test-model", shared.clone(), 10000, Duration::from_secs(30));
+        let mut agent = Agent::new(
+            OpenAI::new("test-key"),
+            "test-model",
+            shared.clone(),
+            10000,
+            Duration::from_secs(30),
+        );
         agent = agent.with_pinned_mode(Mode::Implement);
         *shared.lock().unwrap() = Mode::Plan;
         assert_eq!(*agent.mode.lock().unwrap(), Mode::Implement);
@@ -440,10 +472,19 @@ mod test {
 
     #[test]
     fn terminator_payload_extracts_the_field_and_falls_back_to_raw() {
-        assert_eq!(terminator_payload(r#"{"plan":"step one"}"#, "plan"), "step one");
-        assert_eq!(terminator_payload(r#"{"findings":"it broke"}"#, "findings"), "it broke");
+        assert_eq!(
+            terminator_payload(r#"{"plan":"step one"}"#, "plan"),
+            "step one"
+        );
+        assert_eq!(
+            terminator_payload(r#"{"findings":"it broke"}"#, "findings"),
+            "it broke"
+        );
         assert_eq!(terminator_payload("not json", "plan"), "not json");
-        assert_eq!(terminator_payload(r#"{"plan":"step one"}"#, "findings"), r#"{"plan":"step one"}"#);
+        assert_eq!(
+            terminator_payload(r#"{"plan":"step one"}"#, "findings"),
+            r#"{"plan":"step one"}"#
+        );
     }
 
     async fn run_tool_call(
@@ -497,16 +538,14 @@ mod test {
         fn complete_request(data: &[u8]) -> Option<String> {
             let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
             let headers = std::str::from_utf8(&data[..header_end]).unwrap();
-            let length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    if name.trim().eq_ignore_ascii_case("content-length") {
-                        value.trim().parse::<usize>().ok()
-                    } else {
-                        None
-                    }
-                })?;
+            let length = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })?;
             let body_start = header_end + 4;
             if data.len() < body_start + length {
                 return None;
@@ -536,9 +575,8 @@ mod test {
                         }
                     }
                     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"tests reported\"}}]}\n\ndata: [DONE]\n\n";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}"
-                    );
+                    let response =
+                        format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}");
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }
@@ -547,7 +585,13 @@ mod test {
         let client = OpenAI::with_config(
             openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
         );
-        let mut agent = Agent::new(client, "test-model", Arc::new(Mutex::new(Mode::Yolo)), 10000, Duration::from_secs(30));
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        );
 
         let mut events = vec![];
         run_tool_call(
@@ -577,7 +621,10 @@ mod test {
             .id;
         assert!(agent.owns_and_unseen(&id));
 
-        let answer = agent.bg_turn(&mut |event| events.push(event)).await.unwrap();
+        let answer = agent
+            .bg_turn(&mut |event| events.push(event))
+            .await
+            .unwrap();
         assert_eq!(answer, ChatOutcome::Answer("tests reported".into()));
 
         let request = rx.recv().await.unwrap();
@@ -605,7 +652,14 @@ mod test {
     async fn tool_call_executes_and_continues() {
         let mut agent = agent();
 
-        let step = run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"echo out"}"#, &mut Vec::new()).await;
+        let step = run_tool_call(
+            &mut agent,
+            "call_1",
+            "bash",
+            r#"{"command":"echo out"}"#,
+            &mut Vec::new(),
+        )
+        .await;
 
         assert_eq!(step, Step::Continue);
         assert_eq!(agent.history().len(), 2);
@@ -622,7 +676,14 @@ mod test {
     async fn tool_error_is_returned_to_model() {
         let mut agent = agent();
 
-        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"exit 3"}"#, &mut Vec::new()).await;
+        run_tool_call(
+            &mut agent,
+            "call_1",
+            "bash",
+            r#"{"command":"exit 3"}"#,
+            &mut Vec::new(),
+        )
+        .await;
 
         assert_eq!(
             agent.history()[1],
@@ -637,7 +698,14 @@ mod test {
     async fn invalid_arguments_are_returned_to_model() {
         let mut agent = agent();
 
-        run_tool_call(&mut agent, "call_1", "bash", r#"{"command":"ls""#, &mut Vec::new()).await;
+        run_tool_call(
+            &mut agent,
+            "call_1",
+            "bash",
+            r#"{"command":"ls""#,
+            &mut Vec::new(),
+        )
+        .await;
 
         let Message::Tool { content, .. } = &agent.history()[1] else {
             panic!("expected tool message");
@@ -659,18 +727,51 @@ mod test {
         let step = run_tool_calls(
             &mut agent,
             vec![
-                tool_call("c1", "read_file", &format!("{{\"path\":\"{}\"}}", file_a.to_string_lossy())),
-                tool_call("c2", "read_file", &format!("{{\"path\":\"{}\"}}", file_b.to_string_lossy())),
-                tool_call("c3", "write_file", &format!("{{\"path\":\"{}\",\"content\":\"three\"}}", file_c.to_string_lossy())),
+                tool_call(
+                    "c1",
+                    "read_file",
+                    &format!("{{\"path\":\"{}\"}}", file_a.to_string_lossy()),
+                ),
+                tool_call(
+                    "c2",
+                    "read_file",
+                    &format!("{{\"path\":\"{}\"}}", file_b.to_string_lossy()),
+                ),
+                tool_call(
+                    "c3",
+                    "write_file",
+                    &format!(
+                        "{{\"path\":\"{}\",\"content\":\"three\"}}",
+                        file_c.to_string_lossy()
+                    ),
+                ),
             ],
             &mut Vec::new(),
         )
         .await;
 
         assert_eq!(step, Step::Continue);
-        assert_eq!(agent.history()[1], Message::Tool { tool_call_id: "c1".into(), content: "one".into() });
-        assert_eq!(agent.history()[2], Message::Tool { tool_call_id: "c2".into(), content: "two".into() });
-        assert_eq!(agent.history()[3], Message::Tool { tool_call_id: "c3".into(), content: format!("wrote 5 bytes to {}", file_c.to_string_lossy()) });
+        assert_eq!(
+            agent.history()[1],
+            Message::Tool {
+                tool_call_id: "c1".into(),
+                content: "one".into()
+            }
+        );
+        assert_eq!(
+            agent.history()[2],
+            Message::Tool {
+                tool_call_id: "c2".into(),
+                content: "two".into()
+            }
+        );
+        assert_eq!(
+            agent.history()[3],
+            Message::Tool {
+                tool_call_id: "c3".into(),
+                content: format!("wrote 5 bytes to {}", file_c.to_string_lossy())
+            }
+        );
     }
 
     #[tokio::test]
@@ -683,14 +784,26 @@ mod test {
         run_tool_calls(
             &mut agent,
             vec![
-                tool_call("c1", "read_file", r#"{"path":"a.txt","start":"not-a-number"}"#),
-                tool_call("c2", "read_file", &format!("{{\"path\":\"{}\"}}", file.to_string_lossy())),
+                tool_call(
+                    "c1",
+                    "read_file",
+                    r#"{"path":"a.txt","start":"not-a-number"}"#,
+                ),
+                tool_call(
+                    "c2",
+                    "read_file",
+                    &format!("{{\"path\":\"{}\"}}", file.to_string_lossy()),
+                ),
             ],
             &mut Vec::new(),
         )
         .await;
 
-        let Message::Tool { tool_call_id, content } = &agent.history()[1] else {
+        let Message::Tool {
+            tool_call_id,
+            content,
+        } = &agent.history()[1]
+        else {
             panic!("expected tool message");
         };
         assert_eq!(tool_call_id, "c1");
@@ -847,8 +960,19 @@ mod test {
         let tools = request.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 7);
         assert_eq!(
-            tools.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>(),
-            vec!["bash", "readonly_bash", "read_file", "write_file", "edit_file", "webfetch", "bg_run"]
+            tools
+                .iter()
+                .map(|t| t.function.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "bash",
+                "readonly_bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "webfetch",
+                "bg_run"
+            ]
         );
     }
 
@@ -857,16 +981,14 @@ mod test {
         fn complete_request(data: &[u8]) -> Option<String> {
             let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
             let headers = std::str::from_utf8(&data[..header_end]).unwrap();
-            let length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    if name.trim().eq_ignore_ascii_case("content-length") {
-                        value.trim().parse::<usize>().ok()
-                    } else {
-                        None
-                    }
-                })?;
+            let length = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })?;
             let body_start = header_end + 4;
             if data.len() < body_start + length {
                 return None;
@@ -896,9 +1018,8 @@ mod test {
                         }
                     }
                     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}"
-                    );
+                    let response =
+                        format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}");
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }
@@ -908,8 +1029,14 @@ mod test {
             openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
         );
         let cell = Arc::new(Mutex::new(ThinkingLevel::Off));
-        let mut agent = Agent::new(client, "test-model", Arc::new(Mutex::new(Mode::Yolo)), 10000, Duration::from_secs(30))
-            .with_thinking(cell.clone(), None);
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        )
+        .with_thinking(cell.clone(), None);
 
         let mut turn = async |agent: &mut Agent| {
             let answer = agent.chat("hi", &mut |event| {}).await.unwrap();
@@ -918,8 +1045,14 @@ mod test {
         };
 
         let body = turn(&mut agent).await;
-        assert!(!body.contains("reasoning_effort"), "auto + off must send no override: {body}");
-        assert!(!body.contains("chat_template_kwargs"), "auto + off must send no override: {body}");
+        assert!(
+            !body.contains("reasoning_effort"),
+            "auto + off must send no override: {body}"
+        );
+        assert!(
+            !body.contains("chat_template_kwargs"),
+            "auto + off must send no override: {body}"
+        );
 
         *cell.lock().unwrap() = ThinkingLevel::Low;
         let body = turn(&mut agent).await;
@@ -938,7 +1071,10 @@ mod test {
         let mut agent = plan_agent(base_url);
         let mut events = Vec::new();
 
-        let outcome = agent.chat("plan this", &mut |event| events.push(event)).await.unwrap();
+        let outcome = agent
+            .chat("plan this", &mut |event| events.push(event))
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             ChatOutcome::Terminated {
@@ -961,7 +1097,10 @@ mod test {
         let mut agent = plan_agent(base_url);
         let mut events = Vec::new();
 
-        let outcome = agent.chat("plan this", &mut |event| events.push(event)).await.unwrap();
+        let outcome = agent
+            .chat("plan this", &mut |event| events.push(event))
+            .await
+            .unwrap();
         assert!(matches!(outcome, ChatOutcome::Terminated { .. }));
         assert!(events.iter().any(|event| {
             matches!(event, AgentEvent::ToolStarted { header, .. } if header == "submit_plan")
@@ -969,9 +1108,11 @@ mod test {
         assert!(!events.iter().any(|event| {
             matches!(event, AgentEvent::ToolStarted { header, .. } if header.starts_with("read_file"))
         }));
-        assert!(!events.iter().any(|event| {
-            matches!(event, AgentEvent::ToolResult { .. })
-        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| { matches!(event, AgentEvent::ToolResult { .. }) })
+        );
     }
 
     #[tokio::test]
@@ -981,22 +1122,35 @@ mod test {
         let mut agent = plan_agent(base_url);
         let mut events = Vec::new();
 
-        let outcome = agent.chat("plan this", &mut |event| events.push(event)).await.unwrap();
+        let outcome = agent
+            .chat("plan this", &mut |event| events.push(event))
+            .await
+            .unwrap();
         assert_eq!(outcome, ChatOutcome::Answer("step one, step two".into()));
     }
 
     #[tokio::test]
     async fn yolo_rejects_submit_plan_at_execution_time() {
         let tool_call_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
-        let answer_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
-        let (base_url, _requests) = mock_server(vec![tool_call_sse.to_string(), answer_sse.to_string()]).await;
-        let client = OpenAI::with_config(
-            openai_oxide::ClientConfig::new("local").base_url(base_url),
+        let answer_sse =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, _requests) =
+            mock_server(vec![tool_call_sse.to_string(), answer_sse.to_string()]).await;
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(crate::mode::Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
         );
-        let mut agent = Agent::new(client, "test-model", Arc::new(Mutex::new(crate::mode::Mode::Yolo)), 10000, Duration::from_secs(30));
         let mut events = Vec::new();
 
-        let outcome = agent.chat("do it", &mut |event| events.push(event)).await.unwrap();
+        let outcome = agent
+            .chat("do it", &mut |event| events.push(event))
+            .await
+            .unwrap();
         assert_eq!(outcome, ChatOutcome::Answer("done".into()));
         let rejection = agent.history().iter().any(|message| {
             matches!(message, Message::Tool { content, .. }
@@ -1004,5 +1158,4 @@ mod test {
         });
         assert!(rejection);
     }
-
 }

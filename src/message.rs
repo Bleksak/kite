@@ -1,6 +1,4 @@
-use openai_oxide::types::chat::{
-    ChatCompletionMessageParam, ToolCall, UserContent,
-};
+use openai_oxide::types::chat::{ChatCompletionMessageParam, ToolCall, UserContent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +30,10 @@ impl Message {
                 content: UserContent::Text(content.clone()),
                 name: None,
             },
-            Message::Assistant { content, tool_calls } => {
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
                 let tool_calls = if tool_calls.is_empty() {
                     None
                 } else {
@@ -45,13 +46,15 @@ impl Message {
                     refusal: None,
                 }
             }
-            Message::Tool { tool_call_id, content } => ChatCompletionMessageParam::Tool {
+            Message::Tool {
+                tool_call_id,
+                content,
+            } => ChatCompletionMessageParam::Tool {
                 content: content.clone(),
                 tool_call_id: tool_call_id.clone(),
             },
         }
     }
-
 }
 
 impl PartialEq for Message {
@@ -72,7 +75,9 @@ impl PartialEq for Message {
                 a == b
                     && ta.len() == tb.len()
                     && ta.iter().zip(tb).all(|(x, y)| {
-                        x.id == y.id && x.type_ == y.type_ && x.function.name == y.function.name
+                        x.id == y.id
+                            && x.type_ == y.type_
+                            && x.function.name == y.function.name
                             && x.function.arguments == y.function.arguments
                     })
             }
@@ -169,6 +174,4 @@ mod test {
             r#"{"role":"tool","content":"ok","tool_call_id":"call_123"}"#
         );
     }
-
-
 }

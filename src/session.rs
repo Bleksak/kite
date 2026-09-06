@@ -160,7 +160,9 @@ fn fits_viewport(lines: &[Line<'static>], width: u16, viewport: usize) -> bool {
     }
     let area = Rect::new(0, 0, width, (viewport + 1) as u16);
     let mut buffer = Buffer::empty(area);
-    Paragraph::new(lines).wrap(Wrap { trim: false }).render(area, &mut buffer);
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(area, &mut buffer);
     (0..width).all(|x| {
         buffer
             .cell((x, viewport as u16))

@@ -67,9 +67,15 @@ impl Mode {
 
     pub fn system_prompt(&self) -> &'static str {
         match self {
-            Self::Yolo => "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them.",
-            Self::Plan => "You are a planning agent. Investigate the codebase with read_file and read-only bash commands, then call submit_plan with a concrete, step-by-step implementation plan. Do not modify any files. Call submit_plan alone, without other tools.",
-            Self::Implement => "You are an implementation agent. Execute the plan step by step with the tools. Verify your work (build, tests) with bash or bg_run. If you hit a blocker you cannot resolve, call escalate alone with a description of the blocker; do not guess around it.",
+            Self::Yolo => {
+                "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them."
+            }
+            Self::Plan => {
+                "You are a planning agent. Investigate the codebase with read_file and read-only bash commands, then call submit_plan with a concrete, step-by-step implementation plan. Do not modify any files. Call submit_plan alone, without other tools."
+            }
+            Self::Implement => {
+                "You are an implementation agent. Execute the plan step by step with the tools. Verify your work (build, tests) with bash or bg_run. If you hit a blocker you cannot resolve, call escalate alone with a description of the blocker; do not guess around it."
+            }
         }
     }
 }
@@ -93,7 +99,13 @@ mod test {
         assert_eq!(
             names,
             vec![
-                "bash", "readonly_bash", "read_file", "write_file", "edit_file", "webfetch", "bg_run"
+                "bash",
+                "readonly_bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "webfetch",
+                "bg_run"
             ]
         );
     }
@@ -137,7 +149,14 @@ mod test {
         assert_eq!(
             names,
             vec![
-                "read_file", "readonly_bash", "bash", "write_file", "edit_file", "webfetch", "bg_run", "escalate"
+                "read_file",
+                "readonly_bash",
+                "bash",
+                "write_file",
+                "edit_file",
+                "webfetch",
+                "bg_run",
+                "escalate"
             ]
         );
     }
@@ -170,8 +189,14 @@ mod test {
     #[test]
     fn a_tool_outside_the_mode_set_is_rejected() {
         let restricted = vec![Tool::ReadFile(String::new(), None, None)];
-        assert!(tool_allowed(&restricted, &Tool::ReadFile("a".into(), None, None)));
+        assert!(tool_allowed(
+            &restricted,
+            &Tool::ReadFile("a".into(), None, None)
+        ));
         assert!(!tool_allowed(&restricted, &Tool::Bash("rm -rf /".into())));
-        assert!(!tool_allowed(&restricted, &Tool::WriteFile("a".into(), "x".into())));
+        assert!(!tool_allowed(
+            &restricted,
+            &Tool::WriteFile("a".into(), "x".into())
+        ));
     }
 }
