@@ -9,7 +9,7 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap, Widget};
 use ratatui::{Frame, Terminal};
@@ -65,14 +65,21 @@ impl TuiRenderer {
     pub fn push_user(&mut self, text: &str) {
         self.close_thinking();
         self.tool_header = None;
+        self.scrollback.push(padding_line());
         for line in text.split('\n') {
             if line.is_empty() {
                 self.scrollback.push(Line::default());
             } else {
-                self.scrollback
-                    .push(Line::from(Span::styled(strip_vs16(line), Style::default().bold())));
+                self.scrollback.push(Line::from(Span::styled(
+                    strip_vs16(line),
+                    Style::default()
+                        .bold()
+                        .fg(Color::White)
+                        .bg(Color::DarkGray),
+                )));
             }
         }
+        self.scrollback.push(padding_line());
     }
 
     pub fn on_event(&mut self, event: AgentEvent) {
@@ -83,8 +90,7 @@ impl TuiRenderer {
                     self.push_answer_text(&remaining);
                     self.turn_answer.push_str(&strip_vs16(&remaining));
                 }
-                self.flush_answer();
-                self.render_answer_markdown();
+                self.end_answer_block();
                 self.gate = AnswerGate::new();
             }
             AgentEvent::Tokens(chunk) => {
@@ -93,6 +99,9 @@ impl TuiRenderer {
                 if mode == ThinkingMode::Live
                     && let Some(thinking) = &chunk.thinking
                 {
+                    if self.thinking.is_empty() && !thinking.is_empty() {
+                        self.scrollback.push(padding_line());
+                    }
                     self.thinking.push_str(thinking);
                 }
                 if let Some(text) = text {
@@ -102,7 +111,7 @@ impl TuiRenderer {
                 }
             }
             AgentEvent::ToolStarted { header, body } => {
-                self.flush_answer();
+                self.end_answer_block();
                 self.close_thinking();
                 self.tool_header = Some(header.clone());
                 self.scrollback
@@ -131,8 +140,16 @@ impl TuiRenderer {
             self.push_answer_text(&remaining);
             self.turn_answer.push_str(&strip_vs16(&remaining));
         }
+        self.end_answer_block();
+    }
+
+    fn end_answer_block(&mut self) {
         self.flush_answer();
+        let had_answer = self.answer_start.is_some();
         self.render_answer_markdown();
+        if had_answer {
+            self.scrollback.push(padding_line());
+        }
     }
 
     fn close_thinking(&mut self) {
@@ -149,6 +166,7 @@ impl TuiRenderer {
                     .push(Line::from(Span::styled(strip_vs16(line), Style::default().dim())));
             }
         }
+        self.scrollback.push(padding_line());
     }
 
     fn push_answer_text(&mut self, text: &str) {
@@ -156,6 +174,9 @@ impl TuiRenderer {
         while let Some(index) = self.answer.find('\n') {
             let line = strip_vs16(&self.answer[..index]);
             self.answer.drain(..=index);
+            if self.answer_start.is_none() {
+                self.scrollback.push(padding_line());
+            }
             self.mark_answer_start();
             if line.is_empty() {
                 self.scrollback.push(Line::default());
@@ -170,6 +191,9 @@ impl TuiRenderer {
             return;
         }
         let line = strip_vs16(&mem::take(&mut self.answer));
+        if self.answer_start.is_none() {
+            self.scrollback.push(padding_line());
+        }
         self.mark_answer_start();
         self.scrollback.push(Line::from(line));
     }
@@ -240,6 +264,13 @@ impl TuiRenderer {
             }
         }
     }
+}
+
+fn padding_line() -> Line<'static> {
+    Line::from(Span::styled(
+        " ".to_string(),
+        Style::default().fg(Color::Red),
+    ))
 }
 
 fn strip_vs16(text: &str) -> String {
@@ -679,8 +710,12 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("Let me think. ".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("42".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -696,8 +731,12 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("reasoning ".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("answer".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -715,7 +754,9 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("thinking".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
                 ("⚙ bash".into(), Modifier::BOLD),
                 ("  ls".into(), Modifier::DIM),
             ]
@@ -736,9 +777,15 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("glued".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("narration".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("next round".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -756,10 +803,18 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("first ".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("narration".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("second ".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("answer".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -872,7 +927,11 @@ mod test {
 
         assert_eq!(
             described,
-            vec![("Hello world".into(), Modifier::empty())]
+            vec![
+                (" ".into(), Modifier::empty()),
+                ("Hello world".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
+            ]
         );
     }
 
@@ -883,8 +942,10 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("first".into(), Modifier::empty()),
                 ("second".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -898,8 +959,25 @@ mod test {
         let described = describe(renderer.scrollback());
         assert_eq!(
             described,
-            vec![("do the thing".into(), Modifier::BOLD)]
+            vec![
+                (" ".into(), Modifier::empty()),
+                ("do the thing".into(), Modifier::BOLD),
+                (" ".into(), Modifier::empty()),
+            ]
         );
+    }
+
+    #[test]
+    fn user_block_gets_gray_background_and_white_text() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_user("do the thing");
+        renderer.finish();
+
+        let line = &renderer.scrollback()[1];
+        let span = &line.spans[0];
+        assert_eq!(span.style.fg, Some(Color::White));
+        assert_eq!(span.style.bg, Some(Color::DarkGray));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -912,7 +990,7 @@ mod test {
         }
         state.renderer.finish();
 
-        assert_eq!(state.max_scroll(), 1);
+        assert_eq!(state.max_scroll(), 3);
     }
 
 
@@ -965,12 +1043,15 @@ mod test {
         state.scroll = state.max_scroll();
 
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
-        assert_eq!(state.scroll, 0);
+        assert_eq!(state.scroll, 2);
         assert!(!state.following);
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageUp)), KeyAction::None);
         assert_eq!(state.scroll, 0);
         assert_eq!(handle_key(&mut state, &key(KeyCode::PageDown)), KeyAction::None);
         assert_eq!(state.scroll, 10);
+        assert!(!state.following);
+        assert_eq!(handle_key(&mut state, &key(KeyCode::PageDown)), KeyAction::None);
+        assert_eq!(state.scroll, 12);
         assert!(state.following);
     }
 
@@ -1002,10 +1083,10 @@ mod test {
             AgentEvent::CompletionStarted,
         ]);
 
-        assert_eq!(rendered.len(), 1);
-        assert_eq!(rendered[0].spans.len(), 3);
-        assert_eq!(rendered[0].spans[1].content, "bold");
-        assert!(rendered[0].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered.len(), 3);
+        assert_eq!(rendered[1].spans.len(), 3);
+        assert_eq!(rendered[1].spans[1].content, "bold");
+        assert!(rendered[1].spans[1].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1015,10 +1096,10 @@ mod test {
             AgentEvent::CompletionStarted,
         ]);
 
-        assert_eq!(rendered.len(), 3);
-        assert!(rendered[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(rendered[0].style.add_modifier.contains(Modifier::UNDERLINED));
-        assert!(rendered[2].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered.len(), 5);
+        assert!(rendered[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(rendered[1].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(rendered[3].spans[0].style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
@@ -1028,8 +1109,12 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("**not** rendered".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("done".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -1058,11 +1143,11 @@ mod test {
             text("second **b**"),
         ]);
 
-        assert_eq!(rendered.len(), 2);
-        assert!(rendered[0].spans[1].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(rendered[0].spans[1].content, "a");
+        assert_eq!(rendered.len(), 6);
         assert!(rendered[1].spans[1].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(rendered[1].spans[1].content, "b");
+        assert_eq!(rendered[1].spans[1].content, "a");
+        assert!(rendered[4].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(rendered[4].spans[1].content, "b");
     }
 
     #[test]
