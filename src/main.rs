@@ -29,33 +29,22 @@ struct Cli {
     #[arg(long, default_value_t = 24000)]
     context_window: u64,
 
-    #[arg(long, value_enum, default_value = "auto")]
-    thinking: Thinking,
+    #[arg(long, value_enum, default_value_t = ThinkingLevel::Off)]
+    thinking: ThinkingLevel,
 
     #[arg(long, default_value_t = 300)]
     bash_timeout: u64,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
-enum Thinking {
-    Auto,
-    On,
-    Off,
-}
-
 fn build_agent(
     client: &OpenAI,
     model: &str,
-    thinking: Thinking,
+    thinking: ThinkingLevel,
     thinking_cell: Arc<ThinkingLevelCell>,
     context_window: u64,
     bash_timeout: u64,
 ) -> Agent {
-    let base = match thinking {
-        Thinking::Auto => None,
-        Thinking::On => Some(true),
-        Thinking::Off => Some(false),
-    };
+    let base = Some(thinking == ThinkingLevel::Off);
     Agent::new(
         client.clone(),
         model,
@@ -74,10 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = cli.model.clone();
 
     let client = client.clone();
-    let thinking_cell = Arc::new(ThinkingLevelCell::new(match cli.thinking {
-        Thinking::On => ThinkingLevel::Medium,
-        _ => ThinkingLevel::Off,
-    }));
+    let thinking_cell = Arc::new(ThinkingLevelCell::new(cli.thinking));
     tui::run(
         {
             let model = model.clone();

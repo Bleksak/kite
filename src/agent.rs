@@ -19,7 +19,7 @@ enum Step {
     Done(String),
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, clap::ValueEnum)]
 pub enum ThinkingLevel {
     Off,
     Low,
