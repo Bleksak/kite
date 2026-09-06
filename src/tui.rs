@@ -946,7 +946,14 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             spans.push(span);
         }
         if session.input_cursor == chars.len() {
-            spans.push(Span::styled("█".to_string(), cursor_style));
+            spans.push(
+                Span::styled(
+                    "█".to_string(),
+                    Style::default()
+                        .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
+                        .fg(Color::Rgb(0xd4, 0xd4, 0xd4)),
+                ),
+            );
         }
         Line::from(spans)
     };
@@ -2539,6 +2546,30 @@ mod test {
     }
 
     #[test]
+    fn cursor_cell_renders_inverted() {
+        let mut state = TuiState::new("model".into());
+        state.session().input = "ab".into();
+        state.session().input_cursor = 1;
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut found = false;
+        for y in 0..10 {
+            for x in 0..40 {
+                let cell = buffer.cell((x, y)).unwrap();
+                if cell.symbol() == "b" {
+                    found = true;
+                    let style = cell.style();
+                    assert_eq!(style.bg, Some(Color::Rgb(0xd4, 0xd4, 0xd4)), "cursor cell bg missing");
+                    assert_eq!(style.fg, Some(Color::Rgb(0x28, 0x28, 0x32)), "cursor cell fg missing");
+                }
+            }
+        }
+        assert!(found, "cursor char not found");
+    }
+
+    #[test]
     fn typing_inserts_at_the_cursor_and_moves_it() {
         let mut state = TuiState::new("model".into());
         for c in "hello".chars() {
@@ -3230,3 +3261,4 @@ mod test {
         )));
     }
 }
+
