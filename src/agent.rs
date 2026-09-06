@@ -357,7 +357,7 @@ impl Agent {
                     let header = tool.header();
                     let output = tool.output();
                     let (body, show_result) = match &output {
-                        ToolOutput::Before(body) => (Some(body.to_string()), false),
+                        ToolOutput::Before(body) => (Some(body.to_string()), true),
                         ToolOutput::After => (None, true),
                         ToolOutput::Hidden => (None, false),
                     };
@@ -665,10 +665,16 @@ mod test {
 
         assert_eq!(
             events,
-            vec![AgentEvent::ToolStarted {
-                header: "bash".into(),
-                body: Some("echo out".into()),
-            }]
+            vec![
+                AgentEvent::ToolStarted {
+                    header: "bash".into(),
+                    body: Some("echo out".into()),
+                },
+                AgentEvent::ToolResult {
+                    header: "bash".into(),
+                    body: "out\n".into(),
+                },
+            ]
         );
     }
 

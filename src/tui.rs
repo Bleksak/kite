@@ -40,6 +40,8 @@ pub enum BlockKind {
     User,
     Thinking,
     Answer,
+    ToolRunning,
+    ToolDone,
     Other,
 }
 
@@ -51,7 +53,7 @@ pub struct TuiRenderer {
     answer: String,
     turn_answer: String,
     answer_start: Option<usize>,
-    tool_header: Option<String>,
+    tool_blocks: std::collections::HashMap<String, (usize, usize)>,
 }
 
 impl TuiRenderer {
@@ -64,7 +66,7 @@ impl TuiRenderer {
             answer: String::new(),
             turn_answer: String::new(),
             answer_start: None,
-            tool_header: None,
+            tool_blocks: std::collections::HashMap::new(),
         }
     }
 
@@ -83,7 +85,6 @@ impl TuiRenderer {
 
     pub fn push_user(&mut self, text: &str) {
         self.close_thinking();
-        self.tool_header = None;
         self.push_line(padding_line(), BlockKind::User);
         for line in text.trim_end_matches('\n').split('\n') {
             if line.is_empty() {
@@ -115,7 +116,6 @@ impl TuiRenderer {
                 self.gate = AnswerGate::new();
             }
             AgentEvent::Tokens(chunk) => {
-                self.tool_header = None;
                 let (mode, text) = self.gate.on_chunk(&chunk);
                 if mode == ThinkingMode::Live
                     && let Some(thinking) = &chunk.thinking
@@ -134,33 +134,44 @@ impl TuiRenderer {
             AgentEvent::ToolStarted { header, body } => {
                 self.end_answer_block();
                 self.close_thinking();
-                self.tool_header = Some(header.clone());
+                self.tool_blocks.insert(header.clone(), (self.scrollback.len(), self.scrollback.len()));
+                self.push_line(padding_line(), BlockKind::ToolRunning);
                 self.push_line(
                     Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())),
-                    BlockKind::Other,
+                    BlockKind::ToolRunning,
                 );
                 if let Some(body) = body {
-                    self.push_indented(&body);
+                    self.push_indented(&body, BlockKind::ToolRunning);
+                }
+                if let Some(entry) = self.tool_blocks.get_mut(&header) {
+                    entry.1 = self.scrollback.len();
                 }
             }
             AgentEvent::ToolResult { header, body } => {
                 self.flush_answer();
-                if self.tool_header.as_deref() != Some(header.as_str()) {
-                    self.tool_header = Some(header.clone());
-                    self.push_line(
-                        Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())),
-                        BlockKind::Other,
-                    );
+                match self.tool_blocks.remove(&header) {
+                    Some((start, end)) => {
+                        for block in &mut self.blocks[start..end] {
+                            if *block == BlockKind::ToolRunning {
+                                *block = BlockKind::ToolDone;
+                            }
+                        }
+                    }
+                    None => {
+                        self.push_line(
+                            Line::from(Span::styled(format!("⚙ {header}"), Style::default().bold())),
+                            BlockKind::ToolDone,
+                        );
+                    }
                 }
-                self.push_indented(&body);
-                self.tool_header = None;
+                self.push_indented(&body, BlockKind::ToolDone);
+                self.push_line(padding_line(), BlockKind::ToolDone);
             }
         }
     }
 
     pub fn finish(&mut self) {
         self.close_thinking();
-        self.tool_header = None;
         if let Some(remaining) = self.gate.finish() {
             self.push_answer_text(&remaining);
             self.turn_answer.push_str(&strip_vs16(&remaining));
@@ -293,17 +304,17 @@ impl TuiRenderer {
         self.answer_start = None;
     }
 
-    fn push_indented(&mut self, body: &str) {
+    fn push_indented(&mut self, body: &str, block: BlockKind) {
         for line in body.split('\n') {
             if line.is_empty() {
-                self.push_line(Line::default(), BlockKind::Other);
+                self.push_line(Line::default(), block);
             } else {
                 self.push_line(
                     Line::from(Span::styled(
                         format!("  {}", strip_vs16(line)),
                         Style::default().dim(),
                     )),
-                    BlockKind::Other,
+                    block,
                 );
             }
         }
@@ -551,6 +562,8 @@ fn display_lines(
             let (text_background, block_background) = match block {
                 BlockKind::User => (None, Some(Color::Rgb(128, 128, 128))),
                 BlockKind::Thinking => (None, Some(Color::Rgb(192, 192, 192))),
+                BlockKind::ToolRunning => (None, Some(Color::Rgb(64, 64, 64))),
+                BlockKind::ToolDone => (None, Some(Color::Rgb(0, 100, 0))),
                 _ => (None, None),
             };
             if text_background.is_none() && block_background.is_none() {
@@ -872,6 +885,7 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 ("thinking".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
+                (" ".into(), Modifier::empty()),
                 ("⚙ bash".into(), Modifier::BOLD),
                 ("  ls".into(), Modifier::DIM),
             ]
@@ -950,8 +964,10 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("⚙ read_file: a.txt".into(), Modifier::BOLD),
                 ("  line one".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -980,12 +996,14 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("⚙ read_file: a.txt".into(), Modifier::BOLD),
+                (" ".into(), Modifier::empty()),
                 ("⚙ read_file: b.txt".into(), Modifier::BOLD),
-                ("⚙ read_file: a.txt".into(), Modifier::BOLD),
                 ("  alpha".into(), Modifier::DIM),
-                ("⚙ read_file: b.txt".into(), Modifier::BOLD),
+                (" ".into(), Modifier::empty()),
                 ("  beta".into(), Modifier::DIM),
+                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -1166,6 +1184,81 @@ mod test {
     }
 
     #[test]
+    fn a_tool_block_turns_done_when_the_result_arrives() {
+        let mut renderer = TuiRenderer::new();
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "bash".into(),
+            body: Some("ls".into()),
+        });
+        assert!(renderer.blocks().iter().all(|b| *b == BlockKind::ToolRunning));
+        assert_eq!(renderer.blocks().len(), 3);
+
+        renderer.on_event(AgentEvent::ToolResult {
+            header: "bash".into(),
+            body: "ok".into(),
+        });
+        assert!(renderer.blocks().iter().all(|b| *b == BlockKind::ToolDone));
+        assert_eq!(renderer.blocks().len(), 5);
+    }
+
+    #[test]
+    fn an_unfinished_tool_block_stays_running() {
+        let mut renderer = TuiRenderer::new();
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "bash".into(),
+            body: None,
+        });
+        renderer.finish();
+        assert!(renderer.blocks().iter().all(|b| *b == BlockKind::ToolRunning));
+        assert_eq!(renderer.blocks().len(), 2);
+    }
+
+    #[test]
+    fn parallel_tool_blocks_each_turn_done_on_their_own_result() {
+        let mut renderer = TuiRenderer::new();
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "a".into(),
+            body: None,
+        });
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "b".into(),
+            body: None,
+        });
+        renderer.on_event(AgentEvent::ToolResult {
+            header: "a".into(),
+            body: "alpha".into(),
+        });
+        assert_eq!(renderer.blocks()[0], BlockKind::ToolDone);
+        assert_eq!(renderer.blocks()[2], BlockKind::ToolRunning);
+        renderer.on_event(AgentEvent::ToolResult {
+            header: "b".into(),
+            body: "beta".into(),
+        });
+        assert!(renderer.blocks().iter().all(|b| *b == BlockKind::ToolDone));
+    }
+
+    #[test]
+    fn display_lines_color_tool_blocks_by_state() {
+        let mut renderer = TuiRenderer::new();
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "running".into(),
+            body: None,
+        });
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "done".into(),
+            body: None,
+        });
+        renderer.on_event(AgentEvent::ToolResult {
+            header: "done".into(),
+            body: "ok".into(),
+        });
+
+        let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
+        assert_eq!(display[0].spans.last().unwrap().style.bg, Some(Color::Rgb(64, 64, 64)));
+        assert_eq!(display[3].spans.last().unwrap().style.bg, Some(Color::Rgb(0, 100, 0)));
+    }
+
+    #[test]
     fn tail_start_accounts_for_wrapped_lines() {
         let mut state = TuiState::new("model".into());
         state.viewport = 4;
@@ -1314,6 +1407,7 @@ mod test {
         assert_eq!(
             described,
             vec![
+                (" ".into(), Modifier::empty()),
                 ("⚙ bash".into(), Modifier::BOLD),
                 ("  **cmd**".into(), Modifier::DIM),
             ]
