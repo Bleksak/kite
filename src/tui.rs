@@ -435,6 +435,14 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 page_down(session, pane_width, viewport);
                 KeyAction::None
             }
+            KeyCode::Home => {
+                to_top(session);
+                KeyAction::None
+            }
+            KeyCode::End => {
+                to_bottom(session, pane_width, viewport);
+                KeyAction::None
+            }
             _ => KeyAction::None,
         };
     }
@@ -2323,6 +2331,28 @@ mod test {
             ),
             KeyAction::Quit
         );
+    }
+
+    #[test]
+    fn home_and_end_work_while_running() {
+        let mut state = TuiState::new("model".into());
+        state.session().running = true;
+        state.viewport = 2;
+        for _ in 0..3 {
+            state.session().renderer.on_event(text("x\ny\nz\nw\n"));
+        }
+        state.session().renderer.finish();
+        state.session().scroller.set_following(true);
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        state.session().scroller.end(max);
+
+        assert_eq!(handle_key(&mut state, &key(KeyCode::Home)), KeyAction::None);
+        assert_eq!(state.session().scroller.offset(), 0);
+        assert!(!state.session().scroller.following());
+        assert_eq!(handle_key(&mut state, &key(KeyCode::End)), KeyAction::None);
+        assert_eq!(state.session().scroller.offset(), max);
+        assert!(state.session().scroller.following());
     }
 
     #[test]
