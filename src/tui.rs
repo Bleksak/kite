@@ -243,7 +243,6 @@ impl TuiRenderer {
                 }
             }
         }
-        self.push_line(padding_line(), BlockKind::Thinking);
     }
 
     fn push_answer_text(&mut self, text: &str) {
@@ -943,7 +942,6 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 ("Let me think. ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
                 ("42".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
             ]
@@ -963,7 +961,6 @@ mod test {
             vec![
                 (" ".into(), Modifier::empty()),
                 ("reasoning ".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("answer".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -986,7 +983,6 @@ mod test {
             vec![
                 (" ".into(), Modifier::empty()),
                 ("thinking".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("⚙ bash".into(), Modifier::BOLD),
                 ("  ls".into(), Modifier::empty()),
@@ -1011,12 +1007,10 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 ("glued".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
                 ("narration".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("next round".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
             ]
         );
     }
@@ -1037,12 +1031,10 @@ mod test {
                 (" ".into(), Modifier::empty()),
                 ("first ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
                 ("narration".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("second ".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("answer".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -1260,7 +1252,6 @@ mod test {
             vec![
                 (" ".into(), Modifier::empty()),
                 ("Let me think.".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("42".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
@@ -1518,7 +1509,6 @@ mod test {
             vec![
                 (" ".into(), Modifier::empty()),
                 ("just thinking".into(), Modifier::empty()),
-                (" ".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
                 ("done".into(), Modifier::empty()),
                 (" ".into(), Modifier::empty()),
