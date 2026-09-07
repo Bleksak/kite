@@ -22,15 +22,17 @@
   in plan). Implement mode is not reachable via Tab — it only starts when a
   plan is approved
 - Plan gate: the plan agent calls submit_plan with a plan split into stages.
-  The prompt box header shows "plan ready (N stages)" — Enter implements Step 1,
-  typing feedback re-plans (keeping the plan's context). After each stage is
-  implemented, a review gate opens ("Step N implemented — review the
-  implementation"; still in implement mode): Enter moves to the plan review
-  ("review Step N+1"; plan mode), typing feedback re-implements the stage
-  (keeping the implementation's context). Enter at the plan review implements the
-  next stage; typing feedback re-plans the remaining stages (fresh context).
-  Escalating re-plans the remaining stages automatically and the gate opens
-  again
+  The prompt box header shows "plan ready (N stages)" — Enter opens the Step 1
+  review in a fresh context holding only Step 1's data, typing feedback re-plans
+  the whole plan (keeping the plan's context). Each step review runs in its own
+  fresh context holding only that step's data: Enter implements the step in a
+  fresh implementation context, typing feedback re-plans only that step (the
+  other stages are kept unchanged). After each stage is implemented, a review
+  gate opens ("Step N implemented — review the implementation"; still in
+  implement mode): Enter moves to the next step's review (fresh context), typing
+  feedback re-implements the stage (keeping the implementation's context).
+  Escalating re-plans the remaining stages automatically in a fresh plan context
+  and the step review gate opens again
 - C-p: open/close the plan popup — shows the viewed stage's title and tasks
   (like the background job details); ←/→ switch the viewed step, jk/PgUp/PgDn/
   wheel scroll, p/q/esc close it

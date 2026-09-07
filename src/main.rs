@@ -4,6 +4,7 @@ mod context;
 mod message;
 mod mode;
 mod paths;
+mod plan_gate;
 mod session;
 mod session_store;
 mod stream;
