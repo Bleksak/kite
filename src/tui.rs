@@ -1015,8 +1015,9 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 };
                 KeyAction::None
             }
-            KeyCode::Char('c') => {
-                let whole_file = key.modifiers.contains(KeyModifiers::SHIFT);
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                let whole_file = key.code == KeyCode::Char('C')
+                    || key.modifiers.contains(KeyModifiers::SHIFT);
                 let (lo, hi) = review_comment_range(state);
                 let sections = diff_file_sections(&state.diff_text);
                 let mut draft = String::new();
@@ -3689,6 +3690,20 @@ mod test {
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.range, None);
         assert_eq!(comment.text, "flaky");
+    }
+
+    #[test]
+    fn review_popup_uppercase_c_from_the_decoder_creates_a_file_comment() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('g'));
+        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        handle_key(
+            &mut state,
+            &TermEvent::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
+        );
+        assert!(state.diff_commenting);
+        assert!(state.diff_comment_whole_file);
     }
 
     #[test]
