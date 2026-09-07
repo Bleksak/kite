@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::io::Read as _;
+use std::io::Write as _;
 use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crossterm::ExecutableCommand;
 use crossterm::cursor;
-use crossterm::event::{self, Event as TermEvent, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -429,6 +431,12 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 }
                 KeyAction::None
             }
+            KeyCode::Enter | KeyCode::Char('j') => {
+                if !session.running {
+                    insert_newline(session);
+                }
+                KeyAction::None
+            }
             _ => KeyAction::None,
         };
     }
@@ -449,6 +457,14 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 page_down(session, pane_width, viewport);
                 KeyAction::None
             }
+            KeyCode::Up => {
+                mouse_up(session);
+                KeyAction::None
+            }
+            KeyCode::Down => {
+                mouse_down(session, pane_width, viewport);
+                KeyAction::None
+            }
             KeyCode::Home => {
                 to_top(session);
                 KeyAction::None
@@ -460,15 +476,26 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             _ => KeyAction::None,
         };
     }
+
     match key.code {
         KeyCode::Enter => {
-            if session.input.is_empty() && !session.gate {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            {
+                insert_newline(session);
+                KeyAction::None
+            } else if session.input.is_empty() && !session.gate {
                 KeyAction::None
             } else {
                 let task = mem::take(&mut session.input);
                 session.input_cursor = 0;
                 if !task.is_empty() && session.label.is_empty() {
-                    session.label = task.trim().chars().take(24).collect();
+                    session.label = task
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .map(|line| line.trim().chars().take(24).collect())
+                        .unwrap_or_default();
                 }
                 session.scroller.set_following(true);
                 KeyAction::Submit(task)
@@ -489,6 +516,22 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         }
         KeyCode::Right => {
             session.input_cursor = (session.input_cursor + 1).min(session.input.chars().count());
+            KeyAction::None
+        }
+        KeyCode::Up | KeyCode::Down => {
+            let chars: Vec<char> = session.input.chars().collect();
+            if input_visual_ranges(&chars, pane_width).len() > 1 {
+                move_cursor_visual_line(
+                    &session.input,
+                    &mut session.input_cursor,
+                    pane_width,
+                    key.code == KeyCode::Up,
+                );
+            } else if key.code == KeyCode::Up {
+                mouse_up(session);
+            } else {
+                mouse_down(session, pane_width, viewport);
+            }
             KeyAction::None
         }
         KeyCode::PageUp => {
@@ -541,6 +584,400 @@ fn word_right(input: &str, cursor: usize) -> usize {
         pos += 1;
     }
     pos
+}
+
+fn insert_newline(session: &mut Session) {
+    let mut chars: Vec<char> = session.input.chars().collect();
+    chars.insert(session.input_cursor, '\n');
+    session.input = chars.into_iter().collect();
+    session.input_cursor += 1;
+}
+
+struct InputParser {
+    pending: Vec<u8>,
+}
+
+impl InputParser {
+    fn new() -> Self {
+        Self { pending: Vec::new() }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<TermEvent> {
+        self.pending.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(event) = self.next_event() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn flush_escape(&mut self) -> Vec<TermEvent> {
+        if self.pending == [0x1Bu8] {
+            self.pending.clear();
+            vec![TermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn next_event(&mut self) -> Option<TermEvent> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        if self.pending[0] == 0x1B {
+            self.parse_escape()
+        } else {
+            self.parse_byte()
+        }
+    }
+
+    fn control_byte(&self, b: u8) -> Option<(KeyCode, KeyModifiers)> {
+        Some(match b {
+            0x0D => (KeyCode::Enter, KeyModifiers::NONE),
+            0x0A => (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            0x09 => (KeyCode::Tab, KeyModifiers::NONE),
+            0x7F => (KeyCode::Backspace, KeyModifiers::NONE),
+            0x00 => (KeyCode::Char(' '), KeyModifiers::CONTROL),
+            0x01..=0x1A => (
+                KeyCode::Char((b - 0x01 + b'a') as char),
+                KeyModifiers::CONTROL,
+            ),
+            0x1C..=0x1F => (
+                KeyCode::Char((b - 0x1C + b'4') as char),
+                KeyModifiers::CONTROL,
+            ),
+            _ => return None,
+        })
+    }
+
+    fn parse_byte(&mut self) -> Option<TermEvent> {
+        let b = self.pending[0];
+        if b >= 0x80 {
+            let len = match b & 0xF8 {
+                0xF0 => 4,
+                0xE0 => 3,
+                0xC0 => 2,
+                _ => 1,
+            };
+            if self.pending.len() < len {
+                return None;
+            }
+            let bytes = self.pending[..len].to_vec();
+            self.pending.drain(..len);
+            let c = String::from_utf8(bytes).ok()?.chars().next()?;
+            let modifiers = if c.is_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            return Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)));
+        }
+        self.pending.remove(0);
+        if let Some((code, modifiers)) = self.control_byte(b) {
+            return Some(TermEvent::Key(KeyEvent::new(code, modifiers)));
+        }
+        let c = b as char;
+        let modifiers = if c.is_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)))
+    }
+
+    fn parse_escape(&mut self) -> Option<TermEvent> {
+        if self.pending.len() == 1 {
+            return None;
+        }
+        match self.pending[1] {
+            0x1B => {
+                self.pending.drain(..2);
+                Some(TermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT)))
+            }
+            b'[' => self.parse_csi(),
+            b'O' => self.parse_ss3(),
+            c @ 0x20..=0x7E => {
+                self.pending.drain(..2);
+                let c = c as char;
+                let modifiers = if c.is_uppercase() {
+                    KeyModifiers::ALT | KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::ALT
+                };
+                Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)))
+            }
+            c @ 0x00..=0x1F => {
+                self.pending.drain(..2);
+                let (code, modifiers) = self.control_byte(c)?;
+                Some(TermEvent::Key(KeyEvent::new(code, modifiers | KeyModifiers::ALT)))
+            }
+            _ => {
+                self.pending.remove(0);
+                self.next_event()
+            }
+        }
+    }
+
+    fn parse_ss3(&mut self) -> Option<TermEvent> {
+        if self.pending.len() < 3 {
+            return None;
+        }
+        let b = self.pending[2];
+        self.pending.drain(..3);
+        Some(match b {
+            b'A' => TermEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            b'B' => TermEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            b'C' => TermEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            b'D' => TermEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            b'H' => TermEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            b'F' => TermEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            b'P'..=b'S' => TermEvent::Key(KeyEvent::new(KeyCode::F(1 + (b - b'P')), KeyModifiers::NONE)),
+            _ => return None,
+        })
+    }
+
+    fn parse_csi(&mut self) -> Option<TermEvent> {
+        if self.pending.len() > 32 {
+            self.pending.clear();
+            return None;
+        }
+        let final_idx = self.pending[2..]
+            .iter()
+            .position(|&b| (0x40..=0x7E).contains(&b))?;
+        let total = 2 + final_idx + 1;
+        if self.pending.len() < total {
+            return None;
+        }
+        let seq = String::from_utf8_lossy(&self.pending[2..total]).into_owned();
+        self.pending.drain(..total);
+        self.parse_csi_seq(&seq)
+    }
+
+    fn parse_csi_seq(&self, seq: &str) -> Option<TermEvent> {
+        let bytes = seq.as_bytes();
+        let final_byte = bytes[bytes.len() - 1];
+        let params = &seq[..seq.len() - 1];
+        match final_byte {
+            b'~' => {
+                if let Some(rest) = params.strip_prefix("27;") {
+                    let (mod_s, key_s) = rest.split_once(';')?;
+                    let modifier = mod_to_flags_xterm(mod_s.parse().ok()?);
+                    let code = codepoint_to_keycode(key_s.parse().ok()?)?;
+                    Some(TermEvent::Key(KeyEvent::new(code, modifier)))
+                } else {
+                    let n: u32 = params.parse().ok()?;
+                    let code = match n {
+                        1 | 7 => KeyCode::Home,
+                        2 => KeyCode::Insert,
+                        3 => KeyCode::Delete,
+                        4 | 8 => KeyCode::End,
+                        5 => KeyCode::PageUp,
+                        6 => KeyCode::PageDown,
+                        11..=15 => KeyCode::F((n - 10) as u8),
+                        17..=21 => KeyCode::F((n - 11) as u8),
+                        23..=26 => KeyCode::F((n - 12) as u8),
+                        28..=29 => KeyCode::F((n - 15) as u8),
+                        31..=34 => KeyCode::F((n - 17) as u8),
+                        _ => return None,
+                    };
+                    Some(TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                }
+            }
+            b'u' => {
+                if params.starts_with('?') {
+                    return None;
+                }
+                let mut parts = params.split(';');
+                let code = codepoint_to_keycode(parts.next()?.parse().ok()?)?;
+                let modifier = parts
+                    .next()
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(1);
+                Some(TermEvent::Key(KeyEvent::new(code, mod_to_flags(modifier))))
+            }
+            b'A' | b'B' | b'C' | b'D' => {
+                let code = match final_byte {
+                    b'A' => KeyCode::Up,
+                    b'B' => KeyCode::Down,
+                    b'C' => KeyCode::Right,
+                    _ => KeyCode::Left,
+                };
+                let modifier = params
+                    .split(';')
+                    .nth(1)
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(1);
+                Some(TermEvent::Key(KeyEvent::new(code, mod_to_flags_xterm(modifier))))
+            }
+            b'M' | b'm' => {
+                let button = params
+                    .trim_start_matches('<')
+                    .split(';')
+                    .next()?
+                    .parse::<u32>()
+                    .ok()?;
+                let kind = match button {
+                    64 => event::MouseEventKind::ScrollUp,
+                    65 => event::MouseEventKind::ScrollDown,
+                    _ => return None,
+                };
+                Some(TermEvent::Mouse(event::MouseEvent {
+                    kind,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn mod_to_flags(modifier: u8) -> KeyModifiers {
+    match modifier {
+        2 => KeyModifiers::SHIFT,
+        3 => KeyModifiers::ALT,
+        4 => KeyModifiers::SHIFT | KeyModifiers::ALT,
+        5 => KeyModifiers::CONTROL,
+        6 => KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        7 => KeyModifiers::ALT | KeyModifiers::CONTROL,
+        8 => KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+        _ => KeyModifiers::NONE,
+    }
+}
+
+fn mod_to_flags_xterm(modifier: u8) -> KeyModifiers {
+    match modifier {
+        2 => KeyModifiers::SHIFT,
+        3 => KeyModifiers::ALT,
+        4 => KeyModifiers::CONTROL,
+        5 => KeyModifiers::SHIFT | KeyModifiers::ALT,
+        6 => KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        7 => KeyModifiers::ALT | KeyModifiers::CONTROL,
+        8 => KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+        _ => KeyModifiers::NONE,
+    }
+}
+
+fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
+    Some(match codepoint {
+        3 | 13 | 57414 => KeyCode::Enter,
+        9 => KeyCode::Tab,
+        27 => KeyCode::Esc,
+        127 => KeyCode::Backspace,
+        32..=126 => KeyCode::Char(codepoint as u8 as char),
+        57417 => KeyCode::Left,
+        57418 => KeyCode::Right,
+        57419 => KeyCode::Up,
+        57420 => KeyCode::Down,
+        57421 => KeyCode::PageUp,
+        57422 => KeyCode::PageDown,
+        57423 => KeyCode::Home,
+        57424 => KeyCode::End,
+        57425 => KeyCode::Insert,
+        57426 => KeyCode::Delete,
+        57376..=57395 => KeyCode::F((codepoint - 57376 + 13) as u8),
+        _ => return None,
+    })
+}
+
+fn input_visual_ranges(chars: &[char], width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let len = chars.len();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i <= len {
+        let end = (i..len).find(|&j| chars[j] == '\n').unwrap_or(len);
+        let mut start = i;
+        loop {
+            let take = (start + width).min(end);
+            ranges.push((start, take - start));
+            if take == end {
+                break;
+            }
+            start = take;
+        }
+        i = end + 1;
+    }
+    ranges
+}
+
+fn input_box_lines(input: &str, width: usize) -> usize {
+    let chars: Vec<char> = input.chars().collect();
+    input_visual_ranges(&chars, width).len().clamp(1, 16)
+}
+
+fn input_visual_lines(input: &str, cursor: usize, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let cursor_style = Style::default()
+        .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
+        .fg(Color::Rgb(0x28, 0x28, 0x32));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut i = 0;
+    while i <= len {
+        let end = (i..len).find(|&j| chars[j] == '\n').unwrap_or(len);
+        let mut start = i;
+        loop {
+            let take = (start + width).min(end);
+            let count = take - start;
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for gi in start..take {
+                let span = if gi == cursor {
+                    Span::styled(chars[gi].to_string(), cursor_style)
+                } else {
+                    Span::raw(chars[gi].to_string())
+                };
+                spans.push(span);
+            }
+            let full = count == width;
+            let newline_marker = take == end && cursor == end && end < len;
+            let trailing_block = cursor == len && end == len && take == end;
+            if (newline_marker || trailing_block) && full && count > 0 {
+                if let Some(span) = spans.last_mut() {
+                    *span = Span::styled(span.content.to_string(), cursor_style);
+                }
+            } else if newline_marker {
+                spans.push(Span::styled("⏎".to_string(), cursor_style));
+            } else if trailing_block {
+                spans.push(Span::styled(
+                    "█".to_string(),
+                    Style::default()
+                        .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
+                        .fg(Color::Rgb(0xd4, 0xd4, 0xd4)),
+                ));
+            }
+            lines.push(Line::from(spans));
+            if take == end {
+                break;
+            }
+            start = take;
+        }
+        i = end + 1;
+    }
+    lines
+}
+
+fn move_cursor_visual_line(input: &str, cursor: &mut usize, width: usize, up: bool) {
+    let chars: Vec<char> = input.chars().collect();
+    let ranges = input_visual_ranges(&chars, width);
+    let cur = ranges
+        .iter()
+        .position(|(start, count)| *cursor >= *start && *cursor <= start + count)
+        .unwrap_or(0);
+    let target = if up {
+        cur.saturating_sub(1)
+    } else {
+        (cur + 1).min(ranges.len() - 1)
+    };
+    if target == cur {
+        return;
+    }
+    let (cur_start, _) = ranges[cur];
+    let (target_start, target_count) = ranges[target];
+    let col = (*cursor - cur_start).min(target_count);
+    *cursor = target_start + col;
 }
 
 fn page_up(session: &mut Session) {
@@ -650,12 +1087,13 @@ impl Widget for Fill {
 
 pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
+    let input_lines = input_box_lines(&state.sessions[state.active].input, state.pane_width);
     let chunks = Layout::new(
         Direction::Vertical,
         [
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(2 + input_lines as u16),
         ],
     )
     .split(area);
@@ -933,33 +1371,19 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         }
     }
 
-    let input_line = if session.running {
-        Line::from(Span::styled("working…".to_string(), Style::default().dim()))
+    let input = if session.running {
+        Paragraph::new(Line::from(Span::styled(
+            "working…".to_string(),
+            Style::default().dim(),
+        )))
     } else if let Some(error) = &session.error {
-        Line::from(Span::styled(error.clone(), Style::default().red()))
+        Paragraph::new(Line::from(Span::styled(error.clone(), Style::default().red())))
     } else {
-        let cursor_style = Style::default()
-            .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
-            .fg(Color::Rgb(0x28, 0x28, 0x32));
-        let chars: Vec<char> = session.input.chars().collect();
-        let mut spans = vec![Span::styled("> ".to_string(), Style::default().bold())];
-        for (index, ch) in chars.iter().enumerate() {
-            let span = if index == session.input_cursor {
-                Span::styled(ch.to_string(), cursor_style)
-            } else {
-                Span::raw(ch.to_string())
-            };
-            spans.push(span);
-        }
-        if session.input_cursor == chars.len() {
-            spans.push(Span::styled(
-                "█".to_string(),
-                Style::default()
-                    .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
-                    .fg(Color::Rgb(0xd4, 0xd4, 0xd4)),
-            ));
-        }
-        Line::from(spans)
+        Paragraph::new(input_visual_lines(
+            &session.input,
+            session.input_cursor,
+            state.pane_width,
+        ))
     };
     let shared = *state.mode.lock().unwrap();
     let effective = session.stage.unwrap_or(shared);
@@ -987,7 +1411,9 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         ))
     };
     frame.render_widget(
-        Paragraph::new(input_line).block(Block::default().borders(Borders::ALL).title(mode_title)),
+        input
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(mode_title)),
         chunks[2],
     );
 }
@@ -1177,10 +1603,14 @@ pub async fn run(
     std::io::stdout().execute(cursor::Hide)?;
     terminal::enable_raw_mode()?;
     std::io::stdout().execute(event::EnableMouseCapture)?;
+    std::io::stdout().write_all(b"\x1b[>7u\x1b[?u\x1b[c")?;
+    std::io::stdout().write_all(b"\x1b[>4;2m")?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = std::io::stdout().execute(terminal::LeaveAlternateScreen);
         let _ = std::io::stdout().execute(cursor::Show);
+        let _ = std::io::stdout().execute(event::PopKeyboardEnhancementFlags);
+        let _ = std::io::stdout().write_all(b"\x1b[>4;0m");
         let _ = std::io::stdout().execute(event::DisableMouseCapture);
         default_hook(info);
     }));
@@ -1190,9 +1620,39 @@ pub async fn run(
     terminal.clear()?;
 
     std::thread::spawn(move || {
-        while let Ok(term_event) = event::read() {
-            if key_tx.send(term_event).is_err() {
-                break;
+        let (raw_tx, raw_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 512];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        if raw_tx.send(buf[..n].to_vec()).is_err() {
+                            return;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        });
+        let mut parser = InputParser::new();
+        loop {
+            match raw_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(chunk) => {
+                    for term_event in parser.feed(&chunk) {
+                        if key_tx.send(term_event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    for term_event in parser.flush_escape() {
+                        if key_tx.send(term_event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(_) => return,
             }
         }
     });
@@ -1201,14 +1661,16 @@ pub async fn run(
         TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
             .with_thinking(thinking)
             .with_mode(mode);
-    state.viewport = terminal
-        .size()
-        .map(|size| size.height.saturating_sub(8) as usize)
-        .unwrap_or(22);
-    state.pane_width = terminal
-        .size()
+    let size = terminal.size();
+    state.pane_width = size
+        .as_ref()
         .map(|size| size.width.saturating_sub(2) as usize)
         .unwrap_or(118);
+    let input = state.session().input.clone();
+    let input_lines = input_box_lines(&input, state.pane_width);
+    state.viewport = size
+        .map(|size| size.height.saturating_sub(7 + input_lines as u16) as usize)
+        .unwrap_or(22);
     let mut inputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<String>> = HashMap::new();
     let mut handles: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
 
@@ -1350,14 +1812,16 @@ pub async fn run(
                 }
             }
         }
-        state.viewport = terminal
-            .size()
-            .map(|size| size.height.saturating_sub(8) as usize)
-            .unwrap_or(22);
-        state.pane_width = terminal
-            .size()
+        let size = terminal.size();
+        state.pane_width = size
+            .as_ref()
             .map(|size| size.width.saturating_sub(2) as usize)
             .unwrap_or(118);
+        let input = state.session().input.clone();
+        let input_lines = input_box_lines(&input, state.pane_width);
+        state.viewport = size
+            .map(|size| size.height.saturating_sub(7 + input_lines as u16) as usize)
+            .unwrap_or(22);
         for session in &mut state.sessions {
             if session.scroller.following() {
                 let max = session.max_scroll(state.pane_width, state.viewport);
@@ -1387,6 +1851,8 @@ pub async fn run(
     for handle in handles.values() {
         handle.abort();
     }
+    std::io::stdout().execute(event::PopKeyboardEnhancementFlags)?;
+    std::io::stdout().write_all(b"\x1b[>4;0m")?;
     std::io::stdout().execute(event::DisableMouseCapture)?;
     std::io::stdout().execute(terminal::LeaveAlternateScreen)?;
     std::io::stdout().execute(cursor::Show)?;
@@ -2800,6 +3266,246 @@ mod test {
     }
 
     #[test]
+    fn ctrl_enter_inserts_a_newline_at_the_cursor() {
+        let mut state = TuiState::new("model".into());
+        for c in "ab".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &ctrl_key(KeyCode::Enter));
+        assert_eq!(state.session().input, "ab\n");
+        assert_eq!(state.session().input_cursor, 3);
+    }
+
+    #[test]
+    fn up_and_down_navigate_wrapped_visual_lines() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "a".repeat(50).into();
+        state.session().input_cursor = 50;
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input_cursor, 30);
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input_cursor, 10);
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input_cursor, 10);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input_cursor, 30);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input_cursor, 50);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input_cursor, 50);
+    }
+
+    #[test]
+    fn wrapped_single_line_input_navigates_instead_of_scrolling() {
+        let mut state = TuiState::new("model".into());
+        for i in 0..30 {
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("line {i}\n")));
+        }
+        state.session().renderer.finish();
+        state.pane_width = 20;
+        state.session().input = "a".repeat(50).into();
+        state.session().input_cursor = 50;
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        assert!(max > 0);
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().scroller.offset(), 0);
+        assert_eq!(state.session().input_cursor, 30);
+    }
+
+    #[test]
+    fn up_and_down_scroll_the_chat_with_single_line_input() {
+        let mut state = TuiState::new("model".into());
+        for i in 0..30 {
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("line {i}\n")));
+        }
+        state.session().renderer.finish();
+        state.session().input = "hello".into();
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        assert!(max > 0);
+
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().scroller.offset(), 3);
+        assert!(!state.session().scroller.following());
+
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().scroller.offset(), 0);
+    }
+
+    #[test]
+    fn up_and_down_scroll_the_chat_while_running() {
+        let mut state = TuiState::new("model".into());
+        for i in 0..30 {
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("line {i}\n")));
+        }
+        state.session().renderer.finish();
+        state.session().running = true;
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        assert!(max > 0);
+
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().scroller.offset(), 3);
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().scroller.offset(), 0);
+    }
+
+    #[test]
+    fn up_and_down_move_between_input_lines() {
+        let mut state = TuiState::new("model".into());
+        state.session().input = "hello\nworld".into();
+        state.session().input_cursor = 11;
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input_cursor, 5);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input_cursor, 11);
+        handle_key(&mut state, &key(KeyCode::Up));
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input_cursor, 5);
+        handle_key(&mut state, &key(KeyCode::Down));
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input_cursor, 11);
+    }
+
+    #[test]
+    fn up_and_down_clamp_the_column_to_the_target_line() {
+        let mut state = TuiState::new("model".into());
+        state.session().input = "hi\nhello".into();
+        state.session().input_cursor = 5;
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input_cursor, 2);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input_cursor, 5);
+    }
+
+    #[test]
+    fn input_box_lines_grows_with_wrapped_and_multiline_input() {
+        assert_eq!(input_box_lines("", 80), 1);
+        assert_eq!(input_box_lines("hello", 80), 1);
+        assert_eq!(input_box_lines("hello\nworld", 80), 2);
+        assert_eq!(input_box_lines(&"a".repeat(100), 80), 2);
+        assert_eq!(input_box_lines(&"a".repeat(300), 80), 4);
+        assert_eq!(input_box_lines(&"a".repeat(1000), 80), 13);
+        assert_eq!(input_box_lines(&format!("\n{}", "a".repeat(20)), 20), 2);
+        assert_eq!(input_box_lines(&format!("\n{}", "a".repeat(21)), 20), 3);
+    }
+
+    #[test]
+    fn wide_input_wraps_onto_extra_input_lines() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "a".repeat(50).into();
+        let backend = TestBackend::new(22, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((1, 8)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((20, 8)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((1, 9)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((20, 9)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((1, 10)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((10, 10)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((11, 10)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn cursor_on_a_newline_renders_a_visible_marker() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "ab\ncd".into();
+        state.session().input_cursor = 2;
+        let backend = TestBackend::new(22, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut found = false;
+        for y in 0..12 {
+            for x in 0..22 {
+                if buffer.cell((x, y)).unwrap().symbol() == "⏎" {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "newline cursor marker not found");
+    }
+
+    #[test]
+    fn multiline_input_grows_the_box_and_shrinks_the_chat() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "a".repeat(300).into();
+        let backend = TestBackend::new(22, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, 23)).unwrap().symbol(), "┌");
+        assert_eq!(buffer.cell((0, 39)).unwrap().symbol(), "└");
+        assert_eq!(buffer.cell((0, 3)).unwrap().symbol(), "┌");
+        assert_eq!(buffer.cell((0, 22)).unwrap().symbol(), "└");
+    }
+
+    #[test]
+    fn cursor_at_end_of_full_line_stays_visible() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "a".repeat(20).into();
+        state.session().input_cursor = 20;
+        let backend = TestBackend::new(22, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for x in 1..=20 {
+            assert_eq!(buffer.cell((x, 10)).unwrap().symbol(), "a");
+        }
+        let style = buffer.cell((20, 10)).unwrap().style();
+        assert_eq!(style.bg, Some(Color::Rgb(0xd4, 0xd4, 0xd4)));
+        assert_eq!(style.fg, Some(Color::Rgb(0x28, 0x28, 0x32)));
+    }
+
+    #[test]
+    fn cursor_on_newline_of_full_line_stays_visible() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = format!("{}\n", "a".repeat(20));
+        state.session().input_cursor = 20;
+        let backend = TestBackend::new(22, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for x in 1..=20 {
+            assert_eq!(buffer.cell((x, 9)).unwrap().symbol(), "a");
+        }
+        let style = buffer.cell((20, 9)).unwrap().style();
+        assert_eq!(style.bg, Some(Color::Rgb(0xd4, 0xd4, 0xd4)));
+        let joined: String = (0..12)
+            .flat_map(|y| (0..22).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
+            .collect();
+        assert!(!joined.contains("⏎"));
+    }
+
+    #[test]
+    fn label_uses_the_first_nonempty_line_of_multiline_input() {
+        let mut state = TuiState::new("model".into());
+        state.session().input = "\n  second line  \n".into();
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Enter)),
+            KeyAction::Submit("\n  second line  \n".into())
+        );
+        assert_eq!(state.session().label, "second line");
+    }
+
+    #[test]
     fn enter_with_empty_input_submits_when_the_gate_is_pending() {
         let mut state = TuiState::new("model".into());
         state.session().gate = true;
@@ -3319,7 +4025,6 @@ mod test {
         assert!(joined.contains("100 prompt / 5 completion tok"));
         assert!(joined.contains("[1/1]"));
         assert!(joined.contains("hello"));
-        assert!(joined.contains(">"));
     }
 
     fn complete_request(data: &[u8]) -> Option<String> {
@@ -3459,5 +4164,129 @@ mod test {
                 .iter()
                 .any(|e| matches!(e, TuiEvent::TurnDone { .. }))
         );
+    }
+
+    fn parse(bytes: &[u8]) -> Vec<TermEvent> {
+        let mut parser = InputParser::new();
+        parser.feed(bytes)
+    }
+
+    fn parse_split(bytes: &[u8], at: usize) -> Vec<TermEvent> {
+        let mut parser = InputParser::new();
+        let mut events = parser.feed(&bytes[..at]);
+        events.extend(parser.feed(&bytes[at..]));
+        events
+    }
+
+    fn key_parts(event: &TermEvent) -> (KeyCode, KeyModifiers) {
+        match event {
+            TermEvent::Key(k) => (k.code, k.modifiers),
+            _ => panic!("expected key"),
+        }
+    }
+
+    #[test]
+    fn parser_modify_other_keys_shift_enter() {
+        let events = parse(b"\x1b[27;2;13~");
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Enter, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn parser_modify_other_keys_ctrl_backspace() {
+        let events = parse(b"\x1b[27;4;127~");
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Backspace, KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn parser_modify_other_keys_shift_letter() {
+        let events = parse(b"\x1b[27;2;97~");
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Char('a'), KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn parser_kitty_shift_enter() {
+        let events = parse(b"\x1b[13;2u");
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Enter, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn parser_kitty_ctrl_c() {
+        let events = parse(b"\x1b[99;5u");
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn parser_plain_enter_and_lf() {
+        let events = parse(b"\r\n");
+        assert_eq!(events.len(), 2);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(key_parts(&events[1]), (KeyCode::Char('j'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn parser_ctrl_byte() {
+        let events = parse(b"\x03");
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn parser_arrow_with_modifier() {
+        let events = parse(b"\x1b[1;2A");
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Up, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn parser_alt_enter() {
+        let events = parse(b"\x1b\r");
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Enter, KeyModifiers::ALT));
+    }
+
+    #[test]
+    fn parser_split_sequence() {
+        let events = parse_split(b"\x1b[27;2;13~", 3);
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Enter, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn parser_bare_esc_flush() {
+        let mut parser = InputParser::new();
+        assert!(parser.feed(b"\x1b").is_empty());
+        let events = parser.flush_escape();
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn parser_protocol_responses_dropped() {
+        assert!(parse(b"\x1b[?1;2;4c\x1b[?7u").is_empty());
+    }
+
+    #[test]
+    fn parser_mouse_scroll() {
+        let events = parse(b"\x1b[<64;1;1M");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            TermEvent::Mouse(event::MouseEvent {
+                kind: event::MouseEventKind::ScrollUp,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parser_utf8_char() {
+        let events = parse("é".as_bytes());
+        assert_eq!(events.len(), 1);
+        assert_eq!(key_parts(&events[0]), (KeyCode::Char('é'), KeyModifiers::NONE));
     }
 }
