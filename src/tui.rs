@@ -213,8 +213,54 @@ fn task_output_scroll_max(state: &TuiState) -> usize {
     total.saturating_sub(visible)
 }
 
-fn plan_scroll_max(state: &TuiState) -> usize {
-    let Some((stages, _)) = state.sessions.get(state.active).and_then(|s| s.plan.clone()) else {
+const PANEL_BASE: Color = Color::Rgb(0xc0, 0xc0, 0xd0);
+
+fn render_panel<'a>(
+    frame: &mut Frame,
+    rect: Rect,
+    title: String,
+    content: Vec<Line<'a>>,
+    wrap: bool,
+) {
+    let styled: Vec<Line<'a>> = content
+        .into_iter()
+        .map(|line| {
+            let spans: Vec<Span<'a>> = line
+                .spans
+                .iter()
+                .map(|span| {
+                    let style = if span.style.fg.is_none() {
+                        span.style.patch(Style::default().fg(PANEL_BASE))
+                    } else {
+                        span.style
+                    };
+                    Span {
+                        content: span.content.clone(),
+                        style,
+                    }
+                })
+                .collect();
+            Line {
+                style: line.style,
+                alignment: line.alignment,
+                spans,
+            }
+        })
+        .collect();
+    let mut paragraph = Paragraph::new(styled);
+    if wrap {
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
+        .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
+        .title(title);
+    frame.render_widget(Fill, rect);
+    frame.render_widget(paragraph.block(block), rect);
+}
+
+fn plan_scroll_max(state: &TuiState) -> usize {    let Some((stages, _)) = state.sessions.get(state.active).and_then(|s| s.plan.clone()) else {
         return 0;
     };
     let Some(stage) = stages.get(state.plan_view) else {
@@ -1713,21 +1759,16 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         } else {
             format!(" sessions · {}", state.picker_query)
         };
-        let picker = Paragraph::new(
+        render_panel(
+            frame,
+            Rect::new(x, y, width, height),
+            format!(" {} ", title),
             lines
                 .into_iter()
                 .chain(std::iter::once(hint))
                 .collect::<Vec<Line>>(),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
-                .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
-                .title(format!(" {} ", title)),
+            false,
         );
-        frame.render_widget(Fill, Rect::new(x, y, width, height));
-        frame.render_widget(picker, Rect::new(x, y, width, height));
     }
 
     if state.tasks_open && state.task_output_id.is_none() {
@@ -1780,21 +1821,16 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             " jk · x kill · q close",
             Style::default().fg(Color::Rgb(102, 102, 102)),
         ));
-        let tasks_box = Paragraph::new(
+        render_panel(
+            frame,
+            Rect::new(x, y, width, height),
+            " background tasks ".to_string(),
             lines
                 .into_iter()
                 .chain(std::iter::once(hint))
                 .collect::<Vec<Line>>(),
-        )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
-                .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
-                .title(" background tasks ".to_string()),
+            false,
         );
-        frame.render_widget(Fill, Rect::new(x, y, width, height));
-        frame.render_widget(tasks_box, Rect::new(x, y, width, height));
     }
 
     if state.plan_open {
@@ -1843,17 +1879,13 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         let height = chunks[1].height;
         let x = chunks[1].x;
         let y = chunks[1].y;
-        let plan_box = Paragraph::new(all[start..].iter().take(visible).cloned().collect::<Vec<Line>>())
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
-                    .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
-                    .title(format!(" plan {title_suffix} ")),
-            );
-        frame.render_widget(Fill, Rect::new(x, y, width, height));
-        frame.render_widget(plan_box, Rect::new(x, y, width, height));
+        render_panel(
+            frame,
+            Rect::new(x, y, width, height),
+            format!(" plan {title_suffix} "),
+            all[start..].iter().take(visible).cloned().collect::<Vec<Line>>(),
+            true,
+        );
     }
 
     if let Some(id) = &state.task_output_id {
@@ -1907,21 +1939,16 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                 " jk scroll · q close · C-q close all",
                 Style::default().fg(Color::Rgb(102, 102, 102)),
             ));
-            let output_box = Paragraph::new(
-                body.into_iter()
+            render_panel(
+                frame,
+                Rect::new(x, y, width, height),
+                format!(" task {} output ", task.id),
+                body
+                    .into_iter()
                     .chain(std::iter::once(hint))
                     .collect::<Vec<Line>>(),
-            )
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
-                    .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
-                    .title(format!(" task {} output ", task.id)),
+                true,
             );
-            frame.render_widget(Fill, Rect::new(x, y, width, height));
-            frame.render_widget(output_box, Rect::new(x, y, width, height));
         }
     }
 
