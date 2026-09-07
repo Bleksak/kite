@@ -679,10 +679,113 @@ fn insert_newline(session: &mut Session) {
     session.input_cursor += 1;
 }
 
+struct ByteSource {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    pos: usize,
+}
+
+impl ByteSource {
+    fn new(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn next_byte(&mut self, timeout: Option<std::time::Duration>) -> Option<u8> {
+        loop {
+            if self.pos < self.chunk.len() {
+                let b = self.chunk[self.pos];
+                self.pos += 1;
+                return Some(b);
+            }
+            let chunk = match timeout {
+                Some(timeout) => match self.rx.recv_timeout(timeout) {
+                    Ok(chunk) => chunk,
+                    Err(_) => return None,
+                },
+                None => match self.rx.recv() {
+                    Ok(chunk) => chunk,
+                    Err(_) => return None,
+                },
+            };
+            self.chunk = chunk;
+            self.pos = 0;
+        }
+    }
+}
+
+struct ByteIter<'a> {
+    source: &'a mut ByteSource,
+    timeout: Option<std::time::Duration>,
+}
+
+impl<'a> ByteIter<'a> {
+    fn new(
+        source: &'a mut ByteSource,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
+        Self { source, timeout }
+    }
+}
+
+impl Iterator for ByteIter<'_> {
+    type Item = std::io::Result<u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.source.next_byte(self.timeout).map(Ok)
+    }
+}
+
+fn map_termion_key(key: termion::event::Key) -> Option<TermEvent> {
+    let (code, modifiers) = match key {
+        termion::event::Key::Char('\t') => (KeyCode::Tab, KeyModifiers::NONE),
+        termion::event::Key::Char('\n') => (KeyCode::Enter, KeyModifiers::NONE),
+        termion::event::Key::Char(c) => (KeyCode::Char(c), KeyModifiers::NONE),
+        termion::event::Key::Ctrl(c) => (KeyCode::Char(c), KeyModifiers::CONTROL),
+        termion::event::Key::Alt(c) => (KeyCode::Char(c), KeyModifiers::ALT),
+        termion::event::Key::Null => (KeyCode::Char(' '), KeyModifiers::CONTROL),
+        termion::event::Key::Backspace => (KeyCode::Backspace, KeyModifiers::NONE),
+        termion::event::Key::Esc => (KeyCode::Esc, KeyModifiers::NONE),
+        termion::event::Key::Left => (KeyCode::Left, KeyModifiers::NONE),
+        termion::event::Key::ShiftLeft => (KeyCode::Left, KeyModifiers::SHIFT),
+        termion::event::Key::AltLeft => (KeyCode::Left, KeyModifiers::ALT),
+        termion::event::Key::CtrlLeft => (KeyCode::Left, KeyModifiers::CONTROL),
+        termion::event::Key::Right => (KeyCode::Right, KeyModifiers::NONE),
+        termion::event::Key::ShiftRight => (KeyCode::Right, KeyModifiers::SHIFT),
+        termion::event::Key::AltRight => (KeyCode::Right, KeyModifiers::ALT),
+        termion::event::Key::CtrlRight => (KeyCode::Right, KeyModifiers::CONTROL),
+        termion::event::Key::Up => (KeyCode::Up, KeyModifiers::NONE),
+        termion::event::Key::ShiftUp => (KeyCode::Up, KeyModifiers::SHIFT),
+        termion::event::Key::AltUp => (KeyCode::Up, KeyModifiers::ALT),
+        termion::event::Key::CtrlUp => (KeyCode::Up, KeyModifiers::CONTROL),
+        termion::event::Key::Down => (KeyCode::Down, KeyModifiers::NONE),
+        termion::event::Key::ShiftDown => (KeyCode::Down, KeyModifiers::SHIFT),
+        termion::event::Key::AltDown => (KeyCode::Down, KeyModifiers::ALT),
+        termion::event::Key::CtrlDown => (KeyCode::Down, KeyModifiers::CONTROL),
+        termion::event::Key::Home => (KeyCode::Home, KeyModifiers::NONE),
+        termion::event::Key::CtrlHome => (KeyCode::Home, KeyModifiers::CONTROL),
+        termion::event::Key::End => (KeyCode::End, KeyModifiers::NONE),
+        termion::event::Key::CtrlEnd => (KeyCode::End, KeyModifiers::CONTROL),
+        termion::event::Key::PageUp => (KeyCode::PageUp, KeyModifiers::NONE),
+        termion::event::Key::PageDown => (KeyCode::PageDown, KeyModifiers::NONE),
+        termion::event::Key::Insert => (KeyCode::Insert, KeyModifiers::NONE),
+        termion::event::Key::Delete => (KeyCode::Delete, KeyModifiers::NONE),
+        termion::event::Key::BackTab => (KeyCode::Tab, KeyModifiers::SHIFT),
+        termion::event::Key::F(n) => (KeyCode::F(n), KeyModifiers::NONE),
+        termion::event::Key::__IsNotComplete => return None,
+    };
+    Some(TermEvent::Key(KeyEvent::new(code, modifiers)))
+}
+
+#[cfg(test)]
 struct InputParser {
     pending: Vec<u8>,
 }
 
+#[cfg(test)]
 impl InputParser {
     fn new() -> Self {
         Self { pending: Vec::new() }
@@ -914,6 +1017,7 @@ impl InputParser {
     }
 }
 
+#[cfg(test)]
 fn mod_to_flags(modifier: u8) -> KeyModifiers {
     match modifier {
         2 => KeyModifiers::SHIFT,
@@ -927,6 +1031,7 @@ fn mod_to_flags(modifier: u8) -> KeyModifiers {
     }
 }
 
+#[cfg(test)]
 fn mod_to_flags_xterm(modifier: u8) -> KeyModifiers {
     match modifier {
         2 => KeyModifiers::SHIFT,
@@ -940,6 +1045,7 @@ fn mod_to_flags_xterm(modifier: u8) -> KeyModifiers {
     }
 }
 
+#[cfg(test)]
 fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
     Some(match codepoint {
         3 | 13 | 57414 => KeyCode::Enter,
@@ -1722,24 +1828,61 @@ pub async fn run(
                 }
             }
         });
-        let mut parser = InputParser::new();
+        let mut source = ByteSource::new(raw_rx);
         loop {
-            match raw_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(chunk) => {
-                    for term_event in parser.feed(&chunk) {
+            let first = match source.next_byte(None) {
+                Some(b) => b,
+                None => continue,
+            };
+            let mut iter = ByteIter::new(
+                &mut source,
+                Some(std::time::Duration::from_millis(100)),
+            );
+            match termion::event::parse_event(first, &mut iter) {
+                Ok(termion::event::Event::Key(key)) => {
+                    if let Some(term_event) = map_termion_key(key) {
                         if key_tx.send(term_event).is_err() {
                             return;
                         }
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    for term_event in parser.flush_escape() {
-                        if key_tx.send(term_event).is_err() {
+                Ok(termion::event::Event::Mouse(mouse)) => {
+                    let kind = match mouse {
+                        termion::event::MouseEvent::Press(
+                            termion::event::MouseButton::WheelUp,
+                            _,
+                            _,
+                        ) => Some(MouseEventKind::ScrollUp),
+                        termion::event::MouseEvent::Press(
+                            termion::event::MouseButton::WheelDown,
+                            _,
+                            _,
+                        ) => Some(MouseEventKind::ScrollDown),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        if key_tx
+                            .send(TermEvent::Mouse(MouseEvent { kind }))
+                            .is_err()
+                        {
                             return;
                         }
                     }
                 }
-                Err(_) => return,
+                Ok(_) => {}
+                Err(_) => {
+                    if first == 0x1B {
+                        if key_tx
+                            .send(TermEvent::Key(KeyEvent::new(
+                                KeyCode::Esc,
+                                KeyModifiers::NONE,
+                            )))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
             }
         }
     });
