@@ -124,6 +124,7 @@ pub struct TuiState {
     pub diff_commenting: bool,
     pub diff_comment_draft: String,
     pub diff_comment_cursor: usize,
+    pub diff_comment_whole_file: bool,
     next_id: u64,
 }
 
@@ -157,6 +158,7 @@ impl TuiState {
             diff_commenting: false,
             diff_comment_draft: String::new(),
             diff_comment_cursor: 0,
+            diff_comment_whole_file: false,
             next_id: 1,
         }
     }
@@ -317,12 +319,13 @@ fn git_head_tree() -> String {
 fn format_review_comments(comments: &[ReviewComment]) -> String {
     let mut out = String::from("Review comments:");
     for comment in comments {
-        let range = if comment.start == comment.end {
-            comment.start.to_string()
+        let range = review_comment_range_label(comment);
+        let entry = if range.is_empty() {
+            format!("\n- {}: {}", comment.file, comment.text)
         } else {
-            format!("{}-{}", comment.start, comment.end)
+            format!("\n- {} {}: {}", comment.file, range, comment.text)
         };
-        out.push_str(&format!("\n- {} {}: {}", comment.file, range, comment.text));
+        out.push_str(&entry);
     }
     out
 }
@@ -387,14 +390,23 @@ fn diff_file_sections(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn review_comment_range_label(comment: &ReviewComment) -> String {
+    match &comment.range {
+        Some(range) if range.end == range.start + 1 => range.start.to_string(),
+        Some(range) => format!("{}-{}", range.start, range.end - 1),
+        None => String::new(),
+    }
+}
+
 fn review_comment_line(comment: &ReviewComment) -> Line<'static> {
-    let range = if comment.start == comment.end {
-        comment.start.to_string()
+    let label = review_comment_range_label(comment);
+    let text = if label.is_empty() {
+        format!("💬 {}", comment.text)
     } else {
-        format!("{}-{}", comment.start, comment.end)
+        format!("💬 {label}: {}", comment.text)
     };
     Line::from(Span::styled(
-        format!("💬 {range}: {}", comment.text),
+        text,
         Style::default().fg(Color::Rgb(0xd2, 0xa2, 0x6c)),
     ))
 }
@@ -432,9 +444,22 @@ fn review_file_view(state: &TuiState) -> (Vec<Line<'static>>, usize) {
             }
         }
         lines.push(line);
+        if index == 0 {
+            for (i, comment) in comments.iter().enumerate() {
+                if !placed[i] && comment.range.is_none() {
+                    lines.push(review_comment_line(comment));
+                    placed[i] = true;
+                }
+            }
+        }
         if let Some(number) = d.new.or(d.old) {
             for (i, comment) in comments.iter().enumerate() {
-                if !placed[i] && comment.end == number {
+                if !placed[i]
+                    && comment
+                        .range
+                        .as_ref()
+                        .is_some_and(|r| r.end - 1 == number)
+                {
                     lines.push(review_comment_line(comment));
                     placed[i] = true;
                 }
@@ -458,15 +483,34 @@ fn review_comment_range(state: &TuiState) -> (usize, usize) {
 
 fn commit_review_comment(state: &mut TuiState) {
     let text = state.diff_comment_draft.trim().to_string();
+    let whole_file = state.diff_comment_whole_file;
     state.diff_commenting = false;
     state.diff_comment_draft.clear();
     state.diff_comment_cursor = 0;
+    state.diff_comment_whole_file = false;
     let sections = diff_file_sections(&state.diff_text);
     let Some((path, section)) = sections.get(state.diff_file_index) else {
         return;
     };
     let text = text.trim();
     if text.is_empty() {
+        return;
+    }
+    if whole_file {
+        let session = state.session();
+        if let Some(existing) = session
+            .review_comments
+            .iter_mut()
+            .find(|c| c.file == *path && c.range.is_none())
+        {
+            existing.text = text.to_string();
+        } else {
+            session.review_comments.push(ReviewComment {
+                file: path.clone(),
+                range: None,
+                text: text.to_string(),
+            });
+        }
         return;
     }
     let numbered = crate::transcript::diff_lines_numbered(section);
@@ -484,16 +528,19 @@ fn commit_review_comment(state: &mut TuiState) {
     if let Some(existing) = session
         .review_comments
         .iter_mut()
-        .find(|c| c.file == *path && c.start <= hi && lo <= c.end)
+        .find(|c| {
+            c.file == *path
+                && c.range
+                    .as_ref()
+                    .is_some_and(|r| r.start <= hi && lo < r.end)
+        })
     {
         existing.text = text.to_string();
-        existing.start = start;
-        existing.end = end;
+        existing.range = Some(start..end + 1);
     } else {
         session.review_comments.push(ReviewComment {
             file: path.clone(),
-            start,
-            end,
+            range: Some(start..end + 1),
             text: text.to_string(),
         });
     }
@@ -969,21 +1016,32 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 KeyAction::None
             }
             KeyCode::Char('c') => {
+                let whole_file = key.modifiers.contains(KeyModifiers::SHIFT);
                 let (lo, hi) = review_comment_range(state);
                 let sections = diff_file_sections(&state.diff_text);
                 let mut draft = String::new();
                 if let Some((path, _)) = sections.get(state.diff_file_index) {
                     let session = state.session();
-                    if let Some(existing) = session
-                        .review_comments
-                        .iter()
-                        .find(|c| c.file == *path && c.start <= hi && lo <= c.end)
-                    {
+                    let existing = if whole_file {
+                        session
+                            .review_comments
+                            .iter()
+                            .find(|c| c.file == *path && c.range.is_none())
+                    } else {
+                        session.review_comments.iter().find(|c| {
+                            c.file == *path
+                                && c.range
+                                    .as_ref()
+                                    .is_some_and(|r| r.start <= hi && lo < r.end)
+                        })
+                    };
+                    if let Some(existing) = existing {
                         draft = existing.text.clone();
                     }
                 }
                 state.diff_comment_draft = draft;
                 state.diff_comment_cursor = state.diff_comment_draft.chars().count();
+                state.diff_comment_whole_file = whole_file;
                 state.diff_commenting = true;
                 KeyAction::None
             }
@@ -1006,15 +1064,23 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                     let cursor_number = numbered
                         .get(state.diff_cursor)
                         .and_then(|d| d.new.or(d.old));
-                    if let Some(number) = cursor_number {
-                        let session = state.session();
-                        if let Some(pos) = session
+                    let on_title = state.diff_cursor == 0;
+                    let session = state.session();
+                    let pos = match cursor_number {
+                        Some(number) => session.review_comments.iter().position(|c| {
+                            c.file == *path
+                                && c.range
+                                    .as_ref()
+                                    .is_some_and(|r| r.contains(&number))
+                        }),
+                        None if on_title => session
                             .review_comments
                             .iter()
-                            .position(|c| c.file == *path && c.start <= number && number <= c.end)
-                        {
-                            session.review_comments.remove(pos);
-                        }
+                            .position(|c| c.file == *path && c.range.is_none()),
+                        None => None,
+                    };
+                    if let Some(pos) = pos {
+                        session.review_comments.remove(pos);
                     }
                 }
                 KeyAction::None
@@ -1113,6 +1179,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 state.diff_commenting = false;
                 state.diff_comment_draft.clear();
                 state.diff_comment_cursor = 0;
+                state.diff_comment_whole_file = false;
             }
             state.diff_open = !state.diff_open;
             state.picker_open = false;
@@ -2399,7 +2466,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             ))
         } else {
             Line::from(Span::styled(
-                " ←→ file · jk cursor · v select · c comment · x remove comment · r reviewed · ctrl+g close",
+                " ←→ file · jk cursor · v select · c comment · shift+c file comment · x remove comment · r reviewed · ctrl+g close",
                 Style::default().fg(Color::Rgb(102, 102, 102)),
             ))
         };
@@ -2951,6 +3018,10 @@ mod test {
         TermEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
     }
 
+    fn shift(c: char) -> TermEvent {
+        TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT))
+    }
+
     #[test]
     fn ctrl_s_opens_the_picker_on_the_active_session() {
         let mut state = TuiState::new("model".into());
@@ -3330,8 +3401,7 @@ mod test {
         let comment = &state.session().review_comments[0];
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.text, "wrong");
-        assert_eq!(comment.start, 1);
-        assert_eq!(comment.end, 1);
+        assert_eq!(comment.range, Some(1..2));
     }
 
     #[test]
@@ -3352,8 +3422,7 @@ mod test {
         let comment = &state.session().review_comments[0];
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.text, "bad");
-        assert_eq!(comment.start, 1);
-        assert_eq!(comment.end, 1);
+        assert_eq!(comment.range, Some(1..2));
     }
 
     #[test]
@@ -3394,8 +3463,7 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.session().review_comments.len(), 1);
         assert_eq!(state.session().review_comments[0].text, "worse");
-        assert_eq!(state.session().review_comments[0].start, 2);
-        assert_eq!(state.session().review_comments[0].end, 2);
+        assert_eq!(state.session().review_comments[0].range, Some(2..3));
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('v')));
@@ -3414,22 +3482,19 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.session().review_comments.len(), 1);
         assert_eq!(state.session().review_comments[0].text, "range");
-        assert_eq!(state.session().review_comments[0].start, 1);
-        assert_eq!(state.session().review_comments[0].end, 3);
+        assert_eq!(state.session().review_comments[0].range, Some(1..4));
     }
 
     fn review_comments() -> Vec<ReviewComment> {
         vec![
             ReviewComment {
                 file: "a.txt".into(),
-                start: 12,
-                end: 15,
+                range: Some(12..16),
                 text: "missing index".into(),
             },
             ReviewComment {
                 file: "b.rs".into(),
-                start: 30,
-                end: 30,
+                range: Some(30..31),
                 text: "wrong code".into(),
             },
         ]
@@ -3483,8 +3548,7 @@ mod test {
         state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
         state.session().review_comments.push(ReviewComment {
             file: "a.txt".into(),
-            start: 1,
-            end: 1,
+            range: Some(1..2),
             text: "wrong".into(),
         });
 
@@ -3507,8 +3571,7 @@ mod test {
         state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         state.session().review_comments.push(ReviewComment {
             file: "a.txt".into(),
-            start: 9,
-            end: 9,
+            range: Some(9..10),
             text: "stale".into(),
         });
 
@@ -3546,8 +3609,7 @@ mod test {
         let mut state = TuiState::new("model".into());
         state.session().review_comments.push(ReviewComment {
             file: "a.txt".into(),
-            start: 1,
-            end: 1,
+            range: Some(1..2),
             text: "bad".into(),
         });
         assert!(matches!(
@@ -3571,8 +3633,7 @@ mod test {
         *state.mode.lock().unwrap() = Mode::Plan;
         state.session().review_comments.push(ReviewComment {
             file: "a.txt".into(),
-            start: 1,
-            end: 1,
+            range: Some(1..2),
             text: "bad".into(),
         });
         assert!(matches!(
@@ -3609,6 +3670,106 @@ mod test {
         assert_eq!(state.diff_comment_cursor, 6);
         handle_key(&mut state, &ctrl_key(KeyCode::Right));
         assert_eq!(state.diff_comment_cursor, 11);
+    }
+
+    #[test]
+    fn review_popup_shift_c_creates_a_file_comment() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('g'));
+        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        handle_key(&mut state, &shift('c'));
+        assert!(state.diff_commenting);
+        assert!(state.diff_comment_whole_file);
+        for c in "flaky".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Enter));
+        let comment = &state.session().review_comments[0];
+        assert_eq!(comment.file, "a.txt");
+        assert_eq!(comment.range, None);
+        assert_eq!(comment.text, "flaky");
+    }
+
+    #[test]
+    fn review_popup_shift_c_prefills_when_editing_an_existing_file_comment() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('g'));
+        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        handle_key(&mut state, &shift('c'));
+        for c in "flaky".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Enter));
+
+        handle_key(&mut state, &shift('c'));
+        assert_eq!(state.diff_comment_draft, "flaky");
+        for _ in 0..5 {
+            handle_key(&mut state, &key(KeyCode::Backspace));
+        }
+        for c in "stable".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(state.session().review_comments.len(), 1);
+        assert_eq!(state.session().review_comments[0].range, None);
+        assert_eq!(state.session().review_comments[0].text, "stable");
+    }
+
+    #[test]
+    fn review_popup_x_on_the_title_line_removes_the_file_comment() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('g'));
+        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        handle_key(&mut state, &shift('c'));
+        for c in "flaky".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Enter));
+
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        handle_key(&mut state, &key(KeyCode::Char('x')));
+        assert_eq!(state.session().review_comments.len(), 1);
+
+        handle_key(&mut state, &key(KeyCode::Char('k')));
+        handle_key(&mut state, &key(KeyCode::Char('x')));
+        assert!(state.session().review_comments.is_empty());
+    }
+
+    #[test]
+    fn review_file_view_renders_file_comments_under_the_title() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('g'));
+        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.session().review_comments.push(ReviewComment {
+            file: "a.txt".into(),
+            range: None,
+            text: "flaky".into(),
+        });
+
+        let (lines, _) = review_file_view(&state);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let idx = texts.iter().position(|t| t.starts_with("💬")).unwrap();
+        assert_eq!(texts[idx], "💬 flaky");
+        assert_eq!(texts[idx - 1], "a.txt");
+        assert_eq!(texts[idx + 1], "-   1  x");
+    }
+
+    #[test]
+    fn append_review_comments_formats_file_comments_without_a_range() {
+        let comments = vec![ReviewComment {
+            file: "a.txt".into(),
+            range: None,
+            text: "flaky".into(),
+        }];
+        let out = append_review_comments("fix", Mode::Yolo, None, &comments);
+        assert_eq!(out, "fix\n\nReview comments:\n- a.txt: flaky");
     }
 
     #[test]

@@ -43,7 +43,8 @@
   selection anchor, c comment on the selection (type, arrows/ctrl+arrows move
   the cursor like in the prompt, Enter submits, Esc cancels; comments
   reference the selected line range, render under their line, and c
-  prefills the draft when editing an existing one), r toggle the file as reviewed (✓ in the title), x remove the
+  prefills the draft when editing an existing one), shift+c comment the
+  whole file (rendered under the file name; x on the file name removes it), r toggle the file as reviewed (✓ in the title), x remove the
   comment whose line range contains the cursor line, PgUp/PgDn/wheel scroll,
   g/q/esc close it
 - C-c: quit

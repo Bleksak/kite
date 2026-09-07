@@ -47,8 +47,7 @@ impl QuestionState {
 
 pub struct ReviewComment {
     pub file: String,
-    pub start: usize,
-    pub end: usize,
+    pub range: Option<std::ops::Range<usize>>,
     pub text: String,
 }
 
