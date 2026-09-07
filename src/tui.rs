@@ -5,17 +5,105 @@ use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crossterm::ExecutableCommand;
-use crossterm::cursor;
-use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal;
-use ratatui::backend::CrosstermBackend;
+use bitflags::bitflags;
+use ratatui::backend::TermionBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
+use termion::raw::IntoRawMode;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyCode {
+    Char(char),
+    Enter,
+    Backspace,
+    Insert,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Tab,
+    Esc,
+    F(u8),
+}
+
+bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct KeyModifiers: u8 {
+        const NONE = 0;
+        const SHIFT = 1;
+        const CONTROL = 2;
+        const ALT = 4;
+        const SUPER = 8;
+    }
+}
+
+struct StdinFd(std::os::unix::io::BorrowedFd<'static>);
+
+impl std::io::Write for StdinFd {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::os::unix::io::AsFd for StdinFd {
+    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawModeRestorer(*mut Option<termion::raw::RawTerminal<StdinFd>>);
+
+impl RawModeRestorer {
+    fn restore(&self) {
+        drop(unsafe { (*self.0).take() });
+    }
+}
+
+unsafe impl Send for RawModeRestorer {}
+unsafe impl Sync for RawModeRestorer {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub code: KeyCode,
+    pub modifiers: KeyModifiers,
+}
+
+impl KeyEvent {
+    fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self { code, modifiers }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MouseEventKind {
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub kind: MouseEventKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TermEvent {
+    Key(KeyEvent),
+    Mouse(MouseEvent),
+}
 
 use crate::agent::Agent;
 use crate::context::Context;
@@ -152,29 +240,27 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         if state.task_output_id.is_some() {
             let max = task_output_scroll_max(state);
             return match mouse.kind {
-                event::MouseEventKind::ScrollUp => {
+                MouseEventKind::ScrollUp => {
                     state.task_output_scroll.toward_top(3);
                     KeyAction::None
                 }
-                event::MouseEventKind::ScrollDown => {
+                MouseEventKind::ScrollDown => {
                     state.task_output_scroll.toward_bottom(3, max);
                     KeyAction::None
                 }
-                _ => KeyAction::None,
             };
         }
         let (pane_width, viewport) = (state.pane_width, state.viewport);
         let session = state.session();
         return match mouse.kind {
-            event::MouseEventKind::ScrollUp => {
+            MouseEventKind::ScrollUp => {
                 mouse_up(session);
                 KeyAction::None
             }
-            event::MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollDown => {
                 mouse_down(session, pane_width, viewport);
                 KeyAction::None
             }
-            _ => KeyAction::None,
         };
     }
     let TermEvent::Key(key) = event else {
@@ -817,16 +903,11 @@ impl InputParser {
                     .parse::<u32>()
                     .ok()?;
                 let kind = match button {
-                    64 => event::MouseEventKind::ScrollUp,
-                    65 => event::MouseEventKind::ScrollDown,
+                    64 => MouseEventKind::ScrollUp,
+                    65 => MouseEventKind::ScrollDown,
                     _ => return None,
                 };
-                Some(TermEvent::Mouse(event::MouseEvent {
-                    kind,
-                    column: 0,
-                    row: 0,
-                    modifiers: KeyModifiers::NONE,
-                }))
+                Some(TermEvent::Mouse(MouseEvent { kind }))
             }
             _ => None,
         }
@@ -1599,23 +1680,29 @@ pub async fn run(
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
     let new_agent = std::sync::Arc::new(new_agent);
 
-    std::io::stdout().execute(terminal::EnterAlternateScreen)?;
-    std::io::stdout().execute(cursor::Hide)?;
-    terminal::enable_raw_mode()?;
-    std::io::stdout().execute(event::EnableMouseCapture)?;
+    let stdin_fd = StdinFd(unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) });
+    let raw_mode = stdin_fd.into_raw_mode()?;
+    let raw_mode: *mut Option<termion::raw::RawTerminal<StdinFd>> =
+        Box::leak(Box::new(Some(raw_mode)));
+    let restorer = RawModeRestorer(raw_mode);
+    std::io::stdout().write_all(b"\x1b[?1049h")?;
+    std::io::stdout().write_all(b"\x1b[?25l")?;
+    std::io::stdout().write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h")?;
     std::io::stdout().write_all(b"\x1b[>7u\x1b[?u\x1b[c")?;
     std::io::stdout().write_all(b"\x1b[>4;2m")?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = std::io::stdout().execute(terminal::LeaveAlternateScreen);
-        let _ = std::io::stdout().execute(cursor::Show);
-        let _ = std::io::stdout().execute(event::PopKeyboardEnhancementFlags);
+        let _ = std::io::stdout().write_all(b"\x1b[?1049l");
+        let _ = std::io::stdout().write_all(b"\x1b[?25h");
+        let _ = std::io::stdout().write_all(b"\x1b[<1u");
         let _ = std::io::stdout().write_all(b"\x1b[>4;0m");
-        let _ = std::io::stdout().execute(event::DisableMouseCapture);
+        let _ = std::io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+        let _ = std::io::stdout().flush();
+        restorer.restore();
         default_hook(info);
     }));
 
-    let backend = CrosstermBackend::new(std::io::stdout());
+    let backend = TermionBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
@@ -1851,12 +1938,13 @@ pub async fn run(
     for handle in handles.values() {
         handle.abort();
     }
-    std::io::stdout().execute(event::PopKeyboardEnhancementFlags)?;
+    std::io::stdout().write_all(b"\x1b[<1u")?;
     std::io::stdout().write_all(b"\x1b[>4;0m")?;
-    std::io::stdout().execute(event::DisableMouseCapture)?;
-    std::io::stdout().execute(terminal::LeaveAlternateScreen)?;
-    std::io::stdout().execute(cursor::Show)?;
-    terminal::disable_raw_mode()?;
+    std::io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")?;
+    std::io::stdout().write_all(b"\x1b[?1049l")?;
+    std::io::stdout().write_all(b"\x1b[?25h")?;
+    std::io::stdout().flush()?;
+    restorer.restore();
     println!(
         "session over: {} prompt / {} completion tokens",
         state.sessions[state.active].prompt_tokens, state.sessions[state.active].completion_tokens
@@ -1870,7 +1958,7 @@ mod test {
     use crate::message::Message;
     use crate::stream::ChunkTokens;
     use crate::transcript::TuiRenderer;
-    use crossterm::event::KeyEvent;
+    
     use openai_oxide::client::OpenAI;
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -1915,13 +2003,8 @@ mod test {
         TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
-    fn mouse(kind: event::MouseEventKind) -> TermEvent {
-        TermEvent::Mouse(event::MouseEvent {
-            kind,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        })
+    fn mouse(kind: MouseEventKind) -> TermEvent {
+        TermEvent::Mouse(MouseEvent { kind })
     }
 
     #[test]
@@ -1938,16 +2021,16 @@ mod test {
         let max = state.session().max_scroll(pw, vp);
         assert!(max > 0);
 
-        handle_key(&mut state, &mouse(event::MouseEventKind::ScrollDown));
+        handle_key(&mut state, &mouse(MouseEventKind::ScrollDown));
         assert_eq!(state.session().scroller.offset(), 3);
         assert!(!state.session().scroller.following());
 
-        handle_key(&mut state, &mouse(event::MouseEventKind::ScrollUp));
+        handle_key(&mut state, &mouse(MouseEventKind::ScrollUp));
         assert_eq!(state.session().scroller.offset(), 0);
         assert!(!state.session().scroller.following());
 
         for _ in 0..20 {
-            handle_key(&mut state, &mouse(event::MouseEventKind::ScrollDown));
+            handle_key(&mut state, &mouse(MouseEventKind::ScrollDown));
         }
         assert_eq!(state.session().scroller.offset(), max);
         assert!(state.session().scroller.following());
@@ -2310,9 +2393,9 @@ mod test {
         state.task_output_id = Some(id);
         state.task_output_scroll.offset = 10;
 
-        handle_key(&mut state, &mouse(event::MouseEventKind::ScrollUp));
+        handle_key(&mut state, &mouse(MouseEventKind::ScrollUp));
         assert_eq!(state.task_output_scroll.offset(), 7);
-        handle_key(&mut state, &mouse(event::MouseEventKind::ScrollDown));
+        handle_key(&mut state, &mouse(MouseEventKind::ScrollDown));
         assert_eq!(state.task_output_scroll.offset(), 10);
     }
 
@@ -4276,10 +4359,7 @@ mod test {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
-            TermEvent::Mouse(event::MouseEvent {
-                kind: event::MouseEventKind::ScrollUp,
-                ..
-            })
+            TermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp })
         ));
     }
 

@@ -4,16 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bitflags = "2"
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.29"
 futures-util = "0.3"
 openai-oxide = "0.17"
-ratatui = "0.30"
+ratatui = { version = "0.30", default-features = false, features = ["termion"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "3.2.0"
+termion = "4"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
 tui-markdown = "0.3.9"
