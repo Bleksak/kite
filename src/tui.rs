@@ -1614,12 +1614,12 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let hidden_bottom = total_lines - scroll - visible;
     if !session.running && hidden_top > 0 {
         input_block = input_block.title_top(
-            Line::from(format!(" — {} more — ", hidden_top)).right_aligned(),
+            Line::from(format!("↑ {} more", hidden_top)).right_aligned(),
         );
     }
     if !session.running && hidden_bottom > 0 {
         input_block = input_block.title_bottom(
-            Line::from(format!(" — {} more — ", hidden_bottom)).right_aligned(),
+            Line::from(format!("↓ {} more", hidden_bottom)).right_aligned(),
         );
     }
     frame.render_widget(
@@ -3704,7 +3704,7 @@ mod test {
         let top: String = (0..22)
             .map(|x| buffer.cell((x, 26)).unwrap().symbol().to_string())
             .collect();
-        assert!(top.contains("3 more"), "top border: {top}");
+        assert!(top.contains("↑ 3 more"), "top border: {top}");
         let bottom: String = (0..22)
             .map(|x| buffer.cell((x, 39)).unwrap().symbol().to_string())
             .collect();
@@ -3726,11 +3726,11 @@ mod test {
         let top: String = (0..22)
             .map(|x| buffer.cell((x, 26)).unwrap().symbol().to_string())
             .collect();
-        assert!(top.contains("2 more"), "top border: {top}");
+        assert!(top.contains("↑ 2 more"), "top border: {top}");
         let bottom: String = (0..22)
             .map(|x| buffer.cell((x, 39)).unwrap().symbol().to_string())
             .collect();
-        assert!(bottom.contains("6 more"), "bottom border: {bottom}");
+        assert!(bottom.contains("↓ 6 more"), "bottom border: {bottom}");
     }
 
     #[test]
