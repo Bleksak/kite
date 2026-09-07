@@ -210,6 +210,7 @@ fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent> {
     match event {
         termwiz::input::InputEvent::Key(key_event) => {
             let code = match key_event.key {
+                TermwizKeyCode::Char('\r') => KeyCode::Enter,
                 TermwizKeyCode::Char(c) => KeyCode::Char(c),
                 TermwizKeyCode::Enter => KeyCode::Enter,
                 TermwizKeyCode::Escape => KeyCode::Esc,
@@ -1911,7 +1912,7 @@ pub async fn run(
                     None => break,
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)) => {}
         }
         let size = terminal.size();
         state.pane_width = size
@@ -4380,5 +4381,31 @@ mod test {
         let events = parse("é".as_bytes());
         assert_eq!(events.len(), 1);
         assert_eq!(key_parts(&events[0]), (KeyCode::Char('é'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn termwiz_parsers_shift_enter() {
+        let mut parser = termwiz::input::InputParser::new();
+        let events = parser.parse_as_vec(b"\x1b[27;2;13~", false);
+        assert_eq!(events.len(), 1);
+        let termwiz::input::InputEvent::Key(key_event) = &events[0] else {
+            panic!("expected key event");
+        };
+        assert_eq!(key_event.key, termwiz::input::KeyCode::Enter);
+        assert!(key_event.modifiers.contains(termwiz::input::Modifiers::SHIFT));
+        let mapped = map_termwiz_event(events[0].clone()).unwrap();
+        assert_eq!(
+            key_parts(&mapped),
+            (KeyCode::Enter, KeyModifiers::SHIFT)
+        );
+    }
+
+    #[test]
+    fn termwiz_parsers_kitty_shift_enter() {
+        let mut parser = termwiz::input::InputParser::new();
+        let events = parser.parse_as_vec(b"\x1b[13;2u", false);
+        assert_eq!(events.len(), 1);
+        let mapped = map_termwiz_event(events[0].clone()).unwrap();
+        assert_eq!(key_parts(&mapped), (KeyCode::Enter, KeyModifiers::SHIFT));
     }
 }
