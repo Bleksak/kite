@@ -584,14 +584,6 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 page_down(session, pane_width, viewport);
                 KeyAction::None
             }
-            KeyCode::Up => {
-                mouse_up(session);
-                KeyAction::None
-            }
-            KeyCode::Down => {
-                mouse_down(session, pane_width, viewport);
-                KeyAction::None
-            }
             KeyCode::Home => {
                 to_top(session);
                 KeyAction::None
@@ -662,7 +654,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 );
             } else if key.code == KeyCode::Up {
                 match session.history_index {
-                    Some(0) => mouse_up(session),
+                    Some(0) => {}
                     Some(i) => {
                         let entry = session.history[i - 1].clone();
                         session.history_index = Some(i - 1);
@@ -677,8 +669,6 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                             session.input = entry;
                             session.input_cursor = session.input.chars().count();
                             session.error = None;
-                        } else {
-                            mouse_up(session);
                         }
                     }
                 }
@@ -697,7 +687,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                         session.input_cursor = 0;
                         session.error = None;
                     }
-                    None => mouse_down(session, pane_width, viewport),
+                    None => {}
                 }
             }
             KeyAction::None
@@ -3480,50 +3470,6 @@ mod test {
     }
 
     #[test]
-    fn up_and_down_scroll_the_chat_with_single_line_input() {
-        let mut state = TuiState::new("model".into());
-        for i in 0..30 {
-            state
-                .session()
-                .renderer
-                .on_event(text(&format!("line {i}\n")));
-        }
-        state.session().renderer.finish();
-        state.session().input = "hello".into();
-        let (pw, vp) = (state.pane_width, state.viewport);
-        let max = state.session().max_scroll(pw, vp);
-        assert!(max > 0);
-
-        handle_key(&mut state, &key(KeyCode::Down));
-        assert_eq!(state.session().scroller.offset(), 3);
-        assert!(!state.session().scroller.following());
-
-        handle_key(&mut state, &key(KeyCode::Up));
-        assert_eq!(state.session().scroller.offset(), 0);
-    }
-
-    #[test]
-    fn up_and_down_scroll_the_chat_while_running() {
-        let mut state = TuiState::new("model".into());
-        for i in 0..30 {
-            state
-                .session()
-                .renderer
-                .on_event(text(&format!("line {i}\n")));
-        }
-        state.session().renderer.finish();
-        state.session().running = true;
-        let (pw, vp) = (state.pane_width, state.viewport);
-        let max = state.session().max_scroll(pw, vp);
-        assert!(max > 0);
-
-        handle_key(&mut state, &key(KeyCode::Down));
-        assert_eq!(state.session().scroller.offset(), 3);
-        handle_key(&mut state, &key(KeyCode::Up));
-        assert_eq!(state.session().scroller.offset(), 0);
-    }
-
-    #[test]
     fn up_and_down_move_between_input_lines() {
         let mut state = TuiState::new("model".into());
         state.session().input = "hello\nworld".into();
@@ -3564,19 +3510,7 @@ mod test {
     #[test]
     fn up_walks_backwards_through_history() {
         let mut state = TuiState::new("model".into());
-        for i in 0..30 {
-            state
-                .session()
-                .renderer
-                .on_event(text(&format!("line {i}\n")));
-        }
-        state.session().renderer.finish();
         state.session().history = vec!["first".into(), "second".into(), "third".into()];
-        let (pw, vp) = (state.pane_width, state.viewport);
-        let max = state.session().max_scroll(pw, vp);
-        assert!(max > 0);
-        handle_key(&mut state, &key(KeyCode::Down));
-        assert_eq!(state.session().scroller.offset(), 3);
         handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "third");
         handle_key(&mut state, &key(KeyCode::Up));
@@ -3584,7 +3518,8 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "first");
         handle_key(&mut state, &key(KeyCode::Up));
-        assert_eq!(state.session().scroller.offset(), 0);
+        assert_eq!(state.session().input, "first");
+        assert_eq!(state.session().history_index, Some(0));
     }
 
     #[test]
@@ -3610,26 +3545,14 @@ mod test {
     #[test]
     fn typing_exits_history_mode() {
         let mut state = TuiState::new("model".into());
-        for i in 0..30 {
-            state
-                .session()
-                .renderer
-                .on_event(text(&format!("line {i}\n")));
-        }
-        state.session().renderer.finish();
         state.session().history = vec!["abc".into(), "def".into()];
-        let (pw, vp) = (state.pane_width, state.viewport);
-        let max = state.session().max_scroll(pw, vp);
-        assert!(max > 0);
-        handle_key(&mut state, &key(KeyCode::Down));
-        assert_eq!(state.session().scroller.offset(), 3);
         handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "def");
         handle_key(&mut state, &key(KeyCode::Char('x')));
         assert_eq!(state.session().input, "defx");
         assert_eq!(state.session().history_index, None);
         handle_key(&mut state, &key(KeyCode::Up));
-        assert_eq!(state.session().scroller.offset(), 0);
+        assert_eq!(state.session().input, "defx");
     }
 
     #[test]
@@ -3648,26 +3571,15 @@ mod test {
     #[test]
     fn multi_line_history_entry_navigates_history_not_visual_lines() {
         let mut state = TuiState::new("model".into());
-        for i in 0..30 {
-            state
-                .session()
-                .renderer
-                .on_event(text(&format!("line {i}\n")));
-        }
-        state.session().renderer.finish();
         state.session().history = vec!["a\nb".into(), "c".into()];
-        let (pw, vp) = (state.pane_width, state.viewport);
-        let max = state.session().max_scroll(pw, vp);
-        assert!(max > 0);
-        handle_key(&mut state, &key(KeyCode::Down));
-        assert_eq!(state.session().scroller.offset(), 3);
         handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "c");
         handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "a\nb");
         assert_eq!(state.session().history_index, Some(0));
         handle_key(&mut state, &key(KeyCode::Up));
-        assert_eq!(state.session().scroller.offset(), 0);
+        assert_eq!(state.session().input, "a\nb");
+        assert_eq!(state.session().input_cursor, 3);
     }
 
     #[test]
