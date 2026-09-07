@@ -18,7 +18,7 @@ use crate::tool::{Tool, ToolError, ToolOutput, tool_definitions};
 #[derive(Debug, PartialEq)]
 pub enum ChatOutcome {
     Answer(String),
-    Terminated { tool: String, arguments: String },
+    Terminated { tool: crate::tool::Tool },
 }
 
 #[derive(Debug, PartialEq)]
@@ -137,18 +137,16 @@ impl Agent {
                 && let Some(call) = tool_calls.iter().find(|c| c.function.name == terminator)
             {
                 self.context.messages.push(message.clone());
-                let body = match Tool::try_from(call.clone()) {
-                    Ok(Tool::SubmitPlan(stages)) => Some(crate::tool::plan_text(&stages)),
+                let tool = Tool::try_from(call.clone())?;
+                let body = match &tool {
+                    Tool::SubmitPlan(stages) => Some(crate::tool::plan_text(stages)),
                     _ => None,
                 };
                 on_event(AgentEvent::ToolStarted {
                     header: terminator.to_string(),
                     body,
                 });
-                return Ok(ChatOutcome::Terminated {
-                    tool: terminator.to_string(),
-                    arguments: call.function.arguments.clone(),
-                });
+                return Ok(ChatOutcome::Terminated { tool });
             }
 
             if let Step::Done(text) = self.handle_response(message, on_event).await {
@@ -382,18 +380,6 @@ impl Agent {
     }
 }
 
-pub fn terminator_payload(arguments: &str, field: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get(field)
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| arguments.to_string())
-}
-
 fn format_question_result(questions: &[crate::tool::Question], answers: Vec<String>) -> String {
     let mut out = String::new();
     for (i, (q, answer)) in questions.iter().zip(answers.iter()).enumerate() {
@@ -514,23 +500,6 @@ mod test {
         *shared.lock().unwrap() = Mode::Plan;
         assert_eq!(*agent.mode.lock().unwrap(), Mode::Implement);
         assert_eq!(agent.context.system_prompt, Mode::Implement.system_prompt());
-    }
-
-    #[test]
-    fn terminator_payload_extracts_the_field_and_falls_back_to_raw() {
-        assert_eq!(
-            terminator_payload(r#"{"plan":"step one"}"#, "plan"),
-            "step one"
-        );
-        assert_eq!(
-            terminator_payload(r#"{"findings":"it broke"}"#, "findings"),
-            "it broke"
-        );
-        assert_eq!(terminator_payload("not json", "plan"), "not json");
-        assert_eq!(
-            terminator_payload(r#"{"plan":"step one"}"#, "findings"),
-            r#"{"plan":"step one"}"#
-        );
     }
 
     async fn run_tool_call(
@@ -1226,8 +1195,10 @@ mod test {
         assert_eq!(
             outcome,
             ChatOutcome::Terminated {
-                tool: "submit_plan".into(),
-                arguments: "{\"stages\":[{\"title\":\"step one\",\"tasks\":[\"do it\"]}]}".into()
+                tool: Tool::SubmitPlan(vec![crate::tool::PlanStage {
+                    title: "step one".into(),
+                    tasks: vec!["do it".into()],
+                }]),
             }
         );
         assert!(events.iter().any(|event| {
