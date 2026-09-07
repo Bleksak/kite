@@ -158,6 +158,7 @@ impl TuiState {
             session.prompt_tokens = file.context.total_prompt_tokens;
             session.completion_tokens = file.context.total_completion_tokens;
             session.context = Some(file.context);
+            session.history = file.history;
             state.sessions.push(session);
             state.next_id = state.next_id.max(id + 1);
         }
@@ -661,14 +662,14 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 );
             } else if key.code == KeyCode::Up {
                 match session.history_index {
-                    Some(i) if i + 1 < session.history.len() => {
-                        let entry = session.history[i + 1].clone();
-                        session.history_index = Some(i + 1);
+                    Some(0) => mouse_up(session),
+                    Some(i) => {
+                        let entry = session.history[i - 1].clone();
+                        session.history_index = Some(i - 1);
                         session.input = entry;
                         session.input_cursor = session.input.chars().count();
                         session.error = None;
                     }
-                    Some(_) => mouse_up(session),
                     None => {
                         if session.input.is_empty() && !session.history.is_empty() {
                             let entry = session.history.last().unwrap().clone();
@@ -683,17 +684,17 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 }
             } else {
                 match session.history_index {
-                    Some(0) => {
+                    Some(i) if i + 1 < session.history.len() => {
+                        let entry = session.history[i + 1].clone();
+                        session.history_index = Some(i + 1);
+                        session.input = entry;
+                        session.input_cursor = session.input.chars().count();
+                        session.error = None;
+                    }
+                    Some(_) => {
                         session.history_index = None;
                         session.input.clear();
                         session.input_cursor = 0;
-                        session.error = None;
-                    }
-                    Some(i) => {
-                        let entry = session.history[i - 1].clone();
-                        session.history_index = Some(i - 1);
-                        session.input = entry;
-                        session.input_cursor = session.input.chars().count();
                         session.error = None;
                     }
                     None => mouse_down(session, pane_width, viewport),
@@ -1897,7 +1898,13 @@ pub async fn run(
                             session.completion_tokens = context.total_completion_tokens;
                             session.context = Some(context.clone());
                             if let Some(saved) = &session.context {
-                                session_store::save_session(Path::new(CONTEXT_DIR), id, &session.label, saved);
+                                session_store::save_session(
+                                    Path::new(CONTEXT_DIR),
+                                    id,
+                                    &session.label,
+                                    saved,
+                                    &session.history,
+                                );
                             }
                         }
                     }
@@ -1906,6 +1913,15 @@ pub async fn run(
                             session.renderer.finish();
                             session.running = false;
                             session.error = Some(message);
+                            if let Some(saved) = &session.context {
+                                session_store::save_session(
+                                    Path::new(CONTEXT_DIR),
+                                    id,
+                                    &session.label,
+                                    saved,
+                                    &session.history,
+                                );
+                            }
                         }
                     }
                     Some(TuiEvent::GatePending { session: id }) => {
@@ -1998,6 +2014,7 @@ pub async fn run(
                 session.id,
                 &session.label,
                 context,
+                &session.history,
             );
         }
     }
@@ -3545,23 +3562,7 @@ mod test {
     }
 
     #[test]
-    fn down_walks_backwards_through_history_and_blanks_at_the_end() {
-        let mut state = TuiState::new("model".into());
-        state.session().history = vec!["first".into(), "second".into(), "third".into()];
-        handle_key(&mut state, &key(KeyCode::Up));
-        assert_eq!(state.session().input, "third");
-        handle_key(&mut state, &key(KeyCode::Down));
-        assert_eq!(state.session().input, "second");
-        handle_key(&mut state, &key(KeyCode::Down));
-        assert_eq!(state.session().input, "first");
-        handle_key(&mut state, &key(KeyCode::Down));
-        assert_eq!(state.session().input, "");
-        assert_eq!(state.session().history_index, None);
-        assert_eq!(state.session().input_cursor, 0);
-    }
-
-    #[test]
-    fn up_walks_forwards_through_history() {
+    fn up_walks_backwards_through_history() {
         let mut state = TuiState::new("model".into());
         for i in 0..30 {
             state
@@ -3578,12 +3579,32 @@ mod test {
         assert_eq!(state.session().scroller.offset(), 3);
         handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "third");
-        handle_key(&mut state, &key(KeyCode::Down));
+        handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "second");
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "first");
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().scroller.offset(), 0);
+    }
+
+    #[test]
+    fn down_walks_forward_and_blanks_at_the_end() {
+        let mut state = TuiState::new("model".into());
+        state.session().history = vec!["first".into(), "second".into(), "third".into()];
         handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "third");
         handle_key(&mut state, &key(KeyCode::Up));
-        assert_eq!(state.session().scroller.offset(), 0);
+        assert_eq!(state.session().input, "second");
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "first");
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input, "second");
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input, "third");
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input, "");
+        assert_eq!(state.session().history_index, None);
+        assert_eq!(state.session().input_cursor, 0);
     }
 
     #[test]
@@ -3642,11 +3663,11 @@ mod test {
         assert_eq!(state.session().scroller.offset(), 3);
         handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "c");
-        handle_key(&mut state, &key(KeyCode::Down));
+        handle_key(&mut state, &key(KeyCode::Up));
         assert_eq!(state.session().input, "a\nb");
         assert_eq!(state.session().history_index, Some(0));
         handle_key(&mut state, &key(KeyCode::Up));
-        assert_eq!(state.session().input, "c");
+        assert_eq!(state.session().scroller.offset(), 0);
     }
 
     #[test]
@@ -4242,6 +4263,7 @@ mod test {
         let file = SessionFile {
             label: "fix login".into(),
             context: context.clone(),
+            history: vec!["hello".to_string()],
         };
 
         let state = TuiState::with_sessions("model".into(), vec![(3, file)]);
@@ -4253,6 +4275,7 @@ mod test {
         );
         assert_eq!(state.sessions[0].prompt_tokens, 50);
         assert_eq!(state.sessions[0].completion_tokens, 5);
+        assert_eq!(state.sessions[0].history, vec!["hello".to_string()]);
         assert_eq!(state.sessions[1].label, "");
         assert!(state.sessions[1].context.is_none());
         assert_eq!(state.active, 1);

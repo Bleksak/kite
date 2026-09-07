@@ -6,18 +6,27 @@ use crate::context::Context;
 pub struct SessionFile {
     pub label: String,
     pub context: Context,
+    #[serde(default)]
+    pub history: Vec<String>,
 }
 
 fn sessions_dir(kite_dir: &Path) -> std::path::PathBuf {
     kite_dir.join("sessions")
 }
 
-pub fn save_session(kite_dir: &Path, id: u64, label: &str, context: &Context) {
+pub fn save_session(
+    kite_dir: &Path,
+    id: u64,
+    label: &str,
+    context: &Context,
+    history: &[String],
+) {
     let dir = sessions_dir(kite_dir);
     if std::fs::create_dir_all(&dir).is_ok() {
         let file = SessionFile {
             label: label.to_string(),
             context: context.clone(),
+            history: history.to_vec(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&file) {
             let _ = std::fs::write(dir.join(format!("{id}.json")), json);
@@ -56,7 +65,7 @@ pub fn load_sessions(kite_dir: &Path) -> Vec<(u64, SessionFile)> {
 
 #[cfg(test)]
 mod test {
-    use super::{load_sessions, remove_session_file, save_session};
+    use super::{load_sessions, remove_session_file, save_session, SessionFile};
     use crate::context::Context;
     use crate::message::Message;
 
@@ -81,7 +90,7 @@ mod test {
         context.total_prompt_tokens = 120;
         context.total_completion_tokens = 34;
 
-        save_session(&dir, 7, "fix login", &context);
+        save_session(&dir, 7, "fix login", &context, &["hello".to_string()]);
         let loaded = load_sessions(&dir);
 
         assert_eq!(loaded.len(), 1);
@@ -90,9 +99,33 @@ mod test {
         assert_eq!(loaded[0].1.context.messages.len(), 2);
         assert_eq!(loaded[0].1.context.total_prompt_tokens, 120);
         assert_eq!(loaded[0].1.context.total_completion_tokens, 34);
+        assert_eq!(loaded[0].1.history, vec!["hello".to_string()]);
 
         remove_session_file(&dir, 7);
         assert!(load_sessions(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_sessions_defaults_history_for_old_files() {
+        let dir = temp_dir("session-old");
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut context = Context::new("sys", 100);
+        context.total_prompt_tokens = 10;
+        let file = SessionFile {
+            label: "old".into(),
+            context: context.clone(),
+            history: vec!["stale".into()],
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        let without_history = json.replace(r#","history":["stale"]"#, "");
+        std::fs::write(sessions.join("9.json"), without_history).unwrap();
+
+        let loaded = load_sessions(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].1.history.is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
