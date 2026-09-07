@@ -45,6 +45,13 @@ impl QuestionState {
     }
 }
 
+pub struct ReviewComment {
+    pub file: String,
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
 pub struct Session {
     pub id: u64,
     pub renderer: TuiRenderer,
@@ -56,6 +63,9 @@ pub struct Session {
     pub scroller: Scroller,
     pub label: String,
     pub context: Option<Context>,
+    pub review_baseline: Option<String>,
+    pub review_comments: Vec<ReviewComment>,
+    pub review_reviewed: Vec<String>,
     pub gate: bool,
     pub gate_message: String,
     pub stage: Option<Mode>,
@@ -81,6 +91,9 @@ impl Session {
             scroller: Scroller::at_tail(),
             label: String::new(),
             context: None,
+            review_baseline: None,
+            review_comments: Vec::new(),
+            review_reviewed: Vec::new(),
             gate: false,
             gate_message: String::new(),
             stage: None,

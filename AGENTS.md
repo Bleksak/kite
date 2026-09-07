@@ -36,6 +36,16 @@
 - C-p: open/close the plan popup — shows the viewed stage's title and tasks
   (like the background job details); ←/→ switch the viewed step, jk/PgUp/PgDn/
   wheel scroll, p/q/esc close it
+- C-g: open/close the review popup — shows the file changes as a git diff
+  (the stage's changes against a snapshot taken at stage start, so bash-made
+  changes are included too; in normal mode, against the last commit), one
+  file at a time: ←/→ switch files, jk move the cursor, v set/clear the
+  selection anchor, c comment on the selection (type, arrows/ctrl+arrows move
+  the cursor like in the prompt, Enter submits, Esc cancels; comments
+  reference the selected line range, render under their line, and c
+  prefills the draft when editing an existing one), r toggle the file as reviewed (✓ in the title), x remove the
+  comment whose line range contains the cursor line, PgUp/PgDn/wheel scroll,
+  g/q/esc close it
 - C-c: quit
 - Picker: C-j/↓ down, C-k/↑ up, enter select, esc cancel, C-n new session,
   C-x close the session under the cursor, C-r rename it, typing searches

@@ -479,73 +479,8 @@ impl TuiRenderer {
     }
 
     fn push_diff(&mut self, body: &str, block: BlockKind) {
-        let gray = Color::Rgb(128, 128, 128);
-
-        let mut old_line: Option<usize> = None;
-
-        let mut new_line: Option<usize> = None;
-
-        for raw in body.trim_end_matches('\n').split('\n') {
-            let line = strip_vs16(raw);
-
-            if let Some(hunk) = line.strip_prefix("@@ ") {
-                let range = hunk.strip_suffix(" @@").unwrap_or(hunk);
-
-                let mut parts = range.split(' ');
-
-                old_line = parts.next().and_then(|p| hunk_start(p, '-'));
-
-                new_line = parts.next().and_then(|p| hunk_start(p, '+'));
-
-                continue;
-            }
-
-            if line.starts_with("--- ") || line.starts_with("+++ ") {
-                continue;
-            }
-
-            let is_marker = line.starts_with('\\');
-
-            let (style, bump_old, bump_new, sign, content) = match line.chars().next() {
-                Some('+') => (Color::Rgb(0xb5, 0xbd, 0x68), false, true, "+", &line[1..]),
-
-                Some('-') => (Color::Rgb(0xcc, 0x66, 0x66), true, false, "-", &line[1..]),
-
-                _ if is_marker => (gray, false, false, "", line.as_str()),
-
-                _ => (gray, true, true, "", line.as_str()),
-            };
-
-            let number = if is_marker {
-                String::new()
-            } else if bump_old {
-                num(old_line)
-            } else if bump_new {
-                num(new_line)
-            } else {
-                String::new()
-            };
-
-            let field = if sign.is_empty() {
-                format!("{:>5}", number)
-            } else {
-                format!("{sign}{:>4}", number)
-            };
-
-            let rendered = format!("{}  {}", field, content);
-
-            self.push_line(
-                Line::from(Span::styled(rendered, Style::default().fg(style))),
-                block,
-            );
-
-            if bump_old {
-                old_line = old_line.map(|n| n + 1);
-            }
-
-            if bump_new {
-                new_line = new_line.map(|n| n + 1);
-            }
+        for line in diff_lines(body) {
+            self.push_line(line, block);
         }
     }
 }
@@ -668,6 +603,128 @@ fn num(n: Option<usize>) -> String {
 
 fn hunk_start(part: &str, sign: char) -> Option<usize> {
     part.strip_prefix(sign)?.split(',').next()?.parse().ok()
+}
+
+pub struct DiffLine {
+    pub line: Line<'static>,
+    pub old: Option<usize>,
+    pub new: Option<usize>,
+}
+
+pub fn diff_lines(body: &str) -> Vec<Line<'static>> {
+    diff_lines_numbered(body)
+        .into_iter()
+        .map(|d| d.line)
+        .collect()
+}
+
+pub fn diff_lines_numbered(body: &str) -> Vec<DiffLine> {
+    let gray = Color::Rgb(128, 128, 128);
+
+    let mut old_line: Option<usize> = None;
+
+    let mut new_line: Option<usize> = None;
+
+    let mut lines = Vec::new();
+
+    for raw in body.trim_end_matches('\n').split('\n') {
+        let line = strip_vs16(raw);
+
+        if let Some(hunk) = line.strip_prefix("@@ ") {
+            let range = hunk.strip_suffix(" @@").unwrap_or(hunk);
+
+            let mut parts = range.split(' ');
+
+            old_line = parts.next().and_then(|p| hunk_start(p, '-'));
+
+            new_line = parts.next().and_then(|p| hunk_start(p, '+'));
+
+            continue;
+        }
+
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+
+        if line.starts_with("diff --git") {
+            let rest = line.strip_prefix("diff --git ").unwrap_or("");
+            let path = rest
+                .split(' ')
+                .find(|p| p.starts_with("b/"))
+                .or_else(|| rest.split(' ').find(|p| p.starts_with("a/")))
+                .map(|p| p[2..].to_string())
+                .unwrap_or_default();
+            lines.push(DiffLine {
+                line: Line::from(Span::styled(
+                    path,
+                    Style::default().bold().fg(Color::Rgb(95, 135, 255)),
+                )),
+                old: None,
+                new: None,
+            });
+            continue;
+        }
+
+        if line.starts_with("index ") {
+            continue;
+        }
+
+        if line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line.starts_with("old mode ")
+            || line.starts_with("new mode ")
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+            || line.starts_with("similarity index ")
+            || line.starts_with("Binary files ")
+        {
+            continue;
+        }
+
+        if line.starts_with('\\') {
+            continue;
+        }
+
+        let (style, bump_old, bump_new, sign, content) = match line.chars().next() {
+            Some('+') => (Color::Rgb(0xb5, 0xbd, 0x68), false, true, "+", &line[1..]),
+
+            Some('-') => (Color::Rgb(0xcc, 0x66, 0x66), true, false, "-", &line[1..]),
+
+            _ => (gray, true, true, "", line.as_str()),
+        };
+
+        let number = if bump_old {
+            num(old_line)
+        } else if bump_new {
+            num(new_line)
+        } else {
+            String::new()
+        };
+
+        let field = if sign.is_empty() {
+            format!("{:>5}", number)
+        } else {
+            format!("{sign}{:>4}", number)
+        };
+
+        let rendered = format!("{}  {}", field, content);
+
+        lines.push(DiffLine {
+            line: Line::from(Span::styled(rendered, Style::default().fg(style))),
+            old: if bump_old { old_line } else { None },
+            new: if bump_new { new_line } else { None },
+        });
+
+        if bump_old {
+            old_line = old_line.map(|n| n + 1);
+        }
+
+        if bump_new {
+            new_line = new_line.map(|n| n + 1);
+        }
+    }
+
+    lines
 }
 
 fn has_markdown(text: &str) -> bool {
