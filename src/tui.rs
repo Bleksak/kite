@@ -1066,10 +1066,36 @@ fn input_visual_ranges(chars: &[char], width: usize) -> Vec<(usize, usize)> {
 
 fn input_box_lines(input: &str, width: usize) -> usize {
     let chars: Vec<char> = input.chars().collect();
-    input_visual_ranges(&chars, width).len().clamp(1, 16)
+    input_visual_ranges(&chars, width).len().clamp(1, 12)
 }
 
-fn input_visual_lines(input: &str, cursor: usize, width: usize) -> Vec<Line<'static>> {
+fn cursor_visual_line(chars: &[char], cursor: usize, width: usize) -> usize {
+    input_visual_ranges(chars, width)
+        .iter()
+        .position(|(start, count)| cursor >= *start && cursor <= start + count)
+        .unwrap_or(0)
+}
+
+fn clamp_input_scroll(session: &mut Session, width: usize) {
+    let chars: Vec<char> = session.input.chars().collect();
+    let total = input_visual_ranges(&chars, width).len();
+    let visible = total.min(12);
+    let max_scroll = total - visible;
+    session.input_scroll = session.input_scroll.min(max_scroll);
+    let line = cursor_visual_line(&chars, session.input_cursor, width);
+    if line < session.input_scroll {
+        session.input_scroll = line;
+    } else if line >= session.input_scroll + visible {
+        session.input_scroll = line - visible + 1;
+    }
+}
+
+fn input_visual_lines(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    offset: usize,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
     let chars: Vec<char> = input.chars().collect();
     let len = chars.len();
@@ -1077,40 +1103,44 @@ fn input_visual_lines(input: &str, cursor: usize, width: usize) -> Vec<Line<'sta
         .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
         .fg(Color::Rgb(0x28, 0x28, 0x32));
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut visual = 0;
     let mut i = 0;
-    while i <= len {
+    while i <= len && lines.len() < 12 {
         let end = (i..len).find(|&j| chars[j] == '\n').unwrap_or(len);
         let mut start = i;
         loop {
             let take = (start + width).min(end);
-            let count = take - start;
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for gi in start..take {
-                let span = if gi == cursor {
-                    Span::styled(chars[gi].to_string(), cursor_style)
-                } else {
-                    Span::raw(chars[gi].to_string())
-                };
-                spans.push(span);
-            }
-            let full = count == width;
-            let newline_marker = take == end && cursor == end && end < len;
-            let trailing_block = cursor == len && end == len && take == end;
-            if (newline_marker || trailing_block) && full && count > 0 {
-                if let Some(span) = spans.last_mut() {
-                    *span = Span::styled(span.content.to_string(), cursor_style);
+            if visual >= offset && lines.len() < 12 {
+                let count = take - start;
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                for gi in start..take {
+                    let span = if gi == cursor {
+                        Span::styled(chars[gi].to_string(), cursor_style)
+                    } else {
+                        Span::raw(chars[gi].to_string())
+                    };
+                    spans.push(span);
                 }
-            } else if newline_marker {
-                spans.push(Span::styled("⏎".to_string(), cursor_style));
-            } else if trailing_block {
-                spans.push(Span::styled(
-                    "█".to_string(),
-                    Style::default()
-                        .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
-                        .fg(Color::Rgb(0xd4, 0xd4, 0xd4)),
-                ));
+                let full = count == width;
+                let newline_marker = take == end && cursor == end && end < len;
+                let trailing_block = cursor == len && end == len && take == end;
+                if (newline_marker || trailing_block) && full && count > 0 {
+                    if let Some(span) = spans.last_mut() {
+                        *span = Span::styled(span.content.to_string(), cursor_style);
+                    }
+                } else if newline_marker {
+                    spans.push(Span::styled("⏎".to_string(), cursor_style));
+                } else if trailing_block {
+                    spans.push(Span::styled(
+                        "█".to_string(),
+                        Style::default()
+                            .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
+                            .fg(Color::Rgb(0xd4, 0xd4, 0xd4)),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
-            lines.push(Line::from(spans));
+            visual += 1;
             if take == end {
                 break;
             }
@@ -1545,6 +1575,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             &session.input,
             session.input_cursor,
             state.pane_width,
+            session.input_scroll,
         ))
     };
     let shared = *state.mode.lock().unwrap();
@@ -1572,10 +1603,29 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             }),
         ))
     };
+    let mut input_block = Block::default().borders(Borders::ALL).title(mode_title);
+    let total_lines = {
+        let chars: Vec<char> = session.input.chars().collect();
+        input_visual_ranges(&chars, state.pane_width).len()
+    };
+    let visible = total_lines.min(12);
+    let scroll = session.input_scroll.min(total_lines.saturating_sub(visible));
+    let hidden_top = scroll;
+    let hidden_bottom = total_lines - scroll - visible;
+    if !session.running && hidden_top > 0 {
+        input_block = input_block.title_top(
+            Line::from(format!(" — {} more — ", hidden_top)).right_aligned(),
+        );
+    }
+    if !session.running && hidden_bottom > 0 {
+        input_block = input_block.title_bottom(
+            Line::from(format!(" — {} more — ", hidden_bottom)).right_aligned(),
+        );
+    }
     frame.render_widget(
         input
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(mode_title)),
+            .block(input_block),
         chunks[2],
     );
 }
@@ -1837,6 +1887,8 @@ pub async fn run(
         .scroller
         .offset()
         .min(state.sessions[state.active].max_scroll(state.pane_width, state.viewport));
+    let pw = state.pane_width;
+    clamp_input_scroll(state.session(), pw);
     terminal.draw(|frame| draw(frame, &state, start))?;
 
     let mut session_watch = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -1991,6 +2043,8 @@ pub async fn run(
             .scroller
             .offset()
             .min(state.sessions[state.active].max_scroll(state.pane_width, state.viewport));
+        let pw = state.pane_width;
+        clamp_input_scroll(state.session(), pw);
         terminal.draw(|frame| draw(frame, &state, start))?;
     }
 
@@ -3589,9 +3643,94 @@ mod test {
         assert_eq!(input_box_lines("hello\nworld", 80), 2);
         assert_eq!(input_box_lines(&"a".repeat(100), 80), 2);
         assert_eq!(input_box_lines(&"a".repeat(300), 80), 4);
-        assert_eq!(input_box_lines(&"a".repeat(1000), 80), 13);
+        assert_eq!(input_box_lines(&"a".repeat(960), 80), 12);
+        assert_eq!(input_box_lines(&"a".repeat(1000), 80), 12);
         assert_eq!(input_box_lines(&format!("\n{}", "a".repeat(20)), 20), 2);
         assert_eq!(input_box_lines(&format!("\n{}", "a".repeat(21)), 20), 3);
+    }
+
+    #[test]
+    fn input_scroll_keeps_the_cursor_visible() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "a".repeat(300).into();
+        state.session().input_cursor = 300;
+        clamp_input_scroll(state.session(), 20);
+        assert_eq!(state.session().input_scroll, 3);
+        state.session().input_cursor = 0;
+        clamp_input_scroll(state.session(), 20);
+        assert_eq!(state.session().input_scroll, 0);
+        state.session().input_cursor = 200;
+        clamp_input_scroll(state.session(), 20);
+        assert_eq!(state.session().input_scroll, 0);
+        state.session().input_cursor = 280;
+        clamp_input_scroll(state.session(), 20);
+        assert_eq!(state.session().input_scroll, 2);
+    }
+
+    #[test]
+    fn input_scroll_clamps_when_the_input_shrinks() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "a".repeat(300).into();
+        state.session().input_scroll = 5;
+        state.session().input = "a".repeat(100).into();
+        state.session().input_cursor = 100;
+        clamp_input_scroll(state.session(), 20);
+        assert_eq!(state.session().input_scroll, 0);
+    }
+
+    #[test]
+    fn input_visual_lines_renders_only_the_visible_window() {
+        let lines = input_visual_lines(&"a".repeat(300), 300, 20, 3);
+        assert_eq!(lines.len(), 12);
+        let lines = input_visual_lines(&"a".repeat(300), 300, 20, 0);
+        assert_eq!(lines.len(), 12);
+        let lines = input_visual_lines(&"a".repeat(300), 300, 20, 13);
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn input_overflow_shows_more_in_the_top_border() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "a".repeat(300).into();
+        state.session().input_cursor = 300;
+        clamp_input_scroll(state.session(), 20);
+        let backend = TestBackend::new(22, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let top: String = (0..22)
+            .map(|x| buffer.cell((x, 26)).unwrap().symbol().to_string())
+            .collect();
+        assert!(top.contains("3 more"), "top border: {top}");
+        let bottom: String = (0..22)
+            .map(|x| buffer.cell((x, 39)).unwrap().symbol().to_string())
+            .collect();
+        assert!(!bottom.contains("more"), "bottom border: {bottom}");
+    }
+
+    #[test]
+    fn input_overflow_shows_more_in_both_borders() {
+        let mut state = TuiState::new("model".into());
+        state.pane_width = 20;
+        state.session().input = "a".repeat(400).into();
+        state.session().input_cursor = 280;
+        clamp_input_scroll(state.session(), 20);
+        assert_eq!(state.session().input_scroll, 2);
+        let backend = TestBackend::new(22, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let top: String = (0..22)
+            .map(|x| buffer.cell((x, 26)).unwrap().symbol().to_string())
+            .collect();
+        assert!(top.contains("2 more"), "top border: {top}");
+        let bottom: String = (0..22)
+            .map(|x| buffer.cell((x, 39)).unwrap().symbol().to_string())
+            .collect();
+        assert!(bottom.contains("6 more"), "bottom border: {bottom}");
     }
 
     #[test]
@@ -3642,10 +3781,10 @@ mod test {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.cell((0, 23)).unwrap().symbol(), "┌");
+        assert_eq!(buffer.cell((0, 26)).unwrap().symbol(), "┌");
         assert_eq!(buffer.cell((0, 39)).unwrap().symbol(), "└");
         assert_eq!(buffer.cell((0, 3)).unwrap().symbol(), "┌");
-        assert_eq!(buffer.cell((0, 22)).unwrap().symbol(), "└");
+        assert_eq!(buffer.cell((0, 25)).unwrap().symbol(), "└");
     }
 
     #[test]
