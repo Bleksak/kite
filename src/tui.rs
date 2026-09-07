@@ -1753,17 +1753,17 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             " ctrl+p close",
             Style::default().fg(Color::Rgb(102, 102, 102)),
         ));
-        let content = lines.len() as u16;
-        let height = content + 3;
-        let width = 60u16.min(chunks[1].width.saturating_sub(2));
-        let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
-        let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
+        let width = chunks[1].width;
+        let height = chunks[1].height;
+        let x = chunks[1].x;
+        let y = chunks[1].y;
         let plan_box = Paragraph::new(
             lines
                 .into_iter()
                 .chain(std::iter::once(hint))
                 .collect::<Vec<Line>>(),
         )
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
