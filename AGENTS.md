@@ -28,8 +28,9 @@
   re-plans from the current stage. Enter at the plan review implements the next
   stage; typing feedback re-plans the remaining stages. Escalating re-plans the
   remaining stages automatically and the gate opens again
-- C-p: open/close the plan popup — shows the current stage's title and tasks
-  (like the background job details); p/q/esc close it
+- C-p: open/close the plan popup — shows the viewed stage's title and tasks
+  (like the background job details); ←/→ switch the viewed step, jk/PgUp/PgDn/
+  wheel scroll, p/q/esc close it
 - C-c: quit
 - Picker: C-j/↓ down, C-k/↑ up, enter select, esc cancel, C-n new session,
   C-x close the session under the cursor, C-r rename it, typing searches
