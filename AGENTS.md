@@ -20,11 +20,16 @@
 - Tab: switch the mode (yolo ↔ plan; shown in the prompt box header, bold green
   in plan). Implement mode is not reachable via Tab — it only starts when a
   plan is approved
-- Plan gate: when the plan agent calls submit_plan, the prompt box header shows
-  "plan ready" — Enter approves and starts the implement stage (a fresh agent
-  in implement mode executes the plan); typing feedback rejects and re-plans.
-  If the implement stage escalates, it re-plans automatically and the gate
-  opens again
+- Plan gate: the plan agent calls submit_plan with a plan split into stages.
+  The prompt box header shows "plan ready (N stages)" — Enter implements Step 1,
+  typing feedback re-plans. After each stage is implemented, a review gate opens
+  ("Step N implemented — review the implementation"; still in implement mode):
+  Enter moves to the plan review ("review Step N+1"; plan mode), typing feedback
+  re-plans from the current stage. Enter at the plan review implements the next
+  stage; typing feedback re-plans the remaining stages. Escalating re-plans the
+  remaining stages automatically and the gate opens again
+- C-p: open/close the plan popup — shows the current stage's title and tasks
+  (like the background job details); p/q/esc close it
 - C-c: quit
 - Picker: C-j/↓ down, C-k/↑ up, enter select, esc cancel, C-n new session,
   C-x close the session under the cursor, C-r rename it, typing searches

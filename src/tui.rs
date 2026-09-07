@@ -111,7 +111,6 @@ pub struct TuiState {
     pub task_output_id: Option<String>,
     pub task_output_scroll: Scroller,
     pub plan_open: bool,
-    pub plan_cursor: Cursor,
     next_id: u64,
 }
 
@@ -134,7 +133,6 @@ impl TuiState {
             task_output_id: None,
             task_output_scroll: Scroller::default(),
             plan_open: false,
-            plan_cursor: Cursor::default(),
             next_id: 1,
         }
     }
@@ -470,47 +468,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         };
     }
     if state.plan_open {
-        let len = state
-            .session()
-            .plan
-            .as_ref()
-            .map(|(stages, _)| stages.len())
-            .unwrap_or(0);
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('j') => {
-                    state.plan_cursor.down(len);
-                    KeyAction::None
-                }
-                KeyCode::Char('k') => {
-                    state.plan_cursor.up(len);
-                    KeyAction::None
-                }
-                KeyCode::Char('a') => {
-                    state.plan_open = false;
-                    KeyAction::None
-                }
-                _ => KeyAction::None,
-            };
-        }
         return match key.code {
-            KeyCode::Up => {
-                state.plan_cursor.up(len);
-                KeyAction::None
-            }
-            KeyCode::Down => {
-                state.plan_cursor.down(len);
-                KeyAction::None
-            }
-            KeyCode::Char('j') => {
-                state.plan_cursor.down(len);
-                KeyAction::None
-            }
-            KeyCode::Char('k') => {
-                state.plan_cursor.up(len);
-                KeyAction::None
-            }
-            KeyCode::Char('a') | KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('p') | KeyCode::Char('q') | KeyCode::Esc => {
                 state.plan_open = false;
                 KeyAction::None
             }
@@ -580,6 +539,12 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         };
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Char('p') {
+            state.plan_open = !state.plan_open;
+            state.picker_open = false;
+            state.tasks_open = false;
+            return KeyAction::None;
+        }
         let session = state.session();
         return match key.code {
             KeyCode::Char('s') => {
@@ -592,13 +557,6 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 state.tasks_open = true;
                 state.picker_open = false;
                 state.tasks_cursor.set(0);
-                KeyAction::None
-            }
-            KeyCode::Char('a') => {
-                state.plan_open = true;
-                state.plan_cursor.set(0);
-                state.picker_open = false;
-                state.tasks_open = false;
                 KeyAction::None
             }
             KeyCode::Char('t') => {
@@ -1761,52 +1719,43 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             .get(state.active)
             .and_then(|s| s.plan.clone())
             .unwrap_or((Vec::new(), 0));
-        let cursor = state.plan_cursor.pos.min(stages.len().saturating_sub(1));
-        let visible = 12usize.min(stages.len().max(1));
-        let start = cursor.saturating_sub(visible / 2).min(stages.len().saturating_sub(visible));
         let mut lines: Vec<Line> = Vec::new();
         if stages.is_empty() {
             lines.push(Line::from(Span::styled(
                 " no plan",
                 Style::default().fg(Color::Rgb(102, 102, 102)),
             )));
-        } else {
-            for (i, stage) in stages.iter().enumerate().skip(start).take(visible) {
-                let (marker, marker_style) = if i < stage_index {
-                    ("✓", Style::default().fg(Color::Rgb(0x7e, 0xb5, 0x68)))
-                } else if i == stage_index {
-                    ("▸", Style::default().fg(Color::Rgb(95, 135, 255)).bold())
-                } else {
-                    ("·", Style::default().fg(Color::Rgb(102, 102, 102)))
-                };
-                let selected = i == cursor;
-                let title_style = if selected {
-                    Style::default().bold().fg(Color::Rgb(95, 135, 255))
-                } else {
-                    Style::default()
-                };
-                let title: String = stage.title.chars().take(30).collect();
-                lines.push(Line::from(vec![
-                    Span::styled(format!(" {marker} "), marker_style),
-                    Span::styled(format!("Step {} of {}: {}", i + 1, stages.len(), title), title_style),
-                ]));
-                if selected {
-                    for task in &stage.tasks {
-                        let task_text: String = task.chars().take(44).collect();
-                        lines.push(Line::from(Span::styled(
-                            format!("      - {task_text}"),
-                            Style::default().fg(Color::Rgb(0xa0, 0xa0, 0xb0)),
-                        )));
-                    }
+        } else if let Some(stage) = stages.get(stage_index) {
+            let title = Line::from(vec![
+                Span::styled(
+                    format!("Step {} of {}", stage_index + 1, stages.len()),
+                    Style::default().fg(Color::Rgb(102, 102, 102)),
+                ),
+                Span::styled(format!("  {}", stage.title), Style::default().bold()),
+            ]);
+            lines.push(title);
+            lines.push(Line::from(""));
+            if stage.tasks.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " (no tasks)",
+                    Style::default().fg(Color::Rgb(102, 102, 102)),
+                )));
+            } else {
+                for (i, task) in stage.tasks.iter().enumerate() {
+                    lines.push(Line::from(Span::styled(
+                        format!("{}. {}", i + 1, task),
+                        Style::default().fg(Color::Rgb(0xa0, 0xa0, 0xb0)),
+                    )));
                 }
             }
         }
         let hint = Line::from(Span::styled(
-            " jk · a close",
+            " ctrl+p close",
             Style::default().fg(Color::Rgb(102, 102, 102)),
         ));
-        let height = (visible as u16) + 3;
-        let width = 52u16.min(chunks[1].width.saturating_sub(2));
+        let content = lines.len() as u16;
+        let height = content + 3;
+        let width = 60u16.min(chunks[1].width.saturating_sub(2));
         let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
         let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
         let plan_box = Paragraph::new(
@@ -2947,27 +2896,36 @@ mod test {
     }
 
     #[test]
-    fn ctrl_a_toggles_the_plan_popup_and_navigates() {
+    fn ctrl_p_toggles_the_plan_popup() {
         let mut state = TuiState::new("model".into());
         state.session().plan = Some((plan_stages(), 1));
 
-        handle_key(&mut state, &ctrl('a'));
+        handle_key(&mut state, &ctrl('p'));
         assert!(state.plan_open);
-        assert_eq!(state.plan_cursor.pos, 0);
 
-        handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert_eq!(state.plan_cursor.pos, 1);
-        handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert_eq!(state.plan_cursor.pos, 0);
-        handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert_eq!(state.plan_cursor.pos, 1);
+        handle_key(&mut state, &ctrl('p'));
+        assert!(!state.plan_open);
 
+        handle_key(&mut state, &ctrl('p'));
+        assert!(state.plan_open);
         handle_key(&mut state, &key(KeyCode::Char('q')));
         assert!(!state.plan_open);
 
-        handle_key(&mut state, &ctrl('a'));
+        handle_key(&mut state, &ctrl('p'));
         assert!(state.plan_open);
-        handle_key(&mut state, &ctrl('a'));
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert!(!state.plan_open);
+    }
+
+    #[test]
+    fn ctrl_p_works_while_running() {
+        let mut state = TuiState::new("model".into());
+        state.session().running = true;
+
+        handle_key(&mut state, &ctrl('p'));
+        assert!(state.plan_open);
+
+        handle_key(&mut state, &key(KeyCode::Char('q')));
         assert!(!state.plan_open);
     }
 
@@ -2975,11 +2933,10 @@ mod test {
     fn plan_popup_without_a_plan_stays_inert() {
         let mut state = TuiState::new("model".into());
 
-        handle_key(&mut state, &ctrl('a'));
+        handle_key(&mut state, &ctrl('p'));
         assert!(state.plan_open);
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert_eq!(state.plan_cursor.pos, 0);
         handle_key(&mut state, &key(KeyCode::Esc));
         assert!(!state.plan_open);
     }
