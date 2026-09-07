@@ -1,19 +1,18 @@
 use std::collections::HashMap;
-use std::io::Read as _;
 use std::io::Write as _;
 use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
-use ratatui::backend::TermionBackend;
+use ratatui::backend::TermwizBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
-use termion::raw::IntoRawMode;
+use termwiz::terminal::Terminal as _;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyCode {
@@ -46,36 +45,6 @@ bitflags! {
     }
 }
 
-struct StdinFd(std::os::unix::io::BorrowedFd<'static>);
-
-impl std::io::Write for StdinFd {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl std::os::unix::io::AsFd for StdinFd {
-    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy)]
-struct RawModeRestorer(*mut Option<termion::raw::RawTerminal<StdinFd>>);
-
-impl RawModeRestorer {
-    fn restore(&self) {
-        drop(unsafe { (*self.0).take() });
-    }
-}
-
-unsafe impl Send for RawModeRestorer {}
-unsafe impl Sync for RawModeRestorer {}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
     pub code: KeyCode,
@@ -99,10 +68,11 @@ pub struct MouseEvent {
     pub kind: MouseEventKind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum TermEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
 }
 
 use crate::agent::Agent;
@@ -235,6 +205,61 @@ fn task_output_scroll_max(state: &TuiState) -> usize {
     total.saturating_sub(visible)
 }
 
+fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent> {
+    use termwiz::input::{Modifiers, KeyCode as TermwizKeyCode};
+    match event {
+        termwiz::input::InputEvent::Key(key_event) => {
+            let code = match key_event.key {
+                TermwizKeyCode::Char(c) => KeyCode::Char(c),
+                TermwizKeyCode::Enter => KeyCode::Enter,
+                TermwizKeyCode::Escape => KeyCode::Esc,
+                TermwizKeyCode::Backspace => KeyCode::Backspace,
+                TermwizKeyCode::Tab => KeyCode::Tab,
+                TermwizKeyCode::PageUp => KeyCode::PageUp,
+                TermwizKeyCode::PageDown => KeyCode::PageDown,
+                TermwizKeyCode::End => KeyCode::End,
+                TermwizKeyCode::Home => KeyCode::Home,
+                TermwizKeyCode::Insert => KeyCode::Insert,
+                TermwizKeyCode::Delete => KeyCode::Delete,
+                TermwizKeyCode::LeftArrow => KeyCode::Left,
+                TermwizKeyCode::RightArrow => KeyCode::Right,
+                TermwizKeyCode::UpArrow => KeyCode::Up,
+                TermwizKeyCode::DownArrow => KeyCode::Down,
+                TermwizKeyCode::Function(n) => KeyCode::F(n),
+                _ => return None,
+            };
+            let mut modifiers = KeyModifiers::NONE;
+            if key_event.modifiers.contains(Modifiers::SHIFT) {
+                modifiers |= KeyModifiers::SHIFT;
+            }
+            if key_event.modifiers.contains(Modifiers::ALT) {
+                modifiers |= KeyModifiers::ALT;
+            }
+            if key_event.modifiers.contains(Modifiers::CTRL) {
+                modifiers |= KeyModifiers::CONTROL;
+            }
+            if key_event.modifiers.contains(Modifiers::SUPER) {
+                modifiers |= KeyModifiers::SUPER;
+            }
+            Some(TermEvent::Key(KeyEvent::new(code, modifiers)))
+        }
+        termwiz::input::InputEvent::Mouse(mouse) => {
+            use termwiz::input::MouseButtons;
+            if !mouse.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
+                return None;
+            }
+            let kind = if mouse.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
+                MouseEventKind::ScrollUp
+            } else {
+                MouseEventKind::ScrollDown
+            };
+            Some(TermEvent::Mouse(MouseEvent { kind }))
+        }
+        termwiz::input::InputEvent::Paste(text) => Some(TermEvent::Paste(text)),
+        _ => None,
+    }
+}
+
 pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     if let TermEvent::Mouse(mouse) = event {
         if state.task_output_id.is_some() {
@@ -264,6 +289,18 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         };
     }
     let TermEvent::Key(key) = event else {
+        if let TermEvent::Paste(text) = event {
+            let session = &mut state.sessions[state.active];
+            if !session.running {
+                let mut chars: Vec<char> = session.input.chars().collect();
+                for c in text.chars() {
+                    chars.insert(session.input_cursor, c);
+                    session.input_cursor += 1;
+                }
+                session.input = chars.into_iter().collect();
+            }
+            return KeyAction::None;
+        }
         return KeyAction::None;
     };
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -679,10 +716,12 @@ fn insert_newline(session: &mut Session) {
     session.input_cursor += 1;
 }
 
+#[cfg(test)]
 struct InputParser {
     pending: Vec<u8>,
 }
 
+#[cfg(test)]
 impl InputParser {
     fn new() -> Self {
         Self { pending: Vec::new() }
@@ -914,6 +953,7 @@ impl InputParser {
     }
 }
 
+#[cfg(test)]
 fn mod_to_flags(modifier: u8) -> KeyModifiers {
     match modifier {
         2 => KeyModifiers::SHIFT,
@@ -927,6 +967,7 @@ fn mod_to_flags(modifier: u8) -> KeyModifiers {
     }
 }
 
+#[cfg(test)]
 fn mod_to_flags_xterm(modifier: u8) -> KeyModifiers {
     match modifier {
         2 => KeyModifiers::SHIFT,
@@ -940,6 +981,7 @@ fn mod_to_flags_xterm(modifier: u8) -> KeyModifiers {
     }
 }
 
+#[cfg(test)]
 fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
     Some(match codepoint {
         3 | 13 | 57414 => KeyCode::Enter,
@@ -1677,72 +1719,24 @@ pub async fn run(
     mode: Arc<Mutex<Mode>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
     let new_agent = std::sync::Arc::new(new_agent);
 
-    let stdin_fd = StdinFd(unsafe { std::os::unix::io::BorrowedFd::borrow_raw(0) });
-    let raw_mode = stdin_fd.into_raw_mode()?;
-    let raw_mode: *mut Option<termion::raw::RawTerminal<StdinFd>> =
-        Box::leak(Box::new(Some(raw_mode)));
-    let restorer = RawModeRestorer(raw_mode);
-    std::io::stdout().write_all(b"\x1b[?1049h")?;
     std::io::stdout().write_all(b"\x1b[?25l")?;
     std::io::stdout().write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h")?;
     std::io::stdout().write_all(b"\x1b[>7u\x1b[?u\x1b[c")?;
-    std::io::stdout().write_all(b"\x1b[>4;2m")?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = std::io::stdout().write_all(b"\x1b[?1049l");
         let _ = std::io::stdout().write_all(b"\x1b[?25h");
         let _ = std::io::stdout().write_all(b"\x1b[<1u");
         let _ = std::io::stdout().write_all(b"\x1b[>4;0m");
         let _ = std::io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
         let _ = std::io::stdout().flush();
-        restorer.restore();
         default_hook(info);
     }));
 
-    let backend = TermionBackend::new(std::io::stdout());
+    let backend = TermwizBackend::new()?;
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
-
-    std::thread::spawn(move || {
-        let (raw_tx, raw_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            let mut stdin = std::io::stdin();
-            let mut buf = [0u8; 512];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        if raw_tx.send(buf[..n].to_vec()).is_err() {
-                            return;
-                        }
-                    }
-                    _ => continue,
-                }
-            }
-        });
-        let mut parser = InputParser::new();
-        loop {
-            match raw_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(chunk) => {
-                    for term_event in parser.feed(&chunk) {
-                        if key_tx.send(term_event).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    for term_event in parser.flush_escape() {
-                        if key_tx.send(term_event).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
 
     let mut state =
         TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
@@ -1786,6 +1780,66 @@ pub async fn run(
     let mut session_watch = tokio::time::interval(std::time::Duration::from_secs(2));
 
     loop {
+        let mut should_quit = false;
+        loop {
+            let event = match terminal
+                .backend_mut()
+                .buffered_terminal_mut()
+                .terminal()
+                .poll_input(Some(std::time::Duration::ZERO))
+            {
+                Ok(event) => event,
+                Err(e) => return Err(e.into()),
+            };
+            let Some(event) = event else {
+                break;
+            };
+            let Some(term_event) = map_termwiz_event(event) else {
+                continue;
+            };
+            let ids_before: Vec<u64> = state.sessions.iter().map(|s| s.id).collect();
+            match handle_key(&mut state, &term_event) {
+                KeyAction::Submit(task) => {
+                    let id = state.sessions[state.active].id;
+                    let session = &mut state.sessions[state.active];
+                    session.error = None;
+                    session.running = true;
+                    if !task.is_empty() {
+                        session.renderer.push_user(&task);
+                    }
+                    let max = session.max_scroll(state.pane_width, state.viewport);
+                    session.scroller.end(max);
+                    inputs[&id].send(task)?;
+                }
+                KeyAction::Quit => {
+                    should_quit = true;
+                    break;
+                }
+                KeyAction::NewSession => {
+                    let id = state.sessions[state.active].id;
+                    let (input_tx, input_handle) =
+                        spawn_agent(id, new_agent.clone(), None, agent_tx.clone());
+                    inputs.insert(id, input_tx);
+                    handles.insert(id, input_handle);
+                }
+                KeyAction::CloseSession => {
+                    let removed = ids_before
+                        .into_iter()
+                        .find(|id| !state.sessions.iter().any(|s| s.id == *id));
+                    if let Some(id) = removed {
+                        if let Some(handle) = handles.remove(&id) {
+                            handle.abort();
+                        }
+                        inputs.remove(&id);
+                        session_store::remove_session_file(Path::new(CONTEXT_DIR), id);
+                    }
+                }
+                KeyAction::None => {}
+            }
+        }
+        if should_quit {
+            break;
+        }
         tokio::select! {
             _ = session_watch.tick() => {
                 let removed: Vec<u64> = state
@@ -1857,47 +1911,7 @@ pub async fn run(
                     None => break,
                 }
             }
-            key = key_rx.recv() => {
-                let Some(term_event) = key else {
-                    break;
-                };
-                let ids_before: Vec<u64> = state.sessions.iter().map(|s| s.id).collect();
-                match handle_key(&mut state, &term_event) {
-                    KeyAction::Submit(task) => {
-                        let id = state.sessions[state.active].id;
-                        let session = &mut state.sessions[state.active];
-                        session.error = None;
-                        session.running = true;
-                        if !task.is_empty() {
-                            session.renderer.push_user(&task);
-                        }
-                        let max = session.max_scroll(state.pane_width, state.viewport);
-                        session.scroller.end(max);
-                        inputs[&id].send(task)?;
-                    }
-                    KeyAction::Quit => break,
-                    KeyAction::NewSession => {
-                        let id = state.sessions[state.active].id;
-                        let (input_tx, input_handle) =
-                            spawn_agent(id, new_agent.clone(), None, agent_tx.clone());
-                        inputs.insert(id, input_tx);
-                        handles.insert(id, input_handle);
-                    }
-                    KeyAction::CloseSession => {
-                        let removed = ids_before
-                            .into_iter()
-                            .find(|id| !state.sessions.iter().any(|s| s.id == *id));
-                        if let Some(id) = removed {
-                            if let Some(handle) = handles.remove(&id) {
-                                handle.abort();
-                            }
-                            inputs.remove(&id);
-                            session_store::remove_session_file(Path::new(CONTEXT_DIR), id);
-                        }
-                    }
-                    KeyAction::None => {}
-                }
-            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
         let size = terminal.size();
         state.pane_width = size
@@ -1941,10 +1955,8 @@ pub async fn run(
     std::io::stdout().write_all(b"\x1b[<1u")?;
     std::io::stdout().write_all(b"\x1b[>4;0m")?;
     std::io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")?;
-    std::io::stdout().write_all(b"\x1b[?1049l")?;
-    std::io::stdout().write_all(b"\x1b[?25h")?;
     std::io::stdout().flush()?;
-    restorer.restore();
+    drop(terminal);
     println!(
         "session over: {} prompt / {} completion tokens",
         state.sessions[state.active].prompt_tokens, state.sessions[state.active].completion_tokens
