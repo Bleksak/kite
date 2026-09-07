@@ -4,6 +4,7 @@
 
 - Never write any comments in code: no `//`, no `///`, no `//!`, no `/* */`,
   no `#[doc]`. Code should be self-explanatory.
+- Never use raw serde Value json, the only accepted case for raw serde value json is in tests
 
 ## Testing
 

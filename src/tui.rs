@@ -2024,29 +2024,64 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     );
 }
 
-#[derive(serde::Deserialize)]
-struct SubmitPlanPayload {
-    #[serde(default)]
-    stages: Vec<crate::tool::PlanStage>,
-    #[serde(default)]
-    plan: Option<String>,
-}
-
 fn parse_stages(arguments: &str) -> Vec<crate::tool::PlanStage> {
-    let payload: SubmitPlanPayload =
-        serde_json::from_str(arguments).unwrap_or(SubmitPlanPayload {
-            stages: Vec::new(),
-            plan: None,
-        });
-    if !payload.stages.is_empty() {
-        return payload.stages;
+    let value: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+
+    if let Some(stages) = value.get("stages").and_then(|s| s.as_array()) {
+        let parsed: Vec<crate::tool::PlanStage> = stages
+            .iter()
+            .filter_map(|item| {
+                if let Some(title) = item.as_str() {
+                    return Some(crate::tool::PlanStage {
+                        title: title.chars().take(40).collect(),
+                        tasks: vec![title.to_string()],
+                    });
+                }
+                let obj = item.as_object()?;
+                let title = obj
+                    .get("title")
+                    .or_else(|| obj.get("name"))
+                    .or_else(|| obj.get("step"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "Step".to_string());
+                let tasks = match obj.get("tasks").or_else(|| obj.get("items")) {
+                    Some(serde_json::Value::String(s)) => vec![s.clone()],
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect(),
+                    _ => vec![obj
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_default()],
+                };
+                if tasks.is_empty() {
+                    return None;
+                }
+                Some(crate::tool::PlanStage {
+                    title: title.chars().take(40).collect(),
+                    tasks,
+                })
+            })
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
     }
-    let text = payload
-        .plan
-        .unwrap_or_else(|| crate::agent::terminator_payload(arguments, "plan"));
+
+    if let Some(plan) = value.get("plan").and_then(|p| p.as_str()) {
+        return vec![crate::tool::PlanStage {
+            title: "Plan".to_string(),
+            tasks: vec![plan.to_string()],
+        }];
+    }
+
     vec![crate::tool::PlanStage {
         title: "Plan".to_string(),
-        tasks: vec![text],
+        tasks: vec!["(the plan could not be parsed)".to_string()],
     }]
 }
 
@@ -3001,6 +3036,51 @@ mod test {
                 tasks: vec!["controller".into()],
             },
         ]
+    }
+
+    #[test]
+    fn parse_stages_reads_the_stages_array() {
+        let stages = parse_stages(
+            r#"{"stages":[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]}"#,
+        );
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].title, "One");
+        assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(stages[1].title, "Two");
+    }
+
+    #[test]
+    fn parse_stages_accepts_a_task_string_not_just_an_array() {
+        let stages = parse_stages(r#"{"stages":[{"title":"One","tasks":"just a string"}]}"#);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].tasks, vec!["just a string".to_string()]);
+    }
+
+    #[test]
+    fn parse_stages_accepts_bare_string_stages() {
+        let stages = parse_stages(r#"{"stages":["first step","second step"]}"#);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].title, "first step");
+        assert_eq!(stages[0].tasks, vec!["first step".to_string()]);
+    }
+
+    #[test]
+    fn parse_stages_falls_back_to_the_plan_field() {
+        let stages = parse_stages(r#"{"plan":"the whole plan as text"}"#);
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].title, "Plan");
+        assert_eq!(stages[0].tasks, vec!["the whole plan as text".to_string()]);
+    }
+
+    #[test]
+    fn parse_stages_never_returns_the_raw_json() {
+        let stages = parse_stages(r#"{"stages":{"weird":"shape"}}"#);
+        assert_eq!(stages.len(), 1);
+        assert!(
+            !stages[0].tasks[0].contains('{'),
+            "must not leak raw json: {}",
+            stages[0].tasks[0]
+        );
     }
 
     #[test]
