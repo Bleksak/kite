@@ -91,6 +91,7 @@ pub enum TuiEvent {
     TurnError { session: u64, message: String },
     GatePending { session: u64, message: String },
     StageChanged { session: u64, mode: Option<Mode> },
+    PlanUpdated { session: u64, plan: Option<(Vec<crate::tool::PlanStage>, usize)> },
 }
 
 pub struct TuiState {
@@ -109,6 +110,8 @@ pub struct TuiState {
     pub tasks_cursor: Cursor,
     pub task_output_id: Option<String>,
     pub task_output_scroll: Scroller,
+    pub plan_open: bool,
+    pub plan_cursor: Cursor,
     next_id: u64,
 }
 
@@ -130,6 +133,8 @@ impl TuiState {
             tasks_cursor: Cursor::default(),
             task_output_id: None,
             task_output_scroll: Scroller::default(),
+            plan_open: false,
+            plan_cursor: Cursor::default(),
             next_id: 1,
         }
     }
@@ -464,6 +469,54 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             _ => KeyAction::None,
         };
     }
+    if state.plan_open {
+        let len = state
+            .session()
+            .plan
+            .as_ref()
+            .map(|(stages, _)| stages.len())
+            .unwrap_or(0);
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('j') => {
+                    state.plan_cursor.down(len);
+                    KeyAction::None
+                }
+                KeyCode::Char('k') => {
+                    state.plan_cursor.up(len);
+                    KeyAction::None
+                }
+                KeyCode::Char('a') => {
+                    state.plan_open = false;
+                    KeyAction::None
+                }
+                _ => KeyAction::None,
+            };
+        }
+        return match key.code {
+            KeyCode::Up => {
+                state.plan_cursor.up(len);
+                KeyAction::None
+            }
+            KeyCode::Down => {
+                state.plan_cursor.down(len);
+                KeyAction::None
+            }
+            KeyCode::Char('j') => {
+                state.plan_cursor.down(len);
+                KeyAction::None
+            }
+            KeyCode::Char('k') => {
+                state.plan_cursor.up(len);
+                KeyAction::None
+            }
+            KeyCode::Char('a') | KeyCode::Char('q') | KeyCode::Esc => {
+                state.plan_open = false;
+                KeyAction::None
+            }
+            _ => KeyAction::None,
+        };
+    }
     if state.tasks_open {
         let tasks = crate::bg::REGISTRY.list();
         let len = tasks.len();
@@ -539,6 +592,13 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 state.tasks_open = true;
                 state.picker_open = false;
                 state.tasks_cursor.set(0);
+                KeyAction::None
+            }
+            KeyCode::Char('a') => {
+                state.plan_open = true;
+                state.plan_cursor.set(0);
+                state.picker_open = false;
+                state.tasks_open = false;
                 KeyAction::None
             }
             KeyCode::Char('t') => {
@@ -1695,6 +1755,77 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         frame.render_widget(tasks_box, Rect::new(x, y, width, height));
     }
 
+    if state.plan_open {
+        let (stages, stage_index) = state
+            .sessions
+            .get(state.active)
+            .and_then(|s| s.plan.clone())
+            .unwrap_or((Vec::new(), 0));
+        let cursor = state.plan_cursor.pos.min(stages.len().saturating_sub(1));
+        let visible = 12usize.min(stages.len().max(1));
+        let start = cursor.saturating_sub(visible / 2).min(stages.len().saturating_sub(visible));
+        let mut lines: Vec<Line> = Vec::new();
+        if stages.is_empty() {
+            lines.push(Line::from(Span::styled(
+                " no plan",
+                Style::default().fg(Color::Rgb(102, 102, 102)),
+            )));
+        } else {
+            for (i, stage) in stages.iter().enumerate().skip(start).take(visible) {
+                let (marker, marker_style) = if i < stage_index {
+                    ("✓", Style::default().fg(Color::Rgb(0x7e, 0xb5, 0x68)))
+                } else if i == stage_index {
+                    ("▸", Style::default().fg(Color::Rgb(95, 135, 255)).bold())
+                } else {
+                    ("·", Style::default().fg(Color::Rgb(102, 102, 102)))
+                };
+                let selected = i == cursor;
+                let title_style = if selected {
+                    Style::default().bold().fg(Color::Rgb(95, 135, 255))
+                } else {
+                    Style::default()
+                };
+                let title: String = stage.title.chars().take(30).collect();
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {marker} "), marker_style),
+                    Span::styled(format!("Step {} of {}: {}", i + 1, stages.len(), title), title_style),
+                ]));
+                if selected {
+                    for task in &stage.tasks {
+                        let task_text: String = task.chars().take(44).collect();
+                        lines.push(Line::from(Span::styled(
+                            format!("      - {task_text}"),
+                            Style::default().fg(Color::Rgb(0xa0, 0xa0, 0xb0)),
+                        )));
+                    }
+                }
+            }
+        }
+        let hint = Line::from(Span::styled(
+            " jk · a close",
+            Style::default().fg(Color::Rgb(102, 102, 102)),
+        ));
+        let height = (visible as u16) + 3;
+        let width = 52u16.min(chunks[1].width.saturating_sub(2));
+        let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
+        let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
+        let plan_box = Paragraph::new(
+            lines
+                .into_iter()
+                .chain(std::iter::once(hint))
+                .collect::<Vec<Line>>(),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
+                .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
+                .title(" plan ".to_string()),
+        );
+        frame.render_widget(Fill, Rect::new(x, y, width, height));
+        frame.render_widget(plan_box, Rect::new(x, y, width, height));
+    }
+
     if let Some(id) = &state.task_output_id {
         let tasks = crate::bg::REGISTRY.list();
         if let Some(task) = tasks.iter().find(|t| t.id == *id) {
@@ -1981,6 +2112,10 @@ async fn handle_outcome(
                     session: id,
                     context,
                 });
+                let _ = event_tx.send(TuiEvent::PlanUpdated {
+                    session: id,
+                    plan: Some((stages.clone().unwrap(), 0)),
+                });
                 let _ = event_tx.send(TuiEvent::GatePending {
                     session: id,
                     message: gate.clone().unwrap().0,
@@ -2046,6 +2181,10 @@ async fn handle_outcome(
                         session: id,
                         context,
                     });
+                    let _ = event_tx.send(TuiEvent::PlanUpdated {
+                        session: id,
+                        plan: Some((stages.clone().unwrap(), *stage_index)),
+                    });
                     let _ = event_tx.send(TuiEvent::GatePending {
                         session: id,
                         message: gate.clone().unwrap().0,
@@ -2057,6 +2196,10 @@ async fn handle_outcome(
                     let _ = event_tx.send(TuiEvent::StageChanged {
                         session: id,
                         mode: None,
+                    });
+                    let _ = event_tx.send(TuiEvent::PlanUpdated {
+                        session: id,
+                        plan: None,
                     });
                 }
                 let context = agent.context.clone();
@@ -2386,6 +2529,11 @@ pub async fn run(
                         if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
                             session.stage = mode;
                             session.gate = false;
+                        }
+                    }
+                    Some(TuiEvent::PlanUpdated { session: id, plan }) => {
+                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                            session.plan = plan;
                         }
                     }
                     None => break,
@@ -2783,6 +2931,57 @@ mod test {
         assert_eq!(state.tasks_cursor.pos, 0);
         handle_key(&mut state, &key(KeyCode::Char('q')));
         assert!(!state.tasks_open);
+    }
+
+    fn plan_stages() -> Vec<crate::tool::PlanStage> {
+        vec![
+            crate::tool::PlanStage {
+                title: "data".into(),
+                tasks: vec!["entity".into(), "migration".into()],
+            },
+            crate::tool::PlanStage {
+                title: "api".into(),
+                tasks: vec!["controller".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn ctrl_a_toggles_the_plan_popup_and_navigates() {
+        let mut state = TuiState::new("model".into());
+        state.session().plan = Some((plan_stages(), 1));
+
+        handle_key(&mut state, &ctrl('a'));
+        assert!(state.plan_open);
+        assert_eq!(state.plan_cursor.pos, 0);
+
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        assert_eq!(state.plan_cursor.pos, 1);
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        assert_eq!(state.plan_cursor.pos, 0);
+        handle_key(&mut state, &key(KeyCode::Char('k')));
+        assert_eq!(state.plan_cursor.pos, 1);
+
+        handle_key(&mut state, &key(KeyCode::Char('q')));
+        assert!(!state.plan_open);
+
+        handle_key(&mut state, &ctrl('a'));
+        assert!(state.plan_open);
+        handle_key(&mut state, &ctrl('a'));
+        assert!(!state.plan_open);
+    }
+
+    #[test]
+    fn plan_popup_without_a_plan_stays_inert() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('a'));
+        assert!(state.plan_open);
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        handle_key(&mut state, &key(KeyCode::Char('k')));
+        assert_eq!(state.plan_cursor.pos, 0);
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert!(!state.plan_open);
     }
 
     #[tokio::test]

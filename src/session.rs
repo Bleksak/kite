@@ -64,6 +64,7 @@ pub struct Session {
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub question: Option<QuestionState>,
+    pub plan: Option<(Vec<crate::tool::PlanStage>, usize)>,
     tail_cache: (usize, usize, usize, usize),
 }
 
@@ -88,6 +89,7 @@ impl Session {
             history: Vec::new(),
             history_index: None,
             question: None,
+            plan: None,
             tail_cache: (0, 0, 0, 0),
         }
     }
