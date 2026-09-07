@@ -299,6 +299,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                     session.input_cursor += 1;
                 }
                 session.input = chars.into_iter().collect();
+                session.history_index = None;
             }
             return KeyAction::None;
         }
@@ -614,13 +615,17 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             } else {
                 let task = mem::take(&mut session.input);
                 session.input_cursor = 0;
-                if !task.is_empty() && session.label.is_empty() {
-                    session.label = task
-                        .lines()
-                        .find(|line| !line.trim().is_empty())
-                        .map(|line| line.trim().chars().take(24).collect())
-                        .unwrap_or_default();
+                if !task.is_empty() {
+                    session.history.push(task.clone());
+                    if session.label.is_empty() {
+                        session.label = task
+                            .lines()
+                            .find(|line| !line.trim().is_empty())
+                            .map(|line| line.trim().chars().take(24).collect())
+                            .unwrap_or_default();
+                    }
                 }
+                session.history_index = None;
                 session.scroller.set_following(true);
                 KeyAction::Submit(task)
             }
@@ -631,6 +636,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 let mut chars: Vec<char> = session.input.chars().collect();
                 chars.remove(session.input_cursor);
                 session.input = chars.into_iter().collect();
+                session.history_index = None;
             }
             KeyAction::None
         }
@@ -644,7 +650,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         }
         KeyCode::Up | KeyCode::Down => {
             let chars: Vec<char> = session.input.chars().collect();
-            if input_visual_ranges(&chars, pane_width).len() > 1 {
+            if input_visual_ranges(&chars, pane_width).len() > 1 && session.history_index.is_none() {
                 move_cursor_visual_line(
                     &session.input,
                     &mut session.input_cursor,
@@ -652,9 +658,40 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                     key.code == KeyCode::Up,
                 );
             } else if key.code == KeyCode::Up {
-                mouse_up(session);
+                match session.history_index {
+                    Some(i) if i + 1 < session.history.len() => {
+                        let entry = session.history[i + 1].clone();
+                        session.history_index = Some(i + 1);
+                        session.input = entry;
+                        session.input_cursor = session.input.chars().count();
+                    }
+                    Some(_) => mouse_up(session),
+                    None => {
+                        if session.input.is_empty() && !session.history.is_empty() {
+                            let entry = session.history.last().unwrap().clone();
+                            session.history_index = Some(session.history.len() - 1);
+                            session.input = entry;
+                            session.input_cursor = session.input.chars().count();
+                        } else {
+                            mouse_up(session);
+                        }
+                    }
+                }
             } else {
-                mouse_down(session, pane_width, viewport);
+                match session.history_index {
+                    Some(0) => {
+                        session.history_index = None;
+                        session.input.clear();
+                        session.input_cursor = 0;
+                    }
+                    Some(i) => {
+                        let entry = session.history[i - 1].clone();
+                        session.history_index = Some(i - 1);
+                        session.input = entry;
+                        session.input_cursor = session.input.chars().count();
+                    }
+                    None => mouse_down(session, pane_width, viewport),
+                }
             }
             KeyAction::None
         }
@@ -679,6 +716,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             chars.insert(session.input_cursor, c);
             session.input = chars.into_iter().collect();
             session.input_cursor += 1;
+            session.history_index = None;
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -715,6 +753,7 @@ fn insert_newline(session: &mut Session) {
     chars.insert(session.input_cursor, '\n');
     session.input = chars.into_iter().collect();
     session.input_cursor += 1;
+    session.history_index = None;
 }
 
 #[cfg(test)]
@@ -3485,6 +3524,121 @@ mod test {
         assert_eq!(state.session().input_cursor, 2);
         handle_key(&mut state, &key(KeyCode::Down));
         assert_eq!(state.session().input_cursor, 5);
+    }
+
+    #[test]
+    fn up_on_empty_input_loads_the_last_message() {
+        let mut state = TuiState::new("model".into());
+        state.session().history = vec!["first".into(), "second".into(), "third".into()];
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "third");
+        assert_eq!(state.session().history_index, Some(2));
+        assert_eq!(state.session().input_cursor, 5);
+    }
+
+    #[test]
+    fn down_walks_backwards_through_history_and_blanks_at_the_end() {
+        let mut state = TuiState::new("model".into());
+        state.session().history = vec!["first".into(), "second".into(), "third".into()];
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "third");
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input, "second");
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input, "first");
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input, "");
+        assert_eq!(state.session().history_index, None);
+        assert_eq!(state.session().input_cursor, 0);
+    }
+
+    #[test]
+    fn up_walks_forwards_through_history() {
+        let mut state = TuiState::new("model".into());
+        for i in 0..30 {
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("line {i}\n")));
+        }
+        state.session().renderer.finish();
+        state.session().history = vec!["first".into(), "second".into(), "third".into()];
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        assert!(max > 0);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().scroller.offset(), 3);
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "third");
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input, "second");
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "third");
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().scroller.offset(), 0);
+    }
+
+    #[test]
+    fn typing_exits_history_mode() {
+        let mut state = TuiState::new("model".into());
+        for i in 0..30 {
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("line {i}\n")));
+        }
+        state.session().renderer.finish();
+        state.session().history = vec!["abc".into(), "def".into()];
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        assert!(max > 0);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().scroller.offset(), 3);
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "def");
+        handle_key(&mut state, &key(KeyCode::Char('x')));
+        assert_eq!(state.session().input, "defx");
+        assert_eq!(state.session().history_index, None);
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().scroller.offset(), 0);
+    }
+
+    #[test]
+    fn submit_records_the_message_in_history() {
+        let mut state = TuiState::new("model".into());
+        state.session().input = "hello".into();
+        state.session().input_cursor = 5;
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Enter)),
+            KeyAction::Submit("hello".into())
+        );
+        assert_eq!(state.session().history, vec!["hello".to_string()]);
+        assert_eq!(state.session().history_index, None);
+    }
+
+    #[test]
+    fn multi_line_history_entry_navigates_history_not_visual_lines() {
+        let mut state = TuiState::new("model".into());
+        for i in 0..30 {
+            state
+                .session()
+                .renderer
+                .on_event(text(&format!("line {i}\n")));
+        }
+        state.session().renderer.finish();
+        state.session().history = vec!["a\nb".into(), "c".into()];
+        let (pw, vp) = (state.pane_width, state.viewport);
+        let max = state.session().max_scroll(pw, vp);
+        assert!(max > 0);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().scroller.offset(), 3);
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "c");
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().input, "a\nb");
+        assert_eq!(state.session().history_index, Some(0));
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "c");
     }
 
     #[test]

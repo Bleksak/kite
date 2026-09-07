@@ -21,6 +21,8 @@ pub struct Session {
     pub gate: bool,
     pub stage: Option<Mode>,
     pub input_cursor: usize,
+    pub history: Vec<String>,
+    pub history_index: Option<usize>,
     tail_cache: (usize, usize, usize, usize),
 }
 
@@ -40,6 +42,8 @@ impl Session {
             gate: false,
             stage: None,
             input_cursor: 0,
+            history: Vec::new(),
+            history_index: None,
             tail_cache: (0, 0, 0, 0),
         }
     }

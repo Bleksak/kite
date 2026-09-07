@@ -1039,7 +1039,7 @@ mod test {
         .with_thinking(cell.clone(), None);
 
         let mut turn = async |agent: &mut Agent| {
-            let answer = agent.chat("hi", &mut |event| {}).await.unwrap();
+            let answer = agent.chat("hi", &mut |_event| {}).await.unwrap();
             assert_eq!(answer, ChatOutcome::Answer("ok".into()));
             rx.recv().await.unwrap()
         };
