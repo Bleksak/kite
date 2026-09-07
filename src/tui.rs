@@ -1722,15 +1722,11 @@ pub async fn run(
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
     let new_agent = std::sync::Arc::new(new_agent);
 
-    std::io::stdout().write_all(b"\x1b[?25l")?;
-    std::io::stdout().write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h")?;
-    std::io::stdout().write_all(b"\x1b[>7u\x1b[?u\x1b[c")?;
+    std::io::stdout().write_all(b"\x1b[>7u\x1b[?u")?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = std::io::stdout().write_all(b"\x1b[?25h");
         let _ = std::io::stdout().write_all(b"\x1b[<1u");
-        let _ = std::io::stdout().write_all(b"\x1b[>4;0m");
-        let _ = std::io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
         let _ = std::io::stdout().flush();
         default_hook(info);
     }));
@@ -1962,8 +1958,6 @@ pub async fn run(
         handle.abort();
     }
     std::io::stdout().write_all(b"\x1b[<1u")?;
-    std::io::stdout().write_all(b"\x1b[>4;0m")?;
-    std::io::stdout().write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")?;
     std::io::stdout().flush()?;
     drop(terminal);
     println!(
