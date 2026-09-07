@@ -89,7 +89,7 @@ pub enum TuiEvent {
     Agent { session: u64, event: AgentEvent },
     TurnDone { session: u64, context: Context },
     TurnError { session: u64, message: String },
-    GatePending { session: u64 },
+    GatePending { session: u64, message: String },
     StageChanged { session: u64, mode: Option<Mode> },
 }
 
@@ -1788,7 +1788,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let effective = session.stage.unwrap_or(shared);
     let mode_title = if session.gate {
         Line::from(Span::styled(
-            " 📋 plan ready — Enter to implement, type feedback to re-plan ".to_string(),
+            format!(" {} ", session.gate_message),
             Style::default().bold().fg(Color::Rgb(0xb5, 0xbd, 0x68)),
         ))
     } else {
@@ -1836,24 +1836,127 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     );
 }
 
+#[derive(serde::Deserialize)]
+struct SubmitPlanPayload {
+    #[serde(default)]
+    stages: Vec<crate::tool::PlanStage>,
+    #[serde(default)]
+    plan: Option<String>,
+}
+
+fn parse_stages(arguments: &str) -> Vec<crate::tool::PlanStage> {
+    let payload: SubmitPlanPayload =
+        serde_json::from_str(arguments).unwrap_or(SubmitPlanPayload {
+            stages: Vec::new(),
+            plan: None,
+        });
+    if !payload.stages.is_empty() {
+        return payload.stages;
+    }
+    let text = payload
+        .plan
+        .unwrap_or_else(|| crate::agent::terminator_payload(arguments, "plan"));
+    vec![crate::tool::PlanStage {
+        title: "Plan".to_string(),
+        tasks: vec![text],
+    }]
+}
+
+fn stage_implement_message(
+    stages: &Option<Vec<crate::tool::PlanStage>>,
+    index: usize,
+) -> String {
+    let Some(stages) = stages.as_ref() else {
+        return "Execute the plan.".to_string();
+    };
+    let stage = &stages[index];
+    let done = if index > 0 {
+        let done = stages[..index]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("Step {}: {}", i + 1, s.title))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("Stages already done: {done}.\n")
+    } else {
+        String::new()
+    };
+    let tasks = stage
+        .tasks
+        .iter()
+        .map(|task| format!("- {task}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Execute Step {} of {}: {}\nTasks:\n{tasks}\n{}Do not start later stages.",
+        index + 1,
+        stages.len(),
+        stage.title,
+        done
+    )
+}
+
+fn stage_replan_message(
+    stages: &Option<Vec<crate::tool::PlanStage>>,
+    index: usize,
+    feedback: &str,
+) -> String {
+    let Some(stages) = stages.as_ref() else {
+        return format!(
+            "The plan was rejected. Feedback: {feedback}\n\nRevise the plan and call submit_plan."
+        );
+    };
+    if index == 0 {
+        format!(
+            "The plan was rejected. Feedback: {feedback}\n\nOriginal plan:\n{}\n\nRevise the plan and call submit_plan.",
+            crate::tool::plan_text(stages)
+        )
+    } else {
+        format!(
+            "Step {} of {} is done. Feedback on the remaining stages: {feedback}\n\nRemaining stages:\n{}\n\nRevise the remaining stages and call submit_plan with all of them.",
+            index,
+            stages.len(),
+            crate::tool::plan_text(&stages[index..])
+        )
+    }
+}
+
 async fn handle_outcome(
     agent: &mut Agent,
     new_agent: &std::sync::Arc<dyn Fn() -> Agent + Send + Sync>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<TuiEvent>,
     id: u64,
     gate: &mut Option<String>,
+    stages: &mut Option<Vec<crate::tool::PlanStage>>,
+    stage_index: &mut usize,
     mut outcome: crate::agent::ChatOutcome,
 ) {
     loop {
         match &outcome {
             crate::agent::ChatOutcome::Terminated { tool, arguments } if tool == "submit_plan" => {
-                *gate = Some(crate::agent::terminator_payload(arguments, "plan"));
+                *stages = Some(parse_stages(arguments));
+                *stage_index = 0;
+                let (count, title) = stages
+                    .as_ref()
+                    .map(|s| {
+                        (
+                            s.len(),
+                            s.first().map(|stage| stage.title.clone()).unwrap_or_default(),
+                        )
+                    })
+                    .unwrap_or((0, String::new()));
+                *gate = Some(format!(
+                    "📋 plan ready ({count} stages) — Enter to implement Step 1: {title}, type feedback to re-plan"
+                ));
                 let context = agent.context.clone();
                 let _ = event_tx.send(TuiEvent::TurnDone {
                     session: id,
                     context,
                 });
-                let _ = event_tx.send(TuiEvent::GatePending { session: id });
+                let _ = event_tx.send(TuiEvent::GatePending {
+                    session: id,
+                    message: gate.clone().unwrap(),
+                });
                 return;
             }
             crate::agent::ChatOutcome::Terminated { tool, arguments } if tool == "escalate" => {
@@ -1863,9 +1966,18 @@ async fn handle_outcome(
                     session: id,
                     mode: Some(Mode::Plan),
                 });
-                let message = format!(
-                    "The implementation hit a blocker: {findings}\n\nRevise the plan, keeping what is already done, and call submit_plan."
-                );
+                let message = if let Some(s) = stages.as_ref() {
+                    format!(
+                        "The implementation hit a blocker at Step {} of {}: {}\n\nRevise the remaining stages (from the current one on), keeping what is already done, and call submit_plan with all of them.",
+                        *stage_index + 1,
+                        s.len(),
+                        findings
+                    )
+                } else {
+                    format!(
+                        "The implementation hit a blocker: {findings}\n\nRevise the plan, keeping what is already done, and call submit_plan."
+                    )
+                };
                 let tx = event_tx.clone();
                 match agent
                     .chat(&message, &mut |event| {
@@ -1887,6 +1999,36 @@ async fn handle_outcome(
                 }
             }
             _ => {
+                let review = agent.stage_mode() == Some(Mode::Implement)
+                    && stages
+                        .as_ref()
+                        .map(|s| *stage_index + 1 < s.len())
+                        .unwrap_or(false);
+                if review {
+                    *stage_index += 1;
+                    let title = stages
+                        .as_ref()
+                        .map(|s| s[*stage_index].title.clone())
+                        .unwrap_or_default();
+                    *gate = Some(format!(
+                        "📋 Step {} implemented — review the implementation and Step {}: {title} — Enter to implement, type feedback to re-plan",
+                        *stage_index, *stage_index + 1
+                    ));
+                    let context = agent.context.clone();
+                    let _ = event_tx.send(TuiEvent::TurnDone {
+                        session: id,
+                        context,
+                    });
+                    let _ = event_tx.send(TuiEvent::StageChanged {
+                        session: id,
+                        mode: Some(Mode::Plan),
+                    });
+                    let _ = event_tx.send(TuiEvent::GatePending {
+                        session: id,
+                        message: gate.clone().unwrap(),
+                    });
+                    return;
+                }
                 if agent.stage_mode() == Some(Mode::Implement) {
                     *agent = new_agent();
                     let _ = event_tx.send(TuiEvent::StageChanged {
@@ -1921,20 +2063,22 @@ fn spawn_agent(
             agent.context = context;
         }
         let mut gate: Option<String> = None;
+        let mut stages: Option<Vec<crate::tool::PlanStage>> = None;
+        let mut stage_index: usize = 0;
         let mut bg_rx = crate::bg::REGISTRY.subscribe();
         loop {
             tokio::select! {
                 input = input_rx.recv() => {
                     let Some(mut input) = input else { break; };
-                    if let Some(plan) = gate.take() {
+                    if gate.take().is_some() {
                         let message = if input.is_empty() {
                             agent = new_agent().with_pinned_mode(Mode::Implement);
                             let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Implement) });
-                            format!("Execute this plan:\n\n{plan}")
+                            stage_implement_message(&stages, stage_index)
                         } else {
                             agent = new_agent().with_pinned_mode(Mode::Plan);
                             let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
-                            format!("The plan was rejected. Feedback: {input}\n\nOriginal plan:\n{plan}\n\nRevise the plan and call submit_plan.")
+                            stage_replan_message(&stages, stage_index, &input)
                         };
                         input = message;
                     }
@@ -1956,6 +2100,8 @@ fn spawn_agent(
                                 &event_tx,
                                 id,
                                 &mut gate,
+                                &mut stages,
+                                &mut stage_index,
                                 outcome,
                             )
                             .await;
@@ -1988,6 +2134,8 @@ fn spawn_agent(
                                     &event_tx,
                                     id,
                                     &mut gate,
+                                    &mut stages,
+                                    &mut stage_index,
                                     outcome,
                                 )
                                 .await;
@@ -2179,9 +2327,10 @@ pub async fn run(
                             }
                         }
                     }
-                    Some(TuiEvent::GatePending { session: id }) => {
+                    Some(TuiEvent::GatePending { session: id, message }) => {
                         if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
                             session.gate = true;
+                            session.gate_message = message;
                         }
                     }
                     Some(TuiEvent::StageChanged { session: id, mode }) => {
@@ -4739,7 +4888,7 @@ mod test {
     async fn plan_gate_approval_runs_the_implement_stage_then_resets() {
         let (tx_req, mut rx_req) = tokio::sync::mpsc::unbounded_channel::<String>();
         let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"tasks\\\":[\\\"do it\\\"]}]}\"}}]}}]}\n\ndata: [DONE]\n\n".to_string(),
             "data: {\"choices\":[{\"delta\":{\"content\":\"implemented\"}}]}\n\ndata: [DONE]\n\n".to_string(),
         ])));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4819,7 +4968,7 @@ mod test {
         }
         let implement_request = requests
             .into_iter()
-            .find(|body| body.contains("Execute this plan"))
+            .find(|body| body.contains("Execute Step 1 of 1"))
             .expect("the implement stage request carries the plan");
         assert!(implement_request.contains("step one"));
         assert!(events.iter().any(|e| matches!(
@@ -4834,6 +4983,176 @@ mod test {
                 .iter()
                 .any(|e| matches!(e, TuiEvent::TurnDone { .. }))
         );
+    }
+
+    async fn staged_mock_server(responses: Vec<String>) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx_req, rx_req) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let responses = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx_req.clone();
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                data.extend_from_slice(&buf[..n]);
+                                if let Some(body) = complete_request(&data) {
+                                    let _ = tx.send(body);
+                                    let sse = match responses.lock().unwrap().pop_front() {
+                                        Some(response) => response,
+                                        None => "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+                                    };
+                                    let response = format!(
+                                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
+                                    );
+                                    if socket.write_all(response.as_bytes()).await.is_err() {
+                                        break;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), rx_req)
+    }
+
+    fn plan_sse(id: &str, stages: &str) -> String {
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"__ID__\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"__STAGES__\"}}]}}]}\n\ndata: [DONE]\n\n"
+            .replace("__ID__", id)
+            .replace("__STAGES__", stages)
+    }
+
+    #[tokio::test]
+    async fn staged_plan_walks_through_every_stage_with_a_review_gate() {
+        let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
+        let (base_url, mut rx_req) = staged_mock_server(vec![
+            plan_sse("c1", stages),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"stage one done\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"stage two done\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+        ]).await;
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(base_url),
+        );
+        let shared = Arc::new(Mutex::new(Mode::Yolo));
+        let factory = Arc::new(move || {
+            Agent::new(
+                client.clone(),
+                "test-model",
+                shared.clone(),
+                10000,
+                Duration::from_secs(30),
+            )
+            .with_pinned_mode(Mode::Plan)
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
+        let (input_tx, handle) = spawn_agent(1, factory, None, event_tx);
+        let mut events = vec![];
+
+        input_tx.send("plan me".to_string()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { message, .. } if message.contains("plan ready (2 stages)")
+                    && message.contains("Step 1: data")
+            ))
+            .await
+        );
+
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { message, .. } if message.contains("Step 1 implemented")
+                    && message.contains("Step 2: api")
+            ))
+            .await
+        );
+
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::StageChanged { mode: None, .. }
+            ))
+            .await
+        );
+        handle.abort();
+
+        let mut requests = vec![];
+        while let Ok(body) = rx_req.try_recv() {
+            requests.push(body);
+        }
+        assert!(requests.iter().any(|body| body.contains("Execute Step 1 of 2: data")));
+        assert!(requests.iter().any(|body| body.contains("Do not start later stages")));
+        assert!(requests.iter().any(|body| body.contains("Execute Step 2 of 2: api")));
+        assert!(requests.iter().any(|body| body.contains("Stages already done: Step 1: data")));
+    }
+
+    #[tokio::test]
+    async fn review_gate_feedback_replans_the_remaining_stages() {
+        let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
+        let (base_url, mut rx_req) = staged_mock_server(vec![
+            plan_sse("c1", stages),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"stage one done\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+        ]).await;
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(base_url),
+        );
+        let shared = Arc::new(Mutex::new(Mode::Yolo));
+        let factory = Arc::new(move || {
+            Agent::new(
+                client.clone(),
+                "test-model",
+                shared.clone(),
+                10000,
+                Duration::from_secs(30),
+            )
+            .with_pinned_mode(Mode::Plan)
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
+        let (input_tx, handle) = spawn_agent(1, factory, None, event_tx);
+        let mut events = vec![];
+
+        input_tx.send("plan me".to_string()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { .. }
+            ))
+            .await
+        );
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { message, .. } if message.contains("Step 1 implemented")
+            ))
+            .await
+        );
+        input_tx.send("api should be rest".to_string()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+
+        let mut requests = vec![];
+        while let Ok(body) = rx_req.try_recv() {
+            requests.push(body);
+        }
+        let replan = requests
+            .iter()
+            .find(|body| body.contains("Feedback on the remaining stages"))
+            .expect("the review gate feedback re-plans the remaining stages");
+        assert!(replan.contains("api should be rest"));
+        assert!(replan.contains("Step 1 of 2 is done"));
+        assert!(replan.contains("Revise the remaining stages"));
     }
 
     fn parse(bytes: &[u8]) -> Vec<TermEvent> {

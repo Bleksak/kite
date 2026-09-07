@@ -7,7 +7,7 @@ use tokio::process::Command;
 use similar::TextDiff;
 
 use openai_oxide::types::chat::{FunctionDef, Tool as OpenAITool, ToolCall as OpenAIToolCall};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Debug, thiserror::Error)]
@@ -75,8 +75,31 @@ pub enum Tool {
     WebFetch(String),
     BgRun(String),
     AskUser(Vec<Question>),
-    SubmitPlan(String),
+    SubmitPlan(Vec<PlanStage>),
     Escalate(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStage {
+    pub title: String,
+    pub tasks: Vec<String>,
+}
+
+pub fn plan_text(stages: &[PlanStage]) -> String {
+    stages
+        .iter()
+        .enumerate()
+        .map(|(i, stage)| {
+            let tasks = stage
+                .tasks
+                .iter()
+                .map(|task| format!("- {task}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Step {} of {}: {}\n{}", i + 1, stages.len(), stage.title, tasks)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 pub enum ToolOutput {
@@ -162,7 +185,7 @@ impl Tool {
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
-            Tool::SubmitPlan(plan) => ToolOutput::Before(plan.clone()),
+            Tool::SubmitPlan(stages) => ToolOutput::Before(plan_text(stages)),
             Tool::Escalate(findings) => ToolOutput::Before(findings.clone()),
         }
     }
@@ -183,7 +206,9 @@ impl Tool {
             Tool::AskUser(_) => {
                 "Ask the user one or more questions and wait for their answers. Use it when you need a decision, preference, or information only the user can provide. Question types: single_choice (the user picks one option or types their own answer), multi_choice (the user picks any number of options and/or types their own answer), free (the user types their own answer). Provide options for the choice types. You may ask several questions in one call; the user answers them step by step. Call this alone, without other tools."
             }
-            Tool::SubmitPlan(_) => "Submit the final plan. Call this alone, without other tools.",
+            Tool::SubmitPlan(_) => {
+                "Submit the final plan, split into stages. Call this alone, without other tools."
+            }
             Tool::Escalate(_) => {
                 "Escalate a blocker you cannot resolve. Call this alone, without other tools."
             }
@@ -444,7 +469,7 @@ struct WebFetchArgs {
 
 #[derive(Deserialize)]
 struct SubmitPlanArgs {
-    plan: String,
+    stages: Vec<PlanStage>,
 }
 
 #[derive(Deserialize)]
@@ -518,7 +543,29 @@ impl TryFrom<OpenAIToolCall> for Tool {
             "bg_run" => parse_args::<BashArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::BgRun(a.command)),
             "submit_plan" => parse_args::<SubmitPlanArgs>(&function.name, &function.arguments)
-                .map(|a| Tool::SubmitPlan(a.plan)),
+                .and_then(|a| {
+                    if a.stages.is_empty() {
+                        Err(ToolError::InvalidArguments {
+                            name: function.name.clone(),
+                            raw: function.arguments.clone(),
+                            source: serde::de::Error::custom("stages must not be empty"),
+                        })
+                    } else if a
+                        .stages
+                        .iter()
+                        .any(|s| s.title.trim().is_empty() || s.tasks.is_empty())
+                    {
+                        Err(ToolError::InvalidArguments {
+                            name: function.name.clone(),
+                            raw: function.arguments.clone(),
+                            source: serde::de::Error::custom(
+                                "each stage needs a title and at least one task",
+                            ),
+                        })
+                    } else {
+                        Ok(Tool::SubmitPlan(a.stages))
+                    }
+                }),
             "escalate" => parse_args::<EscalateArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::Escalate(a.findings)),
             "ask_user" => parse_args::<AskUserArgs>(&function.name, &function.arguments)
@@ -633,9 +680,26 @@ fn parameters(tool: &Tool) -> serde_json::Value {
         Tool::SubmitPlan(_) => json!({
             "type": "object",
             "properties": {
-                "plan": { "type": "string", "description": "the complete, step-by-step implementation plan" }
+                "stages": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "the implementation plan split into stages; each stage is a self-contained set of tasks the user reviews before it is implemented",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string", "description": "a short stage name" },
+                            "tasks": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": { "type": "string" },
+                                "description": "the concrete tasks of this stage"
+                            }
+                        },
+                        "required": ["title", "tasks"]
+                    }
+                }
             },
-            "required": ["plan"]
+            "required": ["stages"]
         }),
         Tool::Escalate(_) => json!({
             "type": "object",
@@ -649,7 +713,7 @@ fn parameters(tool: &Tool) -> serde_json::Value {
 
 #[cfg(test)]
 mod test {
-    use crate::tool::{Tool, ToolError, Question, QuestionKind, tool_definitions};
+    use crate::tool::{Tool, ToolError, Question, QuestionKind, PlanStage, plan_text, tool_definitions};
     use openai_oxide::types::chat::{FunctionCall, ToolCall as OpenAIToolCall};
     use std::io::{Read, Write};
     use std::time::Duration;
@@ -1335,6 +1399,62 @@ version: 3"#,
         }]);
         let error = tool.invoke(Duration::from_secs(1)).await.unwrap_err();
         assert!(matches!(error, ToolError::InteractiveNotExecutable));
+    }
+
+    #[test]
+    fn try_from_submit_plan_stages() {
+        let tool = Tool::try_from(call(
+            "submit_plan",
+            r#"{"stages":[{"title":"data","tasks":["entity","migration"]},{"title":"api","tasks":["controller"]}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            tool,
+            Tool::SubmitPlan(vec![
+                PlanStage {
+                    title: "data".into(),
+                    tasks: vec!["entity".into(), "migration".into()],
+                },
+                PlanStage {
+                    title: "api".into(),
+                    tasks: vec!["controller".into()],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn try_from_submit_plan_empty_stages_is_error() {
+        let error = Tool::try_from(call("submit_plan", r#"{"stages":[]}"#)).unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn try_from_submit_plan_stage_without_tasks_is_error() {
+        let error = Tool::try_from(call(
+            "submit_plan",
+            r#"{"stages":[{"title":"data","tasks":[]}]}"#,
+        ))
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn plan_text_renders_the_stages() {
+        let stages = vec![
+            PlanStage {
+                title: "data".into(),
+                tasks: vec!["entity".into(), "migration".into()],
+            },
+            PlanStage {
+                title: "api".into(),
+                tasks: vec!["controller".into()],
+            },
+        ];
+        assert_eq!(
+            plan_text(&stages),
+            "Step 1 of 2: data\n- entity\n- migration\n\nStep 2 of 2: api\n- controller"
+        );
     }
 
     fn serve_once(response: &str) -> (String, std::thread::JoinHandle<()>) {

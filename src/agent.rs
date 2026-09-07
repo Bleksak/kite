@@ -138,7 +138,7 @@ impl Agent {
             {
                 self.context.messages.push(message.clone());
                 let body = match Tool::try_from(call.clone()) {
-                    Ok(Tool::SubmitPlan(plan)) => Some(plan),
+                    Ok(Tool::SubmitPlan(stages)) => Some(crate::tool::plan_text(&stages)),
                     _ => None,
                 };
                 on_event(AgentEvent::ToolStarted {
@@ -1214,7 +1214,7 @@ mod test {
 
     #[tokio::test]
     async fn the_terminator_ends_the_turn_and_captures_the_payload() {
-        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"tasks\\\":[\\\"do it\\\"]}]}\"}}]}}]}\n\ndata: [DONE]\n\n";
         let (base_url, _requests) = mock_server(vec![sse.to_string()]).await;
         let mut agent = plan_agent(base_url);
         let mut events = Vec::new();
@@ -1227,7 +1227,7 @@ mod test {
             outcome,
             ChatOutcome::Terminated {
                 tool: "submit_plan".into(),
-                arguments: "{\"plan\":\"step one\"}".into()
+                arguments: "{\"stages\":[{\"title\":\"step one\",\"tasks\":[\"do it\"]}]}".into()
             }
         );
         assert!(events.iter().any(|event| {
@@ -1239,7 +1239,7 @@ mod test {
     async fn sibling_calls_are_dropped_when_the_terminator_is_called() {
         let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n"
             .to_string()
-            + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\n"
+            + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"tasks\\\":[\\\"do it\\\"]}]}\"}}]}}]}\n\n"
             + "data: [DONE]\n\n";
         let (base_url, _requests) = mock_server(vec![sse]).await;
         let mut agent = plan_agent(base_url);
@@ -1279,7 +1279,7 @@ mod test {
 
     #[tokio::test]
     async fn yolo_rejects_submit_plan_at_execution_time() {
-        let tool_call_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"plan\\\":\\\"step one\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let tool_call_sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"tasks\\\":[\\\"do it\\\"]}]}\"}}]}}]}\n\ndata: [DONE]\n\n";
         let answer_sse =
             "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
         let (base_url, _requests) =

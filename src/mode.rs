@@ -40,7 +40,7 @@ impl Mode {
                 Tool::ReadFile(String::new(), None, None),
                 Tool::ReadOnlyBash(String::new()),
                 Tool::AskUser(Vec::new()),
-                Tool::SubmitPlan(String::new()),
+                Tool::SubmitPlan(Vec::new()),
             ],
             Self::Implement => vec![
                 Tool::ReadFile(String::new(), None, None),
@@ -74,10 +74,10 @@ impl Mode {
                 "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. When you need a decision, preference, or information only the user can provide, call ask_user and wait for the answer — do not guess. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them."
             }
             Self::Plan => {
-                "You are a planning agent. Investigate the codebase with read_file and read-only bash commands, then call submit_plan with a concrete, step-by-step implementation plan. Do not modify any files. Call submit_plan alone, without other tools."
+                "You are a planning agent. Investigate the codebase with read_file and read-only bash commands, then call submit_plan with a concrete implementation plan split into stages. Each stage is a self-contained set of tasks that can be implemented and verified on its own; the user reviews each stage's implementation before the next stage starts, so order the stages from foundation to finish. Do not modify any files. Call submit_plan alone, without other tools."
             }
             Self::Implement => {
-                "You are an implementation agent. Execute the plan step by step with the tools. Verify your work (build, tests) with bash or bg_run. If you hit a blocker you cannot resolve, call escalate alone with a description of the blocker; do not guess around it."
+                "You are an implementation agent. Execute the current stage step by step with the tools. Verify your work (build, tests) with bash or bg_run. Do not start later stages; the user reviews this stage before the next one begins. If you hit a blocker you cannot resolve, call escalate alone with a description of the blocker; do not guess around it."
             }
         }
     }
@@ -138,7 +138,7 @@ mod test {
     fn plan_allows_its_tools_and_rejects_the_rest() {
         assert!(Mode::Plan.allows(&Tool::ReadFile("a".into(), None, None)));
         assert!(Mode::Plan.allows(&Tool::ReadOnlyBash("ls".into())));
-        assert!(Mode::Plan.allows(&Tool::SubmitPlan("plan".into())));
+        assert!(Mode::Plan.allows(&Tool::SubmitPlan(Vec::new())));
         assert!(!Mode::Plan.allows(&Tool::Bash("ls".into())));
         assert!(!Mode::Plan.allows(&Tool::WriteFile("a".into(), "x".into())));
         assert!(!Mode::Plan.allows(&Tool::EditFile("a".into(), "x".into(), "y".into())));
@@ -172,7 +172,7 @@ mod test {
     #[test]
     fn implement_terminator_is_escalate_and_rejects_submit_plan() {
         assert_eq!(Mode::Implement.terminator(), Some("escalate"));
-        assert!(!Mode::Implement.allows(&Tool::SubmitPlan("plan".into())));
+        assert!(!Mode::Implement.allows(&Tool::SubmitPlan(Vec::new())));
         assert!(Mode::Implement.allows(&Tool::Escalate("blocker".into())));
         assert!(Mode::Implement.allows(&Tool::WriteFile("a".into(), "x".into())));
     }
@@ -185,7 +185,7 @@ mod test {
 
     #[test]
     fn yolo_rejects_submit_plan() {
-        assert!(!Mode::Yolo.allows(&Tool::SubmitPlan("plan".into())));
+        assert!(!Mode::Yolo.allows(&Tool::SubmitPlan(Vec::new())));
     }
 
     #[test]
