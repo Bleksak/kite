@@ -803,14 +803,14 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 state.plan_open = false;
                 KeyAction::None
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 if state.plan_view > 0 {
                     state.plan_view -= 1;
                     state.plan_scroll = Scroller::at_tail();
                 }
                 KeyAction::None
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 if state.plan_view + 1 < len {
                     state.plan_view += 1;
                     state.plan_scroll = Scroller::at_tail();
@@ -910,14 +910,14 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 state.diff_open = false;
                 KeyAction::None
             }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 state.diff_file_index = state.diff_file_index.saturating_sub(1);
                 state.diff_cursor = 0;
                 state.diff_anchor = None;
                 state.diff_start = 0;
                 KeyAction::None
             }
-            KeyCode::Right => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 if state.diff_file_index + 1 < file_count {
                     state.diff_file_index += 1;
                     state.diff_cursor = 0;
@@ -3226,9 +3226,11 @@ mod test {
         assert_eq!(state.plan_view, 0);
         handle_key(&mut state, &key(KeyCode::Right));
         assert_eq!(state.plan_view, 1);
-        handle_key(&mut state, &key(KeyCode::Right));
+        handle_key(&mut state, &key(KeyCode::Char('l')));
         assert_eq!(state.plan_view, 1);
-        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Char('h')));
+        assert_eq!(state.plan_view, 0);
+        handle_key(&mut state, &key(KeyCode::Char('h')));
         assert_eq!(state.plan_view, 0);
     }
 
@@ -3296,11 +3298,11 @@ mod test {
 
         handle_key(&mut state, &key(KeyCode::Right));
         assert_eq!(state.diff_file_index, 1);
-        handle_key(&mut state, &key(KeyCode::Right));
+        handle_key(&mut state, &key(KeyCode::Char('l')));
         assert_eq!(state.diff_file_index, 1);
-        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Char('h')));
         assert_eq!(state.diff_file_index, 0);
-        handle_key(&mut state, &key(KeyCode::Left));
+        handle_key(&mut state, &key(KeyCode::Char('h')));
         assert_eq!(state.diff_file_index, 0);
     }
 

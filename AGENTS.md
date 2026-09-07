@@ -34,12 +34,12 @@
   Escalating re-plans the remaining stages automatically in a fresh plan context
   and the step review gate opens again
 - C-p: open/close the plan popup — shows the viewed stage's title and tasks
-  (like the background job details); ←/→ switch the viewed step, jk/PgUp/PgDn/
+  (like the background job details); ←/→ or hl switch the viewed step, jk/PgUp/PgDn/
   wheel scroll, p/q/esc close it
 - C-g: open/close the review popup — shows the file changes as a git diff
   (the stage's changes against a snapshot taken at stage start, so bash-made
   changes are included too; in normal mode, against the last commit), one
-  file at a time: ←/→ switch files, jk move the cursor, v set/clear the
+  file at a time: ←/→ or hl switch files, jk move the cursor, v set/clear the
   selection anchor, c comment on the selection (type, arrows/ctrl+arrows move
   the cursor like in the prompt, Enter submits, Esc cancels; comments
   reference the selected line range, render under their line, and c
