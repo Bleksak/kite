@@ -2028,8 +2028,17 @@ fn parse_stages(arguments: &str) -> Vec<crate::tool::PlanStage> {
     let value: serde_json::Value =
         serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
 
-    if let Some(stages) = value.get("stages").and_then(|s| s.as_array()) {
-        let parsed: Vec<crate::tool::PlanStage> = stages
+    let stages_value = match value.get("stages") {
+        Some(serde_json::Value::String(encoded)) => {
+            serde_json::from_str::<serde_json::Value>(encoded)
+                .ok()
+                .or_else(|| Some(serde_json::Value::String(encoded.clone())))
+        }
+        other => other.cloned(),
+    };
+
+    if let Some(serde_json::Value::Array(items)) = stages_value {
+        let parsed: Vec<crate::tool::PlanStage> = items
             .iter()
             .filter_map(|item| {
                 if let Some(title) = item.as_str() {
@@ -3070,6 +3079,17 @@ mod test {
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].title, "Plan");
         assert_eq!(stages[0].tasks, vec!["the whole plan as text".to_string()]);
+    }
+
+    #[test]
+    fn parse_stages_accepts_a_double_encoded_stages_string() {
+        let inner = r#"[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]"#;
+        let args = format!("{{\"stages\":{}}}", serde_json::to_string(inner).unwrap());
+        let stages = parse_stages(&args);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].title, "One");
+        assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(stages[1].title, "Two");
     }
 
     #[test]
