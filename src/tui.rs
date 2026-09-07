@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::mem;
 use std::path::Path;
@@ -12,7 +13,6 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
-use termwiz::terminal::Terminal as _;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyCode {
@@ -1739,6 +1739,33 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<TermEvent>();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut parser = termwiz::input::InputParser::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let maybe_more = n == buf.len();
+                    parser.parse(
+                        &buf[..n],
+                        |event| {
+                            if let Some(term_event) = map_termwiz_event(event) {
+                                if key_tx.send(term_event).is_err() {
+                                    std::process::exit(1);
+                                }
+                            }
+                        },
+                        maybe_more,
+                    );
+                }
+                Ok(_) => continue,
+                Err(_) => return,
+            }
+        }
+    });
+
     let mut state =
         TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
             .with_thinking(thinking)
@@ -1781,66 +1808,6 @@ pub async fn run(
     let mut session_watch = tokio::time::interval(std::time::Duration::from_secs(2));
 
     loop {
-        let mut should_quit = false;
-        loop {
-            let event = match terminal
-                .backend_mut()
-                .buffered_terminal_mut()
-                .terminal()
-                .poll_input(Some(std::time::Duration::ZERO))
-            {
-                Ok(event) => event,
-                Err(e) => return Err(e.into()),
-            };
-            let Some(event) = event else {
-                break;
-            };
-            let Some(term_event) = map_termwiz_event(event) else {
-                continue;
-            };
-            let ids_before: Vec<u64> = state.sessions.iter().map(|s| s.id).collect();
-            match handle_key(&mut state, &term_event) {
-                KeyAction::Submit(task) => {
-                    let id = state.sessions[state.active].id;
-                    let session = &mut state.sessions[state.active];
-                    session.error = None;
-                    session.running = true;
-                    if !task.is_empty() {
-                        session.renderer.push_user(&task);
-                    }
-                    let max = session.max_scroll(state.pane_width, state.viewport);
-                    session.scroller.end(max);
-                    inputs[&id].send(task)?;
-                }
-                KeyAction::Quit => {
-                    should_quit = true;
-                    break;
-                }
-                KeyAction::NewSession => {
-                    let id = state.sessions[state.active].id;
-                    let (input_tx, input_handle) =
-                        spawn_agent(id, new_agent.clone(), None, agent_tx.clone());
-                    inputs.insert(id, input_tx);
-                    handles.insert(id, input_handle);
-                }
-                KeyAction::CloseSession => {
-                    let removed = ids_before
-                        .into_iter()
-                        .find(|id| !state.sessions.iter().any(|s| s.id == *id));
-                    if let Some(id) = removed {
-                        if let Some(handle) = handles.remove(&id) {
-                            handle.abort();
-                        }
-                        inputs.remove(&id);
-                        session_store::remove_session_file(Path::new(CONTEXT_DIR), id);
-                    }
-                }
-                KeyAction::None => {}
-            }
-        }
-        if should_quit {
-            break;
-        }
         tokio::select! {
             _ = session_watch.tick() => {
                 let removed: Vec<u64> = state
@@ -1910,6 +1877,47 @@ pub async fn run(
                         }
                     }
                     None => break,
+                }
+            }
+            key = key_rx.recv() => {
+                let Some(term_event) = key else {
+                    break;
+                };
+                let ids_before: Vec<u64> = state.sessions.iter().map(|s| s.id).collect();
+                match handle_key(&mut state, &term_event) {
+                    KeyAction::Submit(task) => {
+                        let id = state.sessions[state.active].id;
+                        let session = &mut state.sessions[state.active];
+                        session.error = None;
+                        session.running = true;
+                        if !task.is_empty() {
+                            session.renderer.push_user(&task);
+                        }
+                        let max = session.max_scroll(state.pane_width, state.viewport);
+                        session.scroller.end(max);
+                        inputs[&id].send(task)?;
+                    }
+                    KeyAction::Quit => break,
+                    KeyAction::NewSession => {
+                        let id = state.sessions[state.active].id;
+                        let (input_tx, input_handle) =
+                            spawn_agent(id, new_agent.clone(), None, agent_tx.clone());
+                        inputs.insert(id, input_tx);
+                        handles.insert(id, input_handle);
+                    }
+                    KeyAction::CloseSession => {
+                        let removed = ids_before
+                            .into_iter()
+                            .find(|id| !state.sessions.iter().any(|s| s.id == *id));
+                        if let Some(id) = removed {
+                            if let Some(handle) = handles.remove(&id) {
+                                handle.abort();
+                            }
+                            inputs.remove(&id);
+                            session_store::remove_session_file(Path::new(CONTEXT_DIR), id);
+                        }
+                    }
+                    KeyAction::None => {}
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(16)) => {}
