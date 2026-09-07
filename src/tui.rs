@@ -256,7 +256,7 @@ fn render_panel<'a>(
         .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
         .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
         .title(title);
-    frame.render_widget(Fill, rect);
+    frame.render_widget(Fill(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32))), rect);
     frame.render_widget(paragraph.block(block), rect);
 }
 
@@ -1615,13 +1615,13 @@ fn display_lines(
         .collect()
 }
 
-struct Fill;
+struct Fill(Style);
 
 impl Widget for Fill {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let spaces = " ".repeat(area.width as usize);
         for y in 0..area.height {
-            buf.set_string(area.x, area.y + y, &spaces, Style::default());
+            buf.set_stringn(area.x, area.y + y, &spaces, area.width as usize, self.0);
         }
     }
 }
@@ -1684,7 +1684,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(95, 135, 255))),
     );
-    frame.render_widget(Fill, chunks[1]);
+    frame.render_widget(Fill(Style::default()), chunks[1]);
     frame.render_widget(main, chunks[1]);
 
     if state.picker_open {
