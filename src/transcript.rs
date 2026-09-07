@@ -291,6 +291,8 @@ impl TuiRenderer {
                 self.push_line(padding_line(), BlockKind::ToolDone);
             }
 
+            AgentEvent::AskUser { .. } => {}
+
             AgentEvent::BgTaskDone { id, command, code } => {
                 let status = match code {
                     Some(0) => "exit 0".to_string(),

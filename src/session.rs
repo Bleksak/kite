@@ -5,7 +5,45 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 
 use crate::context::Context;
 use crate::mode::Mode;
+use crate::tool::Question;
 use crate::transcript::TuiRenderer;
+
+#[derive(Debug, Clone)]
+pub struct QuestionState {
+    pub questions: Vec<Question>,
+    pub step: usize,
+    pub answers: Vec<String>,
+    pub cursor: usize,
+    pub selected: Vec<bool>,
+    pub draft: String,
+    pub draft_cursor: usize,
+    pub reply: Option<tokio::sync::watch::Sender<Option<Vec<String>>>>,
+}
+
+impl QuestionState {
+    pub fn new(questions: Vec<Question>) -> QuestionState {
+        let mut state = QuestionState {
+            questions,
+            step: 0,
+            answers: Vec::new(),
+            cursor: 0,
+            selected: Vec::new(),
+            draft: String::new(),
+            draft_cursor: 0,
+            reply: None,
+        };
+        state.reset_step();
+        state
+    }
+
+    pub fn reset_step(&mut self) {
+        let options = &self.questions[self.step].options;
+        self.cursor = 0;
+        self.selected = options.iter().map(|_| false).collect();
+        self.draft.clear();
+        self.draft_cursor = 0;
+    }
+}
 
 pub struct Session {
     pub id: u64,
@@ -24,6 +62,7 @@ pub struct Session {
     pub input_scroll: usize,
     pub history: Vec<String>,
     pub history_index: Option<usize>,
+    pub question: Option<QuestionState>,
     tail_cache: (usize, usize, usize, usize),
 }
 
@@ -46,6 +85,7 @@ impl Session {
             input_scroll: 0,
             history: Vec::new(),
             history_index: None,
+            question: None,
             tail_cache: (0, 0, 0, 0),
         }
     }

@@ -34,10 +34,12 @@ impl Mode {
                 Tool::EditFile(String::new(), String::new(), String::new()),
                 Tool::WebFetch(String::new()),
                 Tool::BgRun(String::new()),
+                Tool::AskUser(Vec::new()),
             ],
             Self::Plan => vec![
                 Tool::ReadFile(String::new(), None, None),
                 Tool::ReadOnlyBash(String::new()),
+                Tool::AskUser(Vec::new()),
                 Tool::SubmitPlan(String::new()),
             ],
             Self::Implement => vec![
@@ -48,6 +50,7 @@ impl Mode {
                 Tool::EditFile(String::new(), String::new(), String::new()),
                 Tool::WebFetch(String::new()),
                 Tool::BgRun(String::new()),
+                Tool::AskUser(Vec::new()),
                 Tool::Escalate(String::new()),
             ],
         }
@@ -68,7 +71,7 @@ impl Mode {
     pub fn system_prompt(&self) -> &'static str {
         match self {
             Self::Yolo => {
-                "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them."
+                "You are a coding agent. Use the tools to accomplish tasks. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. When you need a decision, preference, or information only the user can provide, call ask_user and wait for the answer — do not guess. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. Before quoting or summarizing any file's content, re-read it. Never answer from remembered file content — files may have changed since you last saw them."
             }
             Self::Plan => {
                 "You are a planning agent. Investigate the codebase with read_file and read-only bash commands, then call submit_plan with a concrete, step-by-step implementation plan. Do not modify any files. Call submit_plan alone, without other tools."
@@ -105,7 +108,8 @@ mod test {
                 "write_file",
                 "edit_file",
                 "webfetch",
-                "bg_run"
+                "bg_run",
+                "ask_user"
             ]
         );
     }
@@ -118,7 +122,10 @@ mod test {
             .iter()
             .map(|tool| tool.function.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["read_file", "readonly_bash", "submit_plan"]);
+        assert_eq!(
+            names,
+            vec!["read_file", "readonly_bash", "ask_user", "submit_plan"]
+        );
     }
 
     #[test]
@@ -156,6 +163,7 @@ mod test {
                 "edit_file",
                 "webfetch",
                 "bg_run",
+                "ask_user",
                 "escalate"
             ]
         );

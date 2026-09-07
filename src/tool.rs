@@ -28,6 +28,9 @@ pub enum ToolError {
     #[error("terminator tools are intercepted and never executed")]
     TerminatorNotExecutable,
 
+    #[error("ask_user is answered interactively by the TUI and never executed directly")]
+    InteractiveNotExecutable,
+
     #[error("webfetch of {url} failed: {source}")]
     WebFetchFailed { url: String, source: reqwest::Error },
 
@@ -48,6 +51,20 @@ pub enum ToolError {
     UnknownTool { name: String },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuestionKind {
+    SingleChoice,
+    MultiChoice,
+    Free,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Question {
+    pub prompt: String,
+    pub kind: QuestionKind,
+    pub options: Vec<String>,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Tool {
     Bash(String),
@@ -57,12 +74,13 @@ pub enum Tool {
     EditFile(String, String, String),
     WebFetch(String),
     BgRun(String),
+    AskUser(Vec<Question>),
     SubmitPlan(String),
     Escalate(String),
 }
 
-pub enum ToolOutput<'a> {
-    Before(&'a str),
+pub enum ToolOutput {
+    Before(String),
     After,
 }
 
@@ -89,6 +107,7 @@ impl Tool {
             Tool::EditFile(_, _, _) => "edit_file",
             Tool::WebFetch(_) => "webfetch",
             Tool::BgRun(_) => "bg_run",
+            Tool::AskUser(_) => "ask_user",
             Tool::SubmitPlan(_) => "submit_plan",
             Tool::Escalate(_) => "escalate",
         }
@@ -114,22 +133,37 @@ impl Tool {
             Tool::EditFile(path, _, _) => format!("edit_file: {path}"),
             Tool::WebFetch(url) => format!("webfetch: {url}"),
             Tool::BgRun(_) => "bg_run".to_string(),
+            Tool::AskUser(questions) => format!(
+                "ask_user: {}",
+                questions
+                    .first()
+                    .map(|q| q.prompt.chars().take(40).collect::<String>())
+                    .unwrap_or_default()
+            ),
             Tool::SubmitPlan(_) => "submit_plan".to_string(),
             Tool::Escalate(_) => "escalate".to_string(),
         }
     }
 
-    pub fn output(&self) -> ToolOutput<'_> {
+    pub fn output(&self) -> ToolOutput {
         match self {
-            Tool::Bash(cmd) => ToolOutput::Before(cmd),
-            Tool::ReadOnlyBash(cmd) => ToolOutput::Before(cmd),
+            Tool::Bash(cmd) => ToolOutput::Before(cmd.clone()),
+            Tool::ReadOnlyBash(cmd) => ToolOutput::Before(cmd.clone()),
             Tool::ReadFile(..) => ToolOutput::After,
-            Tool::WriteFile(_, content) => ToolOutput::Before(content),
+            Tool::WriteFile(_, content) => ToolOutput::Before(content.clone()),
             Tool::EditFile(..) => ToolOutput::After,
-            Tool::WebFetch(url) => ToolOutput::Before(url),
-            Tool::BgRun(command) => ToolOutput::Before(command),
-            Tool::SubmitPlan(plan) => ToolOutput::Before(plan),
-            Tool::Escalate(findings) => ToolOutput::Before(findings),
+            Tool::WebFetch(url) => ToolOutput::Before(url.clone()),
+            Tool::BgRun(command) => ToolOutput::Before(command.clone()),
+            Tool::AskUser(questions) => ToolOutput::Before(
+                questions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| format!("{}. {}", i + 1, q.prompt))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Tool::SubmitPlan(plan) => ToolOutput::Before(plan.clone()),
+            Tool::Escalate(findings) => ToolOutput::Before(findings.clone()),
         }
     }
 
@@ -145,6 +179,9 @@ impl Tool {
             Tool::WebFetch(_) => "Fetch a URL and return the response body",
             Tool::BgRun(_) => {
                 "Run a long-running command in the background (tests, builds, dev servers). Returns a task id immediately; the task's result is reported automatically when it finishes"
+            }
+            Tool::AskUser(_) => {
+                "Ask the user one or more questions and wait for their answers. Use it when you need a decision, preference, or information only the user can provide. Question types: single_choice (the user picks one option or types their own answer), multi_choice (the user picks any number of options and/or types their own answer), free (the user types their own answer). Provide options for the choice types. You may ask several questions in one call; the user answers them step by step. Call this alone, without other tools."
             }
             Tool::SubmitPlan(_) => "Submit the final plan. Call this alone, without other tools.",
             Tool::Escalate(_) => {
@@ -303,6 +340,7 @@ impl Tool {
             }
             Tool::SubmitPlan(_) => Err(ToolError::TerminatorNotExecutable),
             Tool::Escalate(_) => Err(ToolError::TerminatorNotExecutable),
+            Tool::AskUser(_) => Err(ToolError::InteractiveNotExecutable),
         }
     }
 
@@ -414,6 +452,38 @@ struct EscalateArgs {
     findings: String,
 }
 
+#[derive(Deserialize)]
+struct AskUserArgs {
+    questions: Vec<QuestionArg>,
+}
+
+#[derive(Deserialize)]
+struct QuestionArg {
+    prompt: String,
+    #[serde(rename = "type")]
+    kind: QuestionKindWire,
+    #[serde(default)]
+    options: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QuestionKindWire {
+    SingleChoice,
+    MultiChoice,
+    Free,
+}
+
+impl QuestionKindWire {
+    fn into_kind(self) -> QuestionKind {
+        match self {
+            QuestionKindWire::SingleChoice => QuestionKind::SingleChoice,
+            QuestionKindWire::MultiChoice => QuestionKind::MultiChoice,
+            QuestionKindWire::Free => QuestionKind::Free,
+        }
+    }
+}
+
 fn parse_args<A: serde::de::DeserializeOwned>(name: &str, arguments: &str) -> Result<A, ToolError> {
     serde_json::from_str(arguments).map_err(|source| ToolError::InvalidArguments {
         name: name.to_string(),
@@ -451,6 +521,39 @@ impl TryFrom<OpenAIToolCall> for Tool {
                 .map(|a| Tool::SubmitPlan(a.plan)),
             "escalate" => parse_args::<EscalateArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::Escalate(a.findings)),
+            "ask_user" => parse_args::<AskUserArgs>(&function.name, &function.arguments)
+                .and_then(|a| {
+                    let mut questions = Vec::new();
+                    for q in a.questions {
+                        let kind = q.kind.into_kind();
+                        let choice = matches!(
+                            kind,
+                            QuestionKind::SingleChoice | QuestionKind::MultiChoice
+                        );
+                        if choice && q.options.is_empty() {
+                            return Err(ToolError::InvalidArguments {
+                                name: function.name.clone(),
+                                raw: function.arguments.clone(),
+                                source: serde::de::Error::custom(
+                                    "options are required for single_choice and multi_choice",
+                                ),
+                            });
+                        }
+                        questions.push(Question {
+                            prompt: q.prompt,
+                            kind,
+                            options: if choice { q.options } else { Vec::new() },
+                        });
+                    }
+                    if questions.is_empty() {
+                        return Err(ToolError::InvalidArguments {
+                            name: function.name.clone(),
+                            raw: function.arguments.clone(),
+                            source: serde::de::Error::custom("questions must not be empty"),
+                        });
+                    }
+                    Ok(Tool::AskUser(questions))
+                }),
             other => Err(ToolError::UnknownTool {
                 name: other.to_string(),
             }),
@@ -500,6 +603,33 @@ fn parameters(tool: &Tool) -> serde_json::Value {
             },
             "required": ["url"]
         }),
+        Tool::AskUser(_) => json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": { "type": "string", "description": "the question to ask" },
+                            "type": {
+                                "type": "string",
+                                "enum": ["single_choice", "multi_choice", "free"],
+                                "description": "single_choice: the user picks one option or types their own answer; multi_choice: the user picks any number of options and/or types their own answer; free: the user types their own answer"
+                            },
+                            "options": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "the options, required for single_choice and multi_choice"
+                            }
+                        },
+                        "required": ["prompt", "type"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        }),
         Tool::SubmitPlan(_) => json!({
             "type": "object",
             "properties": {
@@ -519,7 +649,7 @@ fn parameters(tool: &Tool) -> serde_json::Value {
 
 #[cfg(test)]
 mod test {
-    use crate::tool::{Tool, ToolError, tool_definitions};
+    use crate::tool::{Tool, ToolError, Question, QuestionKind, tool_definitions};
     use openai_oxide::types::chat::{FunctionCall, ToolCall as OpenAIToolCall};
     use std::io::{Read, Write};
     use std::time::Duration;
@@ -1137,6 +1267,74 @@ version: 3"#,
     fn try_from_ignores_hallucinated_fields() {
         let tool = Tool::try_from(call("bash", r#"{"command":"ls","vibes":42}"#)).unwrap();
         assert_eq!(tool, Tool::Bash("ls".into()));
+    }
+
+    #[test]
+    fn try_from_ask_user_single_choice() {
+        let tool = Tool::try_from(call(
+            "ask_user",
+            r#"{"questions":[{"prompt":"which db?","type":"single_choice","options":["pg","mysql"]}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            tool,
+            Tool::AskUser(vec![Question {
+                prompt: "which db?".into(),
+                kind: QuestionKind::SingleChoice,
+                options: vec!["pg".into(), "mysql".into()],
+            }])
+        );
+    }
+
+    #[test]
+    fn try_from_ask_user_multi_and_free() {
+        let tool = Tool::try_from(call(
+            "ask_user",
+            r#"{"questions":[{"prompt":"pick some","type":"multi_choice","options":["a","b"]},{"prompt":"name?","type":"free"}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            tool,
+            Tool::AskUser(vec![
+                Question {
+                    prompt: "pick some".into(),
+                    kind: QuestionKind::MultiChoice,
+                    options: vec!["a".into(), "b".into()],
+                },
+                Question {
+                    prompt: "name?".into(),
+                    kind: QuestionKind::Free,
+                    options: Vec::new(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn try_from_ask_user_choice_without_options_is_error() {
+        let error = Tool::try_from(call(
+            "ask_user",
+            r#"{"questions":[{"prompt":"which?","type":"single_choice"}]}"#,
+        ))
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn try_from_ask_user_empty_questions_is_error() {
+        let error = Tool::try_from(call("ask_user", r#"{"questions":[]}"#)).unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+    }
+
+    #[tokio::test]
+    async fn ask_user_is_not_executable_directly() {
+        let tool = Tool::AskUser(vec![Question {
+            prompt: "q?".into(),
+            kind: QuestionKind::Free,
+            options: Vec::new(),
+        }]);
+        let error = tool.invoke(Duration::from_secs(1)).await.unwrap_err();
+        assert!(matches!(error, ToolError::InteractiveNotExecutable));
     }
 
     fn serve_once(response: &str) -> (String, std::thread::JoinHandle<()>) {

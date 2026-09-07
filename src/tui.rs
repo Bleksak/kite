@@ -79,7 +79,7 @@ use crate::agent::Agent;
 use crate::context::Context;
 use crate::mode::Mode;
 use crate::paths::CONTEXT_DIR;
-use crate::session::{Cursor, Scroller, Session};
+use crate::session::{Cursor, QuestionState, Scroller, Session};
 use crate::session_store::{self, SessionFile};
 use crate::stream::AgentEvent;
 use crate::thinking::ThinkingLevel;
@@ -573,6 +573,9 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         return KeyAction::None;
     }
     let (pane_width, viewport) = (state.pane_width, state.viewport);
+    if state.session().question.is_some() {
+        return handle_question_key(state, key);
+    }
     let session = state.session();
     if session.running {
         return match key.code {
@@ -753,6 +756,113 @@ fn insert_newline(session: &mut Session) {
     session.input_cursor += 1;
     session.history_index = None;
     session.error = None;
+}
+
+fn finish_question(state: &mut TuiState) {
+    let session = &mut state.sessions[state.active];
+    let Some(mut q) = session.question.take() else {
+        return;
+    };
+    while q.answers.len() < q.questions.len() {
+        q.answers.push("cancelled".to_string());
+    }
+    session.question = None;
+    if let Some(tx) = q.reply.take() {
+        let _ = tx.send(Some(q.answers));
+    }
+}
+
+fn handle_question_key(state: &mut TuiState, key: &KeyEvent) -> KeyAction {
+    let session = &mut state.sessions[state.active];
+    let Some(q) = session.question.as_mut() else {
+        return KeyAction::None;
+    };
+    let kind = q.questions[q.step].kind.clone();
+    let option_count = q.questions[q.step].options.len();
+    match key.code {
+        KeyCode::Up => {
+            q.cursor = q.cursor.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            q.cursor = (q.cursor + 1).min(option_count.saturating_sub(1));
+        }
+        KeyCode::Char(' ') if matches!(kind, crate::tool::QuestionKind::MultiChoice) => {
+            if q.cursor < q.selected.len() {
+                q.selected[q.cursor] = !q.selected[q.cursor];
+            }
+        }
+        KeyCode::Char(c) => {
+            let mut chars: Vec<char> = q.draft.chars().collect();
+            chars.insert(q.draft_cursor, c);
+            q.draft = chars.into_iter().collect();
+            q.draft_cursor += 1;
+        }
+        KeyCode::Backspace => {
+            if q.draft_cursor > 0 {
+                let mut chars: Vec<char> = q.draft.chars().collect();
+                chars.remove(q.draft_cursor - 1);
+                q.draft = chars.into_iter().collect();
+                q.draft_cursor -= 1;
+            }
+        }
+        KeyCode::Left => {
+            q.draft_cursor = q.draft_cursor.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            q.draft_cursor = (q.draft_cursor + 1).min(q.draft.chars().count());
+        }
+        KeyCode::Home => {
+            q.draft_cursor = 0;
+        }
+        KeyCode::End => {
+            q.draft_cursor = q.draft.chars().count();
+        }
+        KeyCode::Esc => {
+            finish_question(state);
+        }
+        KeyCode::Enter => {
+            let answer = match kind {
+                crate::tool::QuestionKind::Free => {
+                    if q.draft.is_empty() {
+                        return KeyAction::None;
+                    }
+                    q.draft.clone()
+                }
+                crate::tool::QuestionKind::SingleChoice => {
+                    if !q.draft.is_empty() {
+                        q.draft.clone()
+                    } else {
+                        q.questions[q.step].options[q.cursor].clone()
+                    }
+                }
+                crate::tool::QuestionKind::MultiChoice => {
+                    let picked: Vec<String> = q.selected
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, selected)| **selected)
+                        .map(|(i, _)| q.questions[q.step].options[i].clone())
+                        .collect();
+                    if picked.is_empty() && q.draft.is_empty() {
+                        return KeyAction::None;
+                    }
+                    let mut parts = picked;
+                    if !q.draft.is_empty() {
+                        parts.push(q.draft.clone());
+                    }
+                    parts.join(", ")
+                }
+            };
+            q.answers.push(answer);
+            if q.step + 1 < q.questions.len() {
+                q.step += 1;
+                q.reset_step();
+            } else {
+                finish_question(state);
+            }
+        }
+        _ => {}
+    }
+    KeyAction::None
 }
 
 #[cfg(test)]
@@ -1069,6 +1179,34 @@ fn input_box_lines(input: &str, width: usize) -> usize {
     input_visual_ranges(&chars, width).len().clamp(1, 12)
 }
 
+fn wrapped_text(text: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    input_visual_ranges(&chars, width)
+        .iter()
+        .map(|(start, count)| chars[*start..*start + *count].iter().collect())
+        .collect()
+}
+
+fn question_box_lines(q: &QuestionState, width: usize) -> usize {
+    let current = &q.questions[q.step];
+    let prompt_chars: Vec<char> = current.prompt.chars().collect();
+    let prompt_lines = input_visual_ranges(&prompt_chars, width).len().max(1);
+    let option_lines = if current.kind == crate::tool::QuestionKind::Free {
+        0
+    } else {
+        current.options.len()
+    };
+    1 + prompt_lines + option_lines + 1 + 1
+}
+
+fn active_box_lines(session: &Session, width: usize) -> usize {
+    if let Some(q) = &session.question {
+        question_box_lines(q, width)
+    } else {
+        input_box_lines(&session.input, width)
+    }
+}
+
 fn cursor_visual_line(chars: &[char], cursor: usize, width: usize) -> usize {
     input_visual_ranges(chars, width)
         .iter()
@@ -1148,6 +1286,69 @@ fn input_visual_lines(
         }
         i = end + 1;
     }
+    lines
+}
+
+fn question_wizard_lines(q: &QuestionState, width: usize) -> Vec<Line<'static>> {
+    use crate::tool::QuestionKind;
+    let current = &q.questions[q.step];
+    let total = q.questions.len();
+    let cursor_style = Style::default()
+        .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
+        .fg(Color::Rgb(0x28, 0x28, 0x32));
+    let mut lines = vec![Line::from(Span::styled(
+        format!(" ❓ question {} of {}", q.step + 1, total),
+        Style::default().bold().fg(Color::Rgb(0xe5, 0xb5, 0x67)),
+    ))];
+    for wrapped in wrapped_text(&current.prompt, width) {
+        lines.push(Line::from(Span::raw(wrapped)));
+    }
+    if current.kind != QuestionKind::Free {
+        for (i, option) in current.options.iter().enumerate() {
+            let hovered = i == q.cursor;
+            let (marker, style) = if hovered {
+                ("▸", cursor_style)
+            } else {
+                (" ", Style::default())
+            };
+            match current.kind {
+                QuestionKind::SingleChoice => {
+                    lines.push(Line::from(vec![
+                        Span::styled(marker.to_string(), style),
+                        Span::raw(format!(" {option}")),
+                    ]));
+                }
+                QuestionKind::MultiChoice => {
+                    let (check, check_style) = if q.selected[i] {
+                        ("[x]", cursor_style)
+                    } else {
+                        ("[ ]", Style::default())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker.to_string(), style),
+                        Span::styled(check.to_string(), check_style),
+                        Span::raw(format!(" {option}")),
+                    ]));
+                }
+                QuestionKind::Free => {}
+            }
+        }
+    }
+    let show_draft = matches!(
+        current.kind,
+        QuestionKind::Free | QuestionKind::MultiChoice
+    ) || !q.draft.is_empty();
+    if show_draft {
+        for line in input_visual_lines(&q.draft, q.draft_cursor, width, 0) {
+            lines.push(line);
+        }
+    }
+    let hint = match current.kind {
+        QuestionKind::SingleChoice => "↑↓ pick · enter confirm · type for own answer · esc cancel",
+        QuestionKind::MultiChoice => "↑↓ move · space toggle · enter confirm · type for own answer · esc cancel",
+        QuestionKind::Free => "enter confirm · esc cancel",
+    };
+    lines.push(Line::from(Span::styled(hint.to_string(), Style::default().dim())));
     lines
 }
 
@@ -1279,7 +1480,7 @@ impl Widget for Fill {
 
 pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
-    let input_lines = input_box_lines(&state.sessions[state.active].input, state.pane_width);
+    let input_lines = active_box_lines(&state.sessions[state.active], state.pane_width);
     let chunks = Layout::new(
         Direction::Vertical,
         [
@@ -1563,7 +1764,12 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         }
     }
 
-    let input = if session.running {
+    let input = if session.question.is_some() {
+        Paragraph::new(question_wizard_lines(
+            session.question.as_ref().unwrap(),
+            state.pane_width,
+        ))
+    } else if session.running {
         Paragraph::new(Line::from(Span::styled(
             "working…".to_string(),
             Style::default().dim(),
@@ -1612,12 +1818,12 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let scroll = session.input_scroll.min(total_lines.saturating_sub(visible));
     let hidden_top = scroll;
     let hidden_bottom = total_lines - scroll - visible;
-    if !session.running && hidden_top > 0 {
+    if session.question.is_none() && !session.running && hidden_top > 0 {
         input_block = input_block.title_top(
             Line::from(format!("↑ {} more", hidden_top)).right_aligned(),
         );
     }
-    if !session.running && hidden_bottom > 0 {
+    if session.question.is_none() && !session.running && hidden_bottom > 0 {
         input_block = input_block.title_bottom(
             Line::from(format!("↓ {} more", hidden_bottom)).right_aligned(),
         );
@@ -1859,8 +2065,10 @@ pub async fn run(
         .as_ref()
         .map(|size| size.width.saturating_sub(2) as usize)
         .unwrap_or(118);
-    let input = state.session().input.clone();
-    let input_lines = input_box_lines(&input, state.pane_width);
+    let input_lines = {
+        let pw = state.pane_width;
+        active_box_lines(state.session(), pw)
+    };
     state.viewport = size
         .map(|size| size.height.saturating_sub(7 + input_lines as u16) as usize)
         .unwrap_or(22);
@@ -1924,6 +2132,11 @@ pub async fn run(
                 match event {
                     Some(TuiEvent::Agent { session: id, event }) => {
                         if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                            if let AgentEvent::AskUser { questions, reply } = &event {
+                                let mut q = QuestionState::new(questions.clone());
+                                q.reply = Some(reply.clone());
+                                session.question = Some(q);
+                            }
                             session.renderer.on_event(event);
                             let max = session.max_scroll(state.pane_width, state.viewport);
                             session.scroller.follow_tail(max);
@@ -2028,8 +2241,10 @@ pub async fn run(
             .as_ref()
             .map(|size| size.width.saturating_sub(2) as usize)
             .unwrap_or(118);
-        let input = state.session().input.clone();
-        let input_lines = input_box_lines(&input, state.pane_width);
+        let input_lines = {
+            let pw = state.pane_width;
+            active_box_lines(state.session(), pw)
+        };
         state.viewport = size
             .map(|size| size.height.saturating_sub(7 + input_lines as u16) as usize)
             .unwrap_or(22);
@@ -3594,6 +3809,127 @@ mod test {
         assert_eq!(state.session().input, "");
         assert_eq!(state.session().history_index, None);
         assert_eq!(state.session().input_cursor, 0);
+    }
+
+    fn question_with_reply(
+        questions: Vec<crate::tool::Question>,
+    ) -> (
+        crate::session::QuestionState,
+        tokio::sync::watch::Receiver<Option<Vec<String>>>,
+    ) {
+        let (reply_tx, reply_rx) = tokio::sync::watch::channel(None);
+        let mut state = crate::session::QuestionState::new(questions);
+        state.reply = Some(reply_tx);
+        (state, reply_rx)
+    }
+
+    fn question(prompt: &str, kind: &str, options: &[&str]) -> crate::tool::Question {
+        use crate::tool::QuestionKind;
+        let kind = match kind {
+            "single_choice" => QuestionKind::SingleChoice,
+            "multi_choice" => QuestionKind::MultiChoice,
+            _ => QuestionKind::Free,
+        };
+        crate::tool::Question {
+            prompt: prompt.into(),
+            kind,
+            options: options.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn question_single_choice_picks_an_option() {
+        let mut state = TuiState::new("model".into());
+        let (q, _rx) = question_with_reply(vec![question(
+            "which db?",
+            "single_choice",
+            &["pg", "mysql"],
+        )]);
+        state.session().question = Some(q);
+        handle_key(&mut state, &key(KeyCode::Down));
+        assert_eq!(state.session().question.as_ref().unwrap().cursor, 1);
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert!(state.session().question.is_none());
+    }
+
+    #[test]
+    fn question_single_choice_own_answer_overrides_the_option() {
+        let mut state = TuiState::new("model".into());
+        let (q, _rx) = question_with_reply(vec![question(
+            "which db?",
+            "single_choice",
+            &["pg", "mysql"],
+        )]);
+        state.session().question = Some(q);
+        for c in "sqlite".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert!(state.session().question.is_none());
+    }
+
+    #[test]
+    fn question_multi_choice_toggles_and_joins_the_selection() {
+        let mut state = TuiState::new("model".into());
+        let (q, rx) = question_with_reply(vec![question(
+            "pick some",
+            "multi_choice",
+            &["a", "b", "c"],
+        )]);
+        state.session().question = Some(q);
+        handle_key(&mut state, &key(KeyCode::Char(' ')));
+        handle_key(&mut state, &key(KeyCode::Down));
+        handle_key(&mut state, &key(KeyCode::Char(' ')));
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert!(state.session().question.is_none());
+        let answers = rx.borrow().clone().unwrap();
+        assert_eq!(answers, vec!["a, b".to_string()]);
+    }
+
+    #[test]
+    fn question_free_requires_a_non_empty_answer() {
+        let mut state = TuiState::new("model".into());
+        let (q, _rx) = question_with_reply(vec![question("name?", "free", &[])]);
+        state.session().question = Some(q);
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert!(state.session().question.is_some());
+        handle_key(&mut state, &key(KeyCode::Char('x')));
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert!(state.session().question.is_none());
+    }
+
+    #[test]
+    fn question_multi_step_walks_through_every_question() {
+        let mut state = TuiState::new("model".into());
+        let (q, rx) = question_with_reply(vec![
+            question("which db?", "single_choice", &["pg", "mysql"]),
+            question("name?", "free", &[]),
+        ]);
+        state.session().question = Some(q);
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(state.session().question.as_ref().unwrap().step, 1);
+        for c in "kit".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert!(state.session().question.is_none());
+        let answers = rx.borrow().clone().unwrap();
+        assert_eq!(answers, vec!["pg".to_string(), "kit".to_string()]);
+    }
+
+    #[test]
+    fn question_esc_cancels_and_pads_the_remaining_answers() {
+        let mut state = TuiState::new("model".into());
+        let (q, rx) = question_with_reply(vec![
+            question("which db?", "single_choice", &["pg", "mysql"]),
+            question("name?", "free", &[]),
+        ]);
+        state.session().question = Some(q);
+        handle_key(&mut state, &key(KeyCode::Char(' ')));
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert!(state.session().question.is_none());
+        let answers = rx.borrow().clone().unwrap();
+        assert_eq!(answers, vec!["cancelled".to_string(), "cancelled".to_string()]);
     }
 
     #[test]

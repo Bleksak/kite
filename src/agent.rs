@@ -13,7 +13,7 @@ use crate::mode::Mode;
 use crate::stream::{AgentEvent, ChunkTokens, StreamAccumulator, StreamChunk};
 use crate::thinking::ThinkingLevel;
 
-use crate::tool::{Tool, ToolOutput, tool_definitions};
+use crate::tool::{Tool, ToolError, ToolOutput, tool_definitions};
 
 #[derive(Debug, PartialEq)]
 pub enum ChatOutcome {
@@ -221,7 +221,9 @@ impl Agent {
     }
 
     async fn run_tools(&mut self, calls: &[ToolCall], on_event: &mut impl FnMut(AgentEvent)) {
-        let mut slots: Vec<Result<(Tool, String), String>> = Vec::new();
+        let mut slots: Vec<
+            Result<(Tool, String, Option<tokio::sync::watch::Receiver<Option<Vec<String>>>>), String>,
+        > = Vec::new();
         for call in calls {
             match Tool::try_from(call.clone()) {
                 Ok(tool) => {
@@ -236,14 +238,24 @@ impl Agent {
                     let header = tool.header();
                     let output = tool.output();
                     let body = match &output {
-                        ToolOutput::Before(body) => Some(body.to_string()),
+                        ToolOutput::Before(body) => Some(body.clone()),
                         ToolOutput::After => None,
                     };
                     on_event(AgentEvent::ToolStarted {
                         header: header.clone(),
                         body,
                     });
-                    slots.push(Ok((tool, header)));
+                    let reply_rx = if let Tool::AskUser(questions) = &tool {
+                        let (reply_tx, reply_rx) = tokio::sync::watch::channel(None);
+                        on_event(AgentEvent::AskUser {
+                            questions: questions.clone(),
+                            reply: reply_tx,
+                        });
+                        Some(reply_rx)
+                    } else {
+                        None
+                    };
+                    slots.push(Ok((tool, header, reply_rx)));
                 }
                 Err(error) => slots.push(Err(error.to_string())),
             }
@@ -254,7 +266,7 @@ impl Agent {
             .filter_map(|slot| {
                 slot.as_ref()
                     .ok()
-                    .map(|(tool, _)| tool.invoke(self.bash_timeout))
+                    .map(|(tool, _, rx)| self.invoke_tool(tool, rx.as_ref()))
             })
             .collect();
         let outputs = join_all(futures).await;
@@ -262,7 +274,7 @@ impl Agent {
         let mut outputs = outputs.into_iter();
         for (call, slot) in calls.iter().zip(slots) {
             let content = match slot {
-                Ok((tool, header)) => {
+                Ok((tool, header, _)) => {
                     let content = match outputs.next().unwrap() {
                         Ok(output) => output,
                         Err(error) => error.to_string(),
@@ -285,6 +297,32 @@ impl Agent {
                 tool_call_id: call.id.clone(),
                 content,
             });
+        }
+    }
+
+    fn invoke_tool<'a>(
+        &'a self,
+        tool: &'a Tool,
+        reply_rx: Option<&'a tokio::sync::watch::Receiver<Option<Vec<String>>>>,
+    ) -> futures_util::future::BoxFuture<'a, Result<String, ToolError>> {
+        match (tool, reply_rx) {
+            (Tool::AskUser(questions), Some(rx)) => {
+                let questions = questions.clone();
+                let mut rx = rx.clone();
+                Box::pin(async move {
+                    match rx.changed().await {
+                        Ok(_) => {
+                            let answers = rx.borrow().clone().unwrap_or_default();
+                            Ok(format_question_result(&questions, answers))
+                        }
+                        Err(_) => Err(ToolError::InteractiveNotExecutable),
+                    }
+                })
+            }
+            (Tool::AskUser(_), None) => {
+                Box::pin(async { Err(ToolError::InteractiveNotExecutable) })
+            }
+            (_, _) => Box::pin(tool.invoke(self.bash_timeout)),
         }
     }
 
@@ -354,6 +392,14 @@ pub fn terminator_payload(arguments: &str, field: &str) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| arguments.to_string())
+}
+
+fn format_question_result(questions: &[crate::tool::Question], answers: Vec<String>) -> String {
+    let mut out = String::new();
+    for (i, (q, answer)) in questions.iter().zip(answers.iter()).enumerate() {
+        out.push_str(&format!("{}. {}\n   → {answer}\n", i + 1, q.prompt));
+    }
+    out.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -894,6 +940,107 @@ mod test {
     }
 
     #[tokio::test]
+    async fn ask_user_waits_for_the_answer_and_formats_it() {
+        let agent = agent();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_for_task = events.clone();
+        let handle = tokio::spawn(async move {
+            let mut agent = agent;
+            let call = tool_call(
+                "call_1",
+                "ask_user",
+                r#"{"questions":[{"prompt":"which db?","type":"single_choice","options":["pg","mysql"]},{"prompt":"name?","type":"free"}]}"#,
+            );
+            agent
+                .handle_response(
+                    Message::Assistant {
+                        content: None,
+                        tool_calls: vec![call],
+                    },
+                    &mut |event| events_for_task.lock().unwrap().push(event),
+                )
+                .await
+        });
+        let reply = loop {
+            let found = events
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::AskUser { reply, .. } => Some(reply.clone()),
+                    _ => None,
+                });
+            if let Some(reply) = found {
+                break reply;
+            }
+            tokio::task::yield_now().await;
+        };
+        reply
+            .send(Some(vec!["pg".to_string(), "postgres".to_string()]))
+            .unwrap();
+        handle.await.unwrap();
+        let events = events.lock().unwrap();
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            "1. which db?\n   → pg\n2. name?\n   → postgres"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_user_with_a_dropped_reply_is_an_error() {
+        let agent = agent();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_for_task = events.clone();
+        let handle = tokio::spawn(async move {
+            let mut agent = agent;
+            let call = tool_call(
+                "call_1",
+                "ask_user",
+                r#"{"questions":[{"prompt":"q?","type":"free"}]}"#,
+            );
+            agent
+                .handle_response(
+                    Message::Assistant {
+                        content: None,
+                        tool_calls: vec![call],
+                    },
+                    &mut |event| events_for_task.lock().unwrap().push(event),
+                )
+                .await
+        });
+        let reply = loop {
+            let mut evs = events.lock().unwrap();
+            if let Some(pos) = evs.iter().position(|event| matches!(event, AgentEvent::AskUser { .. }))
+            {
+                let removed = evs.remove(pos);
+                if let AgentEvent::AskUser { reply, .. } = removed {
+                    break reply;
+                }
+            }
+            drop(evs);
+            tokio::task::yield_now().await;
+        };
+        drop(reply);
+        handle.await.unwrap();
+        let events = events.lock().unwrap();
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolResult { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(result.contains("ask_user"));
+    }
+
+    #[tokio::test]
     async fn parallel_tool_calls_all_get_results() {
         let mut agent = agent();
         let step = agent
@@ -958,7 +1105,7 @@ mod test {
         assert_eq!(text, "hello");
 
         let tools = request.tools.as_ref().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         assert_eq!(
             tools
                 .iter()
@@ -971,7 +1118,8 @@ mod test {
                 "write_file",
                 "edit_file",
                 "webfetch",
-                "bg_run"
+                "bg_run",
+                "ask_user"
             ]
         );
     }

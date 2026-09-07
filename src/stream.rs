@@ -2,6 +2,7 @@ use openai_oxide::types::chat::{DeltaToolCall, FunctionCall, ToolCall};
 use serde::Deserialize;
 
 use crate::message::Message;
+use crate::tool::Question;
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct ChunkTokens {
@@ -9,7 +10,7 @@ pub struct ChunkTokens {
     pub text: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub enum AgentEvent {
     CompletionStarted,
     Tokens(ChunkTokens),
@@ -21,11 +22,36 @@ pub enum AgentEvent {
         header: String,
         body: String,
     },
+    AskUser {
+        questions: Vec<Question>,
+        reply: tokio::sync::watch::Sender<Option<Vec<String>>>,
+    },
     BgTaskDone {
         id: String,
         command: String,
         code: Option<i32>,
     },
+}
+
+impl PartialEq for AgentEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::CompletionStarted, Self::CompletionStarted) => true,
+            (Self::Tokens(a), Self::Tokens(b)) => a == b,
+            (Self::ToolStarted { header: h1, body: b1 }, Self::ToolStarted { header: h2, body: b2 }) => {
+                h1 == h2 && b1 == b2
+            }
+            (Self::ToolResult { header: h1, body: b1 }, Self::ToolResult { header: h2, body: b2 }) => {
+                h1 == h2 && b1 == b2
+            }
+            (Self::AskUser { questions: q1, .. }, Self::AskUser { questions: q2, .. }) => q1 == q2,
+            (
+                Self::BgTaskDone { id: i1, command: c1, code: k1 },
+                Self::BgTaskDone { id: i2, command: c2, code: k2 },
+            ) => i1 == i2 && c1 == c2 && k1 == k2,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
