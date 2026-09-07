@@ -1896,6 +1896,25 @@ fn stage_implement_message(
     )
 }
 
+fn stage_implementation_feedback_message(
+    stages: &Option<Vec<crate::tool::PlanStage>>,
+    index: usize,
+    feedback: &str,
+) -> String {
+    let Some(stages) = stages.as_ref() else {
+        return format!(
+            "The implementation was rejected. Feedback: {feedback}\n\nRevise the plan and call submit_plan."
+        );
+    };
+    format!(
+        "Step {} of {} was implemented, but the user's feedback: {feedback}\n\nCurrent stage:\n{}\n\nRevise the stages from Step {} on (redo this stage if needed), keeping what the earlier stages did, and call submit_plan with all of them.",
+        index + 1,
+        stages.len(),
+        crate::tool::plan_text(&stages[index..index + 1]),
+        index + 1
+    )
+}
+
 fn stage_replan_message(
     stages: &Option<Vec<crate::tool::PlanStage>>,
     index: usize,
@@ -1921,12 +1940,18 @@ fn stage_replan_message(
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum GatePhase {
+    ReviewImplementation,
+    ReviewPlan,
+}
+
 async fn handle_outcome(
     agent: &mut Agent,
     new_agent: &std::sync::Arc<dyn Fn() -> Agent + Send + Sync>,
     event_tx: &tokio::sync::mpsc::UnboundedSender<TuiEvent>,
     id: u64,
-    gate: &mut Option<String>,
+    gate: &mut Option<(String, GatePhase)>,
     stages: &mut Option<Vec<crate::tool::PlanStage>>,
     stage_index: &mut usize,
     mut outcome: crate::agent::ChatOutcome,
@@ -1945,8 +1970,11 @@ async fn handle_outcome(
                         )
                     })
                     .unwrap_or((0, String::new()));
-                *gate = Some(format!(
-                    "📋 plan ready ({count} stages) — Enter to implement Step 1: {title}, type feedback to re-plan"
+                *gate = Some((
+                    format!(
+                        "📋 plan ready ({count} stages) — Enter to implement Step 1: {title}, type feedback to re-plan"
+                    ),
+                    GatePhase::ReviewPlan,
                 ));
                 let context = agent.context.clone();
                 let _ = event_tx.send(TuiEvent::TurnDone {
@@ -1955,7 +1983,7 @@ async fn handle_outcome(
                 });
                 let _ = event_tx.send(TuiEvent::GatePending {
                     session: id,
-                    message: gate.clone().unwrap(),
+                    message: gate.clone().unwrap().0,
                 });
                 return;
             }
@@ -2006,26 +2034,21 @@ async fn handle_outcome(
                         .unwrap_or(false);
                 if review {
                     *stage_index += 1;
-                    let title = stages
-                        .as_ref()
-                        .map(|s| s[*stage_index].title.clone())
-                        .unwrap_or_default();
-                    *gate = Some(format!(
-                        "📋 Step {} implemented — review the implementation and Step {}: {title} — Enter to implement, type feedback to re-plan",
-                        *stage_index, *stage_index + 1
+                    *gate = Some((
+                        format!(
+                            "📋 Step {} implemented — review the implementation — Enter to continue, type feedback to re-plan",
+                            *stage_index
+                        ),
+                        GatePhase::ReviewImplementation,
                     ));
                     let context = agent.context.clone();
                     let _ = event_tx.send(TuiEvent::TurnDone {
                         session: id,
                         context,
                     });
-                    let _ = event_tx.send(TuiEvent::StageChanged {
-                        session: id,
-                        mode: Some(Mode::Plan),
-                    });
                     let _ = event_tx.send(TuiEvent::GatePending {
                         session: id,
-                        message: gate.clone().unwrap(),
+                        message: gate.clone().unwrap().0,
                     });
                     return;
                 }
@@ -2062,7 +2085,7 @@ fn spawn_agent(
         if let Some(context) = restored {
             agent.context = context;
         }
-        let mut gate: Option<String> = None;
+        let mut gate: Option<(String, GatePhase)> = None;
         let mut stages: Option<Vec<crate::tool::PlanStage>> = None;
         let mut stage_index: usize = 0;
         let mut bg_rx = crate::bg::REGISTRY.subscribe();
@@ -2070,17 +2093,42 @@ fn spawn_agent(
             tokio::select! {
                 input = input_rx.recv() => {
                     let Some(mut input) = input else { break; };
-                    if gate.take().is_some() {
-                        let message = if input.is_empty() {
-                            agent = new_agent().with_pinned_mode(Mode::Implement);
-                            let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Implement) });
-                            stage_implement_message(&stages, stage_index)
-                        } else {
-                            agent = new_agent().with_pinned_mode(Mode::Plan);
-                            let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
-                            stage_replan_message(&stages, stage_index, &input)
-                        };
-                        input = message;
+                    if let Some((_, phase)) = gate.take() {
+                        match (phase, input.is_empty()) {
+                            (GatePhase::ReviewImplementation, true) => {
+                                let title = stages
+                                    .as_ref()
+                                    .map(|s| s[stage_index].title.clone())
+                                    .unwrap_or_default();
+                                let message = format!(
+                                    "📋 review Step {}: {title} — Enter to implement, type feedback to re-plan",
+                                    stage_index + 1
+                                );
+                                gate = Some((message.clone(), GatePhase::ReviewPlan));
+                                let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
+                                let _ = event_tx.send(TuiEvent::GatePending { session: id, message });
+                                continue;
+                            }
+                            (GatePhase::ReviewImplementation, false) => {
+                                agent = new_agent().with_pinned_mode(Mode::Plan);
+                                let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
+                                input = stage_implementation_feedback_message(
+                                    &stages,
+                                    stage_index.saturating_sub(1),
+                                    &input,
+                                );
+                            }
+                            (GatePhase::ReviewPlan, true) => {
+                                agent = new_agent().with_pinned_mode(Mode::Implement);
+                                let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Implement) });
+                                input = stage_implement_message(&stages, stage_index);
+                            }
+                            (GatePhase::ReviewPlan, false) => {
+                                agent = new_agent().with_pinned_mode(Mode::Plan);
+                                let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
+                                input = stage_replan_message(&stages, stage_index, &input);
+                            }
+                        }
                     }
                     let tx = event_tx.clone();
                     let result = agent
@@ -2331,6 +2379,7 @@ pub async fn run(
                         if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
                             session.gate = true;
                             session.gate_message = message;
+                            session.running = false;
                         }
                     }
                     Some(TuiEvent::StageChanged { session: id, mode }) => {
@@ -5072,7 +5121,23 @@ mod test {
             wait_for_event(&mut event_rx, &mut events, |e| matches!(
                 e,
                 TuiEvent::GatePending { message, .. } if message.contains("Step 1 implemented")
-                    && message.contains("Step 2: api")
+                    && message.contains("review the implementation")
+            ))
+            .await
+        );
+        assert!(
+            !events
+                .iter()
+                .rev()
+                .take(3)
+                .any(|e| matches!(e, TuiEvent::StageChanged { mode: Some(Mode::Plan), .. }))
+        );
+
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { message, .. } if message.contains("review Step 2: api")
             ))
             .await
         );
@@ -5138,6 +5203,14 @@ mod test {
             ))
             .await
         );
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { message, .. } if message.contains("review Step 2: api")
+            ))
+            .await
+        );
         input_tx.send("api should be rest".to_string()).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         handle.abort();
@@ -5153,6 +5226,64 @@ mod test {
         assert!(replan.contains("api should be rest"));
         assert!(replan.contains("Step 1 of 2 is done"));
         assert!(replan.contains("Revise the remaining stages"));
+    }
+
+    #[tokio::test]
+    async fn implementation_gate_feedback_replans_from_the_current_stage() {
+        let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
+        let (base_url, mut rx_req) = staged_mock_server(vec![
+            plan_sse("c1", stages),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"stage one done\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+        ]).await;
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(base_url),
+        );
+        let shared = Arc::new(Mutex::new(Mode::Yolo));
+        let factory = Arc::new(move || {
+            Agent::new(
+                client.clone(),
+                "test-model",
+                shared.clone(),
+                10000,
+                Duration::from_secs(30),
+            )
+            .with_pinned_mode(Mode::Plan)
+        });
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
+        let (input_tx, handle) = spawn_agent(1, factory, None, event_tx);
+        let mut events = vec![];
+
+        input_tx.send("plan me".to_string()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { .. }
+            ))
+            .await
+        );
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { message, .. } if message.contains("review the implementation")
+            ))
+            .await
+        );
+        input_tx.send("the entity is wrong".to_string()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+
+        let mut requests = vec![];
+        while let Ok(body) = rx_req.try_recv() {
+            requests.push(body);
+        }
+        let replan = requests
+            .iter()
+            .find(|body| body.contains("the user's feedback"))
+            .expect("the implementation gate feedback re-plans from the current stage");
+        assert!(replan.contains("the entity is wrong"));
+        assert!(replan.contains("Step 1 of 2 was implemented"));
+        assert!(replan.contains("redo this stage if needed"));
     }
 
     fn parse(bytes: &[u8]) -> Vec<TermEvent> {
