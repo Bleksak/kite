@@ -300,6 +300,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 }
                 session.input = chars.into_iter().collect();
                 session.history_index = None;
+                session.error = None;
             }
             return KeyAction::None;
         }
@@ -637,6 +638,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 chars.remove(session.input_cursor);
                 session.input = chars.into_iter().collect();
                 session.history_index = None;
+                session.error = None;
             }
             KeyAction::None
         }
@@ -664,6 +666,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                         session.history_index = Some(i + 1);
                         session.input = entry;
                         session.input_cursor = session.input.chars().count();
+                        session.error = None;
                     }
                     Some(_) => mouse_up(session),
                     None => {
@@ -672,6 +675,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                             session.history_index = Some(session.history.len() - 1);
                             session.input = entry;
                             session.input_cursor = session.input.chars().count();
+                            session.error = None;
                         } else {
                             mouse_up(session);
                         }
@@ -683,12 +687,14 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                         session.history_index = None;
                         session.input.clear();
                         session.input_cursor = 0;
+                        session.error = None;
                     }
                     Some(i) => {
                         let entry = session.history[i - 1].clone();
                         session.history_index = Some(i - 1);
                         session.input = entry;
                         session.input_cursor = session.input.chars().count();
+                        session.error = None;
                     }
                     None => mouse_down(session, pane_width, viewport),
                 }
@@ -717,6 +723,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             session.input = chars.into_iter().collect();
             session.input_cursor += 1;
             session.history_index = None;
+            session.error = None;
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -754,6 +761,7 @@ fn insert_newline(session: &mut Session) {
     session.input = chars.into_iter().collect();
     session.input_cursor += 1;
     session.history_index = None;
+    session.error = None;
 }
 
 #[cfg(test)]
@@ -4554,6 +4562,17 @@ mod test {
             key_parts(&mapped),
             (KeyCode::Enter, KeyModifiers::SHIFT)
         );
+    }
+
+    #[test]
+    fn up_recalls_after_error() {
+        let mut state = TuiState::new("model".into());
+        state.session().error = Some("request error".into());
+        state.session().running = false;
+        state.session().history = vec!["hello".into()];
+        handle_key(&mut state, &key(KeyCode::Up));
+        assert_eq!(state.session().input, "hello");
+        assert_eq!(state.session().error, None);
     }
 
     #[test]
