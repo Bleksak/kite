@@ -111,6 +111,8 @@ pub struct TuiState {
     pub task_output_id: Option<String>,
     pub task_output_scroll: Scroller,
     pub plan_open: bool,
+    pub plan_view: usize,
+    pub plan_scroll: Scroller,
     next_id: u64,
 }
 
@@ -133,6 +135,8 @@ impl TuiState {
             task_output_id: None,
             task_output_scroll: Scroller::default(),
             plan_open: false,
+            plan_view: 0,
+            plan_scroll: Scroller::default(),
             next_id: 1,
         }
     }
@@ -209,6 +213,18 @@ fn task_output_scroll_max(state: &TuiState) -> usize {
     total.saturating_sub(visible)
 }
 
+fn plan_scroll_max(state: &TuiState) -> usize {
+    let Some((stages, _)) = state.sessions.get(state.active).and_then(|s| s.plan.clone()) else {
+        return 0;
+    };
+    let Some(stage) = stages.get(state.plan_view) else {
+        return 0;
+    };
+    let total = 1 + 1 + if stage.tasks.is_empty() { 1 } else { stage.tasks.len() } + 1;
+    let visible = state.viewport.saturating_sub(4);
+    total.saturating_sub(visible)
+}
+
 fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent> {
     use termwiz::input::{Modifiers, KeyCode as TermwizKeyCode};
     match event {
@@ -267,6 +283,19 @@ fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent> {
 
 pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     if let TermEvent::Mouse(mouse) = event {
+        if state.plan_open {
+            let max = plan_scroll_max(state);
+            return match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    state.plan_scroll.toward_top(3);
+                    KeyAction::None
+                }
+                MouseEventKind::ScrollDown => {
+                    state.plan_scroll.toward_bottom(3, max);
+                    KeyAction::None
+                }
+            };
+        }
         if state.task_output_id.is_some() {
             let max = task_output_scroll_max(state);
             return match mouse.kind {
@@ -468,9 +497,54 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         };
     }
     if state.plan_open {
+        let len = state
+            .session()
+            .plan
+            .as_ref()
+            .map(|(stages, _)| stages.len())
+            .unwrap_or(0);
+        let scroll_max = plan_scroll_max(state);
         return match key.code {
             KeyCode::Char('p') | KeyCode::Char('q') | KeyCode::Esc => {
                 state.plan_open = false;
+                KeyAction::None
+            }
+            KeyCode::Left => {
+                if state.plan_view > 0 {
+                    state.plan_view -= 1;
+                    state.plan_scroll = Scroller::at_tail();
+                }
+                KeyAction::None
+            }
+            KeyCode::Right => {
+                if state.plan_view + 1 < len {
+                    state.plan_view += 1;
+                    state.plan_scroll = Scroller::at_tail();
+                }
+                KeyAction::None
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                state.plan_scroll.toward_bottom(3, scroll_max);
+                KeyAction::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                state.plan_scroll.toward_top(3);
+                KeyAction::None
+            }
+            KeyCode::PageDown => {
+                state.plan_scroll.toward_bottom(8, scroll_max);
+                KeyAction::None
+            }
+            KeyCode::PageUp => {
+                state.plan_scroll.toward_top(8);
+                KeyAction::None
+            }
+            KeyCode::Home => {
+                state.plan_scroll.home();
+                KeyAction::None
+            }
+            KeyCode::End => {
+                state.plan_scroll.end(scroll_max);
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -540,6 +614,16 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if key.code == KeyCode::Char('p') {
+            if !state.plan_open {
+                let stage_index = state
+                    .session()
+                    .plan
+                    .as_ref()
+                    .map(|(_, i)| *i)
+                    .unwrap_or(0);
+                state.plan_view = stage_index;
+                state.plan_scroll = Scroller::at_tail();
+            }
             state.plan_open = !state.plan_open;
             state.picker_open = false;
             state.tasks_open = false;
@@ -1714,21 +1798,22 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     }
 
     if state.plan_open {
-        let (stages, stage_index) = state
+        let (stages, _) = state
             .sessions
             .get(state.active)
             .and_then(|s| s.plan.clone())
             .unwrap_or((Vec::new(), 0));
+        let scroll_max = plan_scroll_max(state);
         let mut lines: Vec<Line> = Vec::new();
         if stages.is_empty() {
             lines.push(Line::from(Span::styled(
                 " no plan",
                 Style::default().fg(Color::Rgb(102, 102, 102)),
             )));
-        } else if let Some(stage) = stages.get(stage_index) {
+        } else if let Some(stage) = stages.get(state.plan_view) {
             let title = Line::from(vec![
                 Span::styled(
-                    format!("Step {} of {}", stage_index + 1, stages.len()),
+                    format!("Step {} of {}", state.plan_view + 1, stages.len()),
                     Style::default().fg(Color::Rgb(102, 102, 102)),
                 ),
                 Span::styled(format!("  {}", stage.title), Style::default().bold()),
@@ -1750,27 +1835,29 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             }
         }
         let hint = Line::from(Span::styled(
-            " ctrl+p close",
+            " ←→ step · jk/ PgUp PgDn scroll · ctrl+p close",
             Style::default().fg(Color::Rgb(102, 102, 102)),
         ));
+        let all: Vec<Line> = lines.into_iter().chain(std::iter::once(hint)).collect();
+        let visible = state.viewport.saturating_sub(4);
+        let start = if state.plan_scroll.following() {
+            scroll_max
+        } else {
+            state.plan_scroll.offset().min(scroll_max)
+        };
         let width = chunks[1].width;
         let height = chunks[1].height;
         let x = chunks[1].x;
         let y = chunks[1].y;
-        let plan_box = Paragraph::new(
-            lines
-                .into_iter()
-                .chain(std::iter::once(hint))
-                .collect::<Vec<Line>>(),
-        )
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
-                .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
-                .title(" plan ".to_string()),
-        );
+        let plan_box = Paragraph::new(all[start..].iter().take(visible).cloned().collect::<Vec<Line>>())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
+                    .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
+                    .title(" plan ".to_string()),
+            );
         frame.render_widget(Fill, Rect::new(x, y, width, height));
         frame.render_widget(plan_box, Rect::new(x, y, width, height));
     }
@@ -2939,6 +3026,38 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Esc));
         assert!(!state.plan_open);
+    }
+
+    #[test]
+    fn plan_popup_left_right_switches_the_viewed_step() {
+        let mut state = TuiState::new("model".into());
+        state.session().plan = Some((plan_stages(), 0));
+
+        handle_key(&mut state, &ctrl('p'));
+        assert_eq!(state.plan_view, 0);
+
+        handle_key(&mut state, &key(KeyCode::Left));
+        assert_eq!(state.plan_view, 0);
+        handle_key(&mut state, &key(KeyCode::Right));
+        assert_eq!(state.plan_view, 1);
+        handle_key(&mut state, &key(KeyCode::Right));
+        assert_eq!(state.plan_view, 1);
+        handle_key(&mut state, &key(KeyCode::Left));
+        assert_eq!(state.plan_view, 0);
+    }
+
+    #[test]
+    fn plan_popup_jk_scrolls_the_view() {
+        let mut state = TuiState::new("model".into());
+        state.session().plan = Some((plan_stages(), 0));
+
+        handle_key(&mut state, &ctrl('p'));
+        assert!(state.plan_scroll.following());
+
+        handle_key(&mut state, &key(KeyCode::Char('k')));
+        assert!(!state.plan_scroll.following());
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        assert!(state.plan_scroll.following());
     }
 
     #[tokio::test]
