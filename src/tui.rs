@@ -2058,22 +2058,28 @@ fn stage_implement_message(
     )
 }
 
-fn stage_implementation_feedback_message(
+fn stage_reimplement_message(
     stages: &Option<Vec<crate::tool::PlanStage>>,
     index: usize,
     feedback: &str,
 ) -> String {
     let Some(stages) = stages.as_ref() else {
         return format!(
-            "The implementation was rejected. Feedback: {feedback}\n\nRevise the plan and call submit_plan."
+            "The implementation was rejected. Feedback: {feedback}\n\nRe-implement the stage, addressing the feedback."
         );
     };
+    let stage = &stages[index];
+    let tasks = stage
+        .tasks
+        .iter()
+        .map(|task| format!("- {task}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "Step {} of {} was implemented, but the user's feedback: {feedback}\n\nCurrent stage:\n{}\n\nRevise the stages from Step {} on (redo this stage if needed), keeping what the earlier stages did, and call submit_plan with all of them.",
+        "Re-implement Step {} of {}: {}\nTasks:\n{tasks}\n\nThe previous implementation was rejected. Feedback: {feedback}\n\nAddress the feedback, keeping what is already done, and re-implement this stage. Do not start later stages.",
         index + 1,
         stages.len(),
-        crate::tool::plan_text(&stages[index..index + 1]),
-        index + 1
+        stage.title
     )
 }
 
@@ -2203,7 +2209,7 @@ async fn handle_outcome(
                     *stage_index += 1;
                     *gate = Some((
                         format!(
-                            "📋 Step {} implemented — review the implementation — Enter to continue, type feedback to re-plan",
+                            "📋 Step {} implemented — review the implementation — Enter to continue, type feedback to re-implement",
                             *stage_index
                         ),
                         GatePhase::ReviewImplementation,
@@ -2285,11 +2291,10 @@ fn spawn_agent(
                                 continue;
                             }
                             (GatePhase::ReviewImplementation, false) => {
-                                agent = new_agent().with_pinned_mode(Mode::Plan);
-                                let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
-                                input = stage_implementation_feedback_message(
+                                stage_index = stage_index.saturating_sub(1);
+                                input = stage_reimplement_message(
                                     &stages,
-                                    stage_index.saturating_sub(1),
+                                    stage_index,
                                     &input,
                                 );
                             }
@@ -2299,8 +2304,6 @@ fn spawn_agent(
                                 input = stage_implement_message(&stages, stage_index);
                             }
                             (GatePhase::ReviewPlan, false) => {
-                                agent = new_agent().with_pinned_mode(Mode::Plan);
-                                let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
                                 input = stage_replan_message(&stages, stage_index, &input);
                             }
                         }
@@ -5499,11 +5502,12 @@ mod test {
     }
 
     #[tokio::test]
-    async fn implementation_gate_feedback_replans_from_the_current_stage() {
+    async fn implementation_gate_feedback_reimplements_the_current_stage() {
         let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
         let (base_url, mut rx_req) = staged_mock_server(vec![
             plan_sse("c1", stages),
             "data: {\"choices\":[{\"delta\":{\"content\":\"stage one done\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"re-implemented\"}}]}\n\ndata: [DONE]\n\n".to_string(),
         ]).await;
         let client = OpenAI::with_config(
             openai_oxide::ClientConfig::new("local").base_url(base_url),
@@ -5547,13 +5551,12 @@ mod test {
         while let Ok(body) = rx_req.try_recv() {
             requests.push(body);
         }
-        let replan = requests
+        let reimplement = requests
             .iter()
-            .find(|body| body.contains("the user's feedback"))
-            .expect("the implementation gate feedback re-plans from the current stage");
-        assert!(replan.contains("the entity is wrong"));
-        assert!(replan.contains("Step 1 of 2 was implemented"));
-        assert!(replan.contains("redo this stage if needed"));
+            .find(|body| body.contains("Re-implement Step 1 of 2"))
+            .expect("the implementation gate feedback re-implements the current stage");
+        assert!(reimplement.contains("the entity is wrong"));
+        assert!(reimplement.contains("The previous implementation was rejected"));
     }
 
     fn parse(bytes: &[u8]) -> Vec<TermEvent> {

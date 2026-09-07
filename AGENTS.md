@@ -23,12 +23,14 @@
   plan is approved
 - Plan gate: the plan agent calls submit_plan with a plan split into stages.
   The prompt box header shows "plan ready (N stages)" — Enter implements Step 1,
-  typing feedback re-plans. After each stage is implemented, a review gate opens
-  ("Step N implemented — review the implementation"; still in implement mode):
-  Enter moves to the plan review ("review Step N+1"; plan mode), typing feedback
-  re-plans from the current stage. Enter at the plan review implements the next
-  stage; typing feedback re-plans the remaining stages. Escalating re-plans the
-  remaining stages automatically and the gate opens again
+  typing feedback re-plans (keeping the plan's context). After each stage is
+  implemented, a review gate opens ("Step N implemented — review the
+  implementation"; still in implement mode): Enter moves to the plan review
+  ("review Step N+1"; plan mode), typing feedback re-implements the stage
+  (keeping the implementation's context). Enter at the plan review implements the
+  next stage; typing feedback re-plans the remaining stages (fresh context).
+  Escalating re-plans the remaining stages automatically and the gate opens
+  again
 - C-p: open/close the plan popup — shows the viewed stage's title and tasks
   (like the background job details); ←/→ switch the viewed step, jk/PgUp/PgDn/
   wheel scroll, p/q/esc close it
