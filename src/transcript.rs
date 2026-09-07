@@ -606,7 +606,7 @@ fn style_markdown_lines(
         .collect()
 }
 
-fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
+pub fn render_markdown_lines(markdown: &str) -> Vec<Line<'static>> {
     let (prepared, restore) = prepare_markdown(markdown);
 
     let rendered = from_str_with_options(&prepared, &MD_OPTIONS);

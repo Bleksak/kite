@@ -1805,34 +1805,28 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             .unwrap_or((Vec::new(), 0));
         let scroll_max = plan_scroll_max(state);
         let mut lines: Vec<Line> = Vec::new();
+        let mut title_suffix = String::new();
         if stages.is_empty() {
             lines.push(Line::from(Span::styled(
                 " no plan",
                 Style::default().fg(Color::Rgb(102, 102, 102)),
             )));
         } else if let Some(stage) = stages.get(state.plan_view) {
-            let title = Line::from(vec![
-                Span::styled(
-                    format!("Step {} of {}", state.plan_view + 1, stages.len()),
-                    Style::default().fg(Color::Rgb(102, 102, 102)),
-                ),
-                Span::styled(format!("  {}", stage.title), Style::default().bold()),
-            ]);
-            lines.push(title);
-            lines.push(Line::from(""));
+            title_suffix = format!(" · Step {} of {}", state.plan_view + 1, stages.len());
+            let mut md = String::new();
+            md.push_str(&stage.title);
+            md.push_str("\n\n");
             if stage.tasks.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    " (no tasks)",
-                    Style::default().fg(Color::Rgb(102, 102, 102)),
-                )));
+                md.push_str("_no tasks_");
             } else {
                 for (i, task) in stage.tasks.iter().enumerate() {
-                    lines.push(Line::from(Span::styled(
-                        format!("{}. {}", i + 1, task),
-                        Style::default().fg(Color::Rgb(0xa0, 0xa0, 0xb0)),
-                    )));
+                    md.push_str(&format!("{}. {}\n", i + 1, task));
+                }
+                if md.ends_with('\n') {
+                    md.pop();
                 }
             }
+            lines = crate::transcript::render_markdown_lines(&md);
         }
         let hint = Line::from(Span::styled(
             " ←→ step · jk/ PgUp PgDn scroll · ctrl+p close",
@@ -1856,7 +1850,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Rgb(95, 135, 255)))
                     .style(Style::default().bg(Color::Rgb(0x28, 0x28, 0x32)))
-                    .title(" plan ".to_string()),
+                    .title(format!(" plan {title_suffix} ")),
             );
         frame.render_widget(Fill, Rect::new(x, y, width, height));
         frame.render_widget(plan_box, Rect::new(x, y, width, height));
