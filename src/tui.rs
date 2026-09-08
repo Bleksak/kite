@@ -110,8 +110,7 @@ pub struct TuiState {
     pub picker_query: String,
     pub picker_rename: Option<String>,
     pub task_list: crate::components::task_list::State,
-    pub task_output_id: Option<String>,
-    pub task_output_scroll: Scroller,
+    pub task_detail: crate::components::task_detail::State,
     pub plan_open: bool,
     pub plan_view: usize,
     pub plan_scroll: Scroller,
@@ -143,8 +142,7 @@ impl TuiState {
             picker_query: String::new(),
             picker_rename: None,
             task_list: crate::components::task_list::State::default(),
-            task_output_id: None,
-            task_output_scroll: Scroller::default(),
+            task_detail: crate::components::task_detail::State::default(),
             plan_open: false,
             plan_view: 0,
             plan_scroll: Scroller::default(),
@@ -1664,7 +1662,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         crate::components::session_picker::draw(frame, state, chunks[1]);
     }
 
-    if state.task_list.open && state.task_output_id.is_none() {
+    if state.task_list.open && state.task_detail.task_id.is_none() {
         crate::components::task_list::draw(frame, state, chunks[1]);
     }
 
@@ -1676,7 +1674,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         crate::components::code_review::draw(frame, state, chunks[1]);
     }
 
-    if state.task_output_id.is_some() {
+    if state.task_detail.task_id.is_some() {
         crate::components::task_detail::draw(frame, state, chunks[1]);
     }
 
@@ -3136,25 +3134,25 @@ mod test {
                 .unwrap(),
         );
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.task_output_id.as_deref(), Some(id.as_str()));
+        assert_eq!(state.task_detail.task_id.as_deref(), Some(id.as_str()));
 
         handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert_eq!(state.task_output_scroll.offset(), 3);
+        assert_eq!(state.task_detail.scroll.offset(), 3);
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert_eq!(state.task_output_scroll.offset(), 0);
+        assert_eq!(state.task_detail.scroll.offset(), 0);
         handle_key(&mut state, &key(KeyCode::PageUp));
-        assert_eq!(state.task_output_scroll.offset(), 0);
+        assert_eq!(state.task_detail.scroll.offset(), 0);
         handle_key(&mut state, &key(KeyCode::PageDown));
-        assert_eq!(state.task_output_scroll.offset(), 8);
+        assert_eq!(state.task_detail.scroll.offset(), 8);
         handle_key(&mut state, &key(KeyCode::Home));
-        assert_eq!(state.task_output_scroll.offset(), 0);
-        assert!(!state.task_output_scroll.following());
+        assert_eq!(state.task_detail.scroll.offset(), 0);
+        assert!(!state.task_detail.scroll.following());
         handle_key(&mut state, &key(KeyCode::End));
-        assert_eq!(state.task_output_scroll.offset(), 18);
-        assert!(state.task_output_scroll.following());
+        assert_eq!(state.task_detail.scroll.offset(), 18);
+        assert!(state.task_detail.scroll.following());
 
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(state.task_output_id.is_none());
+        assert!(state.task_detail.task_id.is_none());
         assert!(state.task_list.open);
 
         handle_key(&mut state, &ctrl('q'));
@@ -3180,7 +3178,7 @@ mod test {
         }
         let mut state = TuiState::new("model".into());
         state.task_list.open = true;
-        state.task_output_id = Some(id);
+        state.task_detail.task_id = Some(id);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3216,8 +3214,8 @@ mod test {
             state.session().renderer.push_user(&format!("CHATLINE-{i}"));
         }
         state.task_list.open = true;
-        state.task_output_id = Some(id);
-        state.task_output_scroll.set_following(true);
+        state.task_detail.task_id = Some(id);
+        state.task_detail.scroll.set_following(true);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3249,13 +3247,13 @@ mod test {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let mut state = TuiState::new("model".into());
-        state.task_output_id = Some(id);
-        state.task_output_scroll.offset = 10;
+        state.task_detail.task_id = Some(id);
+        state.task_detail.scroll.offset = 10;
 
         handle_key(&mut state, &mouse(MouseEventKind::ScrollUp));
-        assert_eq!(state.task_output_scroll.offset(), 7);
+        assert_eq!(state.task_detail.scroll.offset(), 7);
         handle_key(&mut state, &mouse(MouseEventKind::ScrollDown));
-        assert_eq!(state.task_output_scroll.offset(), 10);
+        assert_eq!(state.task_detail.scroll.offset(), 10);
     }
 
     #[tokio::test]
@@ -3276,18 +3274,18 @@ mod test {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let mut state = TuiState::new("model".into());
-        state.task_output_id = Some(id);
+        state.task_detail.task_id = Some(id);
 
         for _ in 0..10 {
             handle_key(&mut state, &key(KeyCode::Char('j')));
         }
-        assert_eq!(state.task_output_scroll.offset(), 18);
+        assert_eq!(state.task_detail.scroll.offset(), 18);
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert_eq!(state.task_output_scroll.offset(), 15);
+        assert_eq!(state.task_detail.scroll.offset(), 15);
         handle_key(&mut state, &key(KeyCode::PageDown));
-        assert_eq!(state.task_output_scroll.offset(), 18);
+        assert_eq!(state.task_detail.scroll.offset(), 18);
         handle_key(&mut state, &key(KeyCode::PageUp));
-        assert_eq!(state.task_output_scroll.offset(), 10);
+        assert_eq!(state.task_detail.scroll.offset(), 10);
     }
 
     #[tokio::test]
@@ -3317,8 +3315,8 @@ mod test {
         terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
 
         state.task_list.open = true;
-        state.task_output_id = Some(id);
-        state.task_output_scroll.set_following(true);
+        state.task_detail.task_id = Some(id);
+        state.task_detail.scroll.set_following(true);
         terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
 
         let buffer = terminal.backend().buffer();

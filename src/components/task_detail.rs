@@ -3,12 +3,27 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::session::Scroller;
 use crate::tui::{
     KeyAction, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, TuiState,
 };
 
+pub struct State {
+    pub task_id: Option<String>,
+    pub scroll: Scroller,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            task_id: None,
+            scroll: Scroller::default(),
+        }
+    }
+}
+
 fn scroll_max(state: &TuiState) -> usize {
-    let Some(id) = &state.task_output_id else {
+    let Some(id) = &state.task_detail.task_id else {
         return 0;
     };
     let Some(task) = crate::bg::REGISTRY.list().into_iter().find(|t| t.id == *id) else {
@@ -21,31 +36,31 @@ fn scroll_max(state: &TuiState) -> usize {
 }
 
 pub fn mouse(state: &mut TuiState, mouse: &MouseEvent) -> Option<KeyAction> {
-    if state.task_output_id.is_none() {
+    if state.task_detail.task_id.is_none() {
         return None;
     }
     let max = scroll_max(state);
     Some(match mouse.kind {
         MouseEventKind::ScrollUp => {
-            state.task_output_scroll.toward_top(3);
+            state.task_detail.scroll.toward_top(3);
             KeyAction::None
         }
         MouseEventKind::ScrollDown => {
-            state.task_output_scroll.toward_bottom(3, max);
+            state.task_detail.scroll.toward_bottom(3, max);
             KeyAction::None
         }
     })
 }
 
 pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
-    if state.task_output_id.is_none() {
+    if state.task_detail.task_id.is_none() {
         return None;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(match key.code {
             KeyCode::Char('q') => {
                 state.task_list.open = false;
-                state.task_output_id = None;
+                state.task_detail.task_id = None;
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -54,31 +69,31 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     let scroll_max = scroll_max(state);
     Some(match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            state.task_output_id = None;
+            state.task_detail.task_id = None;
             KeyAction::None
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            state.task_output_scroll.toward_bottom(3, scroll_max);
+            state.task_detail.scroll.toward_bottom(3, scroll_max);
             KeyAction::None
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            state.task_output_scroll.toward_top(3);
+            state.task_detail.scroll.toward_top(3);
             KeyAction::None
         }
         KeyCode::PageDown => {
-            state.task_output_scroll.toward_bottom(8, scroll_max);
+            state.task_detail.scroll.toward_bottom(8, scroll_max);
             KeyAction::None
         }
         KeyCode::PageUp => {
-            state.task_output_scroll.toward_top(8);
+            state.task_detail.scroll.toward_top(8);
             KeyAction::None
         }
         KeyCode::Home => {
-            state.task_output_scroll.home();
+            state.task_detail.scroll.home();
             KeyAction::None
         }
         KeyCode::End => {
-            state.task_output_scroll.end(scroll_max);
+            state.task_detail.scroll.end(scroll_max);
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -86,7 +101,7 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
 }
 
 pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
-    let Some(id) = &state.task_output_id else {
+    let Some(id) = &state.task_detail.task_id else {
         return;
     };
     let tasks = crate::bg::REGISTRY.list();
@@ -98,10 +113,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
     let visible = area.height as usize - 4;
     let total = lines.len();
     let max = total.saturating_sub(visible);
-    let start = if state.task_output_scroll.following() {
+    let start = if state.task_detail.scroll.following() {
         max
     } else {
-        state.task_output_scroll.offset().min(max)
+        state.task_detail.scroll.offset().min(max)
     };
     let status = match &task.status {
         crate::bg::BgStatus::Running => "running".to_string(),

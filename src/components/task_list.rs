@@ -73,8 +73,8 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
         }
         KeyCode::Enter => {
             if let Some(task) = tasks.get(state.task_list.cursor.pos) {
-                state.task_output_id = Some(task.id.clone());
-                state.task_output_scroll = Scroller::at_tail();
+                state.task_detail.task_id = Some(task.id.clone());
+                state.task_detail.scroll = Scroller::at_tail();
             }
             KeyAction::None
         }
