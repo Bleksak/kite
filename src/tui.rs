@@ -2410,8 +2410,17 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     if state.picker_open {
         let filtered = state.filtered();
         let renaming = state.picker_rename.clone();
-        let list_height = filtered.len().max(1) as u16;
-        let height = list_height + 3;
+        let height = (filtered.len().max(1) as u16 + 3).min(chunks[1].height);
+        let visible = height.saturating_sub(3) as usize;
+        let start = if filtered.len() <= visible {
+            0
+        } else {
+            let mut s = state.picker_cursor.pos.saturating_sub(visible / 2);
+            if s + visible > filtered.len() {
+                s = filtered.len() - visible;
+            }
+            s
+        };
         let width = 52u16.min(chunks[1].width.saturating_sub(2));
         let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
         let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
@@ -2424,8 +2433,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             filtered
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(visible)
                 .map(|(i, session_idx)| {
-                    let selected = i == state.picker_cursor.pos;
+                    let selected = i + start == state.picker_cursor.pos;
                     let session = &state.sessions[*session_idx];
                     let marker = if selected { "›" } else { " " };
                     let status = if session.running {
@@ -2494,7 +2505,8 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     if state.tasks_open && state.task_output_id.is_none() {
         let tasks = crate::bg::REGISTRY.list();
         let list_height = tasks.len().max(1) as u16;
-        let height = list_height + 3;
+        let height = (list_height + 3).min(chunks[1].height);
+        let visible = height.saturating_sub(3) as usize;
         let width = 52u16.min(chunks[1].width.saturating_sub(2));
         let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
         let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
@@ -2507,6 +2519,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             tasks
                 .iter()
                 .enumerate()
+                .take(visible)
                 .map(|(i, task)| {
                     let selected = i == state.tasks_cursor.pos;
                     let status = match &task.status {
@@ -3375,6 +3388,21 @@ mod test {
             handle_key(&mut state, &TermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
             KeyAction::None
         );
+    }
+
+    #[test]
+    fn picker_does_not_overflow_a_short_terminal() {
+        let mut state = TuiState::new("model".into());
+        for i in 1..40 {
+            state.sessions.push(Session::new(i));
+        }
+        state.active = 39;
+        state.picker_open = true;
+        state.picker_cursor.set(39);
+
+        let backend = TestBackend::new(174, 43);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
     }
 
     #[test]
