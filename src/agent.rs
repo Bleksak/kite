@@ -137,11 +137,6 @@ impl Agent {
         }
     }
 
-    #[cfg(test)]
-    pub fn history(&self) -> &[Message] {
-        &self.context.messages
-    }
-
     pub async fn chat(
         &mut self,
         user_message: &str,
@@ -824,7 +819,7 @@ mod test {
 
         assert_eq!(step, Step::Done("hello".into()));
         assert_eq!(
-            agent.history()[0],
+            agent.context.messages.as_slice()[0],
             Message::Assistant {
                 content: Some("hello".into()),
                 tool_calls: vec![],
@@ -846,9 +841,9 @@ mod test {
         .await;
 
         assert_eq!(step, Step::Continue);
-        assert_eq!(agent.history().len(), 2);
+        assert_eq!(agent.context.messages.as_slice().len(), 2);
         assert_eq!(
-            agent.history()[1],
+            agent.context.messages.as_slice()[1],
             Message::Tool {
                 tool_call_id: "call_1".into(),
                 content: "out\n".into(),
@@ -870,7 +865,7 @@ mod test {
         .await;
 
         assert_eq!(
-            agent.history()[1],
+            agent.context.messages.as_slice()[1],
             Message::Tool {
                 tool_call_id: "call_1".into(),
                 content: "bash exited with 3\n".into(),
@@ -891,7 +886,7 @@ mod test {
         )
         .await;
 
-        let Message::Tool { content, .. } = &agent.history()[1] else {
+        let Message::Tool { content, .. } = &agent.context.messages.as_slice()[1] else {
             panic!("expected tool message");
         };
         assert!(content.contains("invalid arguments for bash"));
@@ -936,21 +931,21 @@ mod test {
 
         assert_eq!(step, Step::Continue);
         assert_eq!(
-            agent.history()[1],
+            agent.context.messages.as_slice()[1],
             Message::Tool {
                 tool_call_id: "c1".into(),
                 content: "one".into()
             }
         );
         assert_eq!(
-            agent.history()[2],
+            agent.context.messages.as_slice()[2],
             Message::Tool {
                 tool_call_id: "c2".into(),
                 content: "two".into()
             }
         );
         assert_eq!(
-            agent.history()[3],
+            agent.context.messages.as_slice()[3],
             Message::Tool {
                 tool_call_id: "c3".into(),
                 content: format!("wrote 5 bytes to {}", file_c.to_string_lossy())
@@ -986,14 +981,14 @@ mod test {
         let Message::Tool {
             tool_call_id,
             content,
-        } = &agent.history()[1]
+        } = &agent.context.messages.as_slice()[1]
         else {
             panic!("expected tool message");
         };
         assert_eq!(tool_call_id, "c1");
         assert!(content.contains("invalid arguments"));
         assert_eq!(
-            agent.history()[2],
+            agent.context.messages.as_slice()[2],
             Message::Tool {
                 tool_call_id: "c2".into(),
                 content: "one".into(),
@@ -1008,7 +1003,7 @@ mod test {
         run_tool_call(&mut agent, "call_1", "nuke", "{}", &mut Vec::new()).await;
 
         assert_eq!(
-            agent.history()[1],
+            agent.context.messages.as_slice()[1],
             Message::Tool {
                 tool_call_id: "call_1".into(),
                 content: "unknown tool nuke".into(),
@@ -1198,14 +1193,14 @@ mod test {
         assert_eq!(step, Step::Continue);
 
         assert_eq!(
-            agent.history()[1],
+            agent.context.messages.as_slice()[1],
             Message::Tool {
                 tool_call_id: "call_1".into(),
                 content: "one\n".into(),
             }
         );
         assert_eq!(
-            agent.history()[2],
+            agent.context.messages.as_slice()[2],
             Message::Tool {
                 tool_call_id: "call_2".into(),
                 content: "two\n".into(),
@@ -1497,7 +1492,7 @@ mod test {
         assert_eq!(outcome, ChatOutcome::Cancelled);
         waiter.await.unwrap();
         assert_eq!(
-            agent.history().last().unwrap(),
+            agent.context.messages.as_slice().last().unwrap(),
             &Message::Tool {
                 tool_call_id: "call_1".into(),
                 content: "cancelled".into(),
@@ -1533,7 +1528,7 @@ mod test {
             .unwrap();
 
         assert_eq!(outcome, ChatOutcome::Answer("done".into()));
-        let history = agent.history();
+        let history = agent.context.messages.as_slice();
         let steer = history
             .iter()
             .position(|m| matches!(m, Message::User { content } if content == "steer me"))
@@ -1578,7 +1573,7 @@ mod test {
             count += 1;
         }
         assert_eq!(count, 2);
-        let history = agent.history();
+        let history = agent.context.messages.as_slice();
         let position_of = |predicate: fn(&Message) -> bool| {
             history.iter().position(predicate).unwrap()
         };
@@ -1659,7 +1654,7 @@ mod test {
             .await
             .unwrap();
         assert_eq!(outcome, ChatOutcome::Answer("done".into()));
-        let rejection = agent.history().iter().any(|message| {
+        let rejection = agent.context.messages.as_slice().iter().any(|message| {
             matches!(message, Message::Tool { content, .. }
                 if content.contains("submit_plan is not allowed in mode yolo"))
         });
