@@ -3,46 +3,53 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::screen::Screen;
 use crate::session::{Cursor, Scroller};
 use crate::tui::{KeyAction, KeyCode, KeyEvent, KeyModifiers, TuiState};
 
+#[derive(Clone)]
 pub struct State {
-    pub open: bool,
     pub cursor: Cursor,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            open: false,
             cursor: Cursor::default(),
         }
     }
 }
 
 pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
-    if !state.task_list.open {
-        return None;
-    }
+    let TuiState { screen, active, .. } = state;
+    let list = match screen {
+        Screen::TaskList(list) => list,
+        _ => return None,
+    };
     let tasks = crate::bg::REGISTRY.list();
     let len = tasks.len();
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(match key.code {
             KeyCode::Char('j') => {
-                state.task_list.cursor.down(len);
+                list.cursor.down(len);
                 KeyAction::None
             }
             KeyCode::Char('k') => {
-                state.task_list.cursor.up(len);
+                list.cursor.up(len);
                 KeyAction::None
             }
             KeyCode::Char('s') => {
-                state.picker.open = true;
-                state.task_list.open = false;
+                let mut picker = crate::components::session_picker::State::default();
+                picker.cursor.set(*active);
+                let carried = list.clone();
+                *screen = Screen::SessionPicker {
+                    picker,
+                    list: carried,
+                };
                 KeyAction::None
             }
             KeyCode::Char('q') => {
-                state.task_list.open = false;
+                *screen = Screen::Chat;
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -50,36 +57,44 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     }
     Some(match key.code {
         KeyCode::Up => {
-            state.task_list.cursor.up(len);
+            list.cursor.up(len);
             KeyAction::None
         }
         KeyCode::Down => {
-            state.task_list.cursor.down(len);
+            list.cursor.down(len);
             KeyAction::None
         }
         KeyCode::Char('j') => {
-            state.task_list.cursor.down(len);
+            list.cursor.down(len);
             KeyAction::None
         }
         KeyCode::Char('k') => {
-            state.task_list.cursor.up(len);
+            list.cursor.up(len);
             KeyAction::None
         }
         KeyCode::Char('x') => {
-            if let Some(task) = tasks.get(state.task_list.cursor.pos) {
+            if let Some(task) = tasks.get(list.cursor.pos) {
                 let _ = crate::bg::REGISTRY.kill(&task.id);
             }
             KeyAction::None
         }
         KeyCode::Enter => {
-            if let Some(task) = tasks.get(state.task_list.cursor.pos) {
-                state.task_detail.task_id = Some(task.id.clone());
-                state.task_detail.scroll = Scroller::at_tail();
+            let pos = list.cursor.pos;
+            if let Some(task) = tasks.get(pos) {
+                let id = task.id.clone();
+                let carried = list.clone();
+                *screen = Screen::TaskDetail {
+                    detail: crate::components::task_detail::State {
+                        task_id: id,
+                        scroll: Scroller::at_tail(),
+                    },
+                    list: carried,
+                };
             }
             KeyAction::None
         }
         KeyCode::Char('q') | KeyCode::Esc => {
-            state.task_list.open = false;
+            *screen = Screen::Chat;
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -87,13 +102,17 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
 }
 
 pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
+    let list = match &state.screen {
+        Screen::TaskList(list) => list,
+        _ => return,
+    };
     let tasks = crate::bg::REGISTRY.list();
     let height = area.height;
     let visible = height.saturating_sub(3) as usize;
     let start = if tasks.len() <= visible {
         0
     } else {
-        let mut s = state.task_list.cursor.pos.saturating_sub(visible / 2);
+        let mut s = list.cursor.pos.saturating_sub(visible / 2);
         if s + visible > tasks.len() {
             s = tasks.len() - visible;
         }
@@ -111,7 +130,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
             .skip(start)
             .take(visible)
             .map(|(i, task)| {
-                let selected = i + start == state.task_list.cursor.pos;
+                let selected = i + start == list.cursor.pos;
                 let status = match &task.status {
                     crate::bg::BgStatus::Running => "running  ".to_string(),
                     crate::bg::BgStatus::Finished(None) => "killed   ".to_string(),

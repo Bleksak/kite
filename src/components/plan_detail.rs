@@ -3,13 +3,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::screen::Screen;
 use crate::session::Scroller;
-use crate::tui::{
-    KeyAction, KeyCode, KeyEvent, MouseEvent, MouseEventKind, TuiState,
-};
+use crate::tui::{KeyAction, KeyCode, KeyEvent, MouseEvent, MouseEventKind, TuiState};
 
 pub struct State {
-    pub open: bool,
     pub view: usize,
     pub scroll: Scroller,
 }
@@ -17,99 +15,100 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            open: false,
             view: 0,
             scroll: Scroller::default(),
         }
     }
 }
 
-fn scroll_max(state: &TuiState) -> usize {
-    let Some((stages, _)) = state
-        .sessions
-        .get(state.active)
-        .and_then(|s| s.plan.clone())
-    else {
-        return 0;
-    };
-    let Some(stage) = stages.get(state.plan_detail.view) else {
+fn scroll_max(stages: &[crate::tool::PlanStage], view: usize, viewport: usize) -> usize {
+    let Some(stage) = stages.get(view) else {
         return 0;
     };
     let total =
         1 + 1 + if stage.tasks.is_empty() { 1 } else { stage.tasks.len() } + 1;
-    let visible = state.viewport.saturating_sub(4);
+    let visible = viewport.saturating_sub(4);
     total.saturating_sub(visible)
 }
 
 pub fn mouse(state: &mut TuiState, mouse: &MouseEvent) -> Option<KeyAction> {
-    if !state.plan_detail.open {
-        return None;
-    }
-    let max = scroll_max(state);
+    let viewport = state.viewport;
+    let (stages, _) = state
+        .sessions
+        .get(state.active)
+        .and_then(|s| s.plan.clone())
+        .unwrap_or((Vec::new(), 0));
+    let plan = match &mut state.screen {
+        Screen::PlanDetail(plan) => plan,
+        _ => return None,
+    };
+    let max = scroll_max(&stages, plan.view, viewport);
     Some(match mouse.kind {
         MouseEventKind::ScrollUp => {
-            state.plan_detail.scroll.toward_top(3);
+            plan.scroll.toward_top(3);
             KeyAction::None
         }
         MouseEventKind::ScrollDown => {
-            state.plan_detail.scroll.toward_bottom(3, max);
+            plan.scroll.toward_bottom(3, max);
             KeyAction::None
         }
     })
 }
 
 pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
-    if !state.plan_detail.open {
-        return None;
-    }
-    let len = state
-        .session()
-        .plan
-        .as_ref()
-        .map(|(stages, _)| stages.len())
-        .unwrap_or(0);
-    let scroll_max = scroll_max(state);
+    let viewport = state.viewport;
+    let (stages, _) = state
+        .sessions
+        .get(state.active)
+        .and_then(|s| s.plan.clone())
+        .unwrap_or((Vec::new(), 0));
+    let len = stages.len();
+    let plan = match &mut state.screen {
+        Screen::PlanDetail(plan) => plan,
+        _ => return None,
+    };
+    let scroll_max = scroll_max(&stages, plan.view, viewport);
     Some(match key.code {
         KeyCode::Char('p') | KeyCode::Char('q') | KeyCode::Esc => {
-            state.plan_detail.open = false;
+            state.screen = Screen::Chat;
             KeyAction::None
         }
         KeyCode::Left | KeyCode::Char('h') => {
-            if state.plan_detail.view > 0 {
-                state.plan_detail.view -= 1;
-                state.plan_detail.scroll = Scroller::at_tail();
+            if plan.view > 0 {
+                plan.view -= 1;
+                plan.scroll = Scroller::at_tail();
             }
             KeyAction::None
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            if state.plan_detail.view + 1 < len {
-                state.plan_detail.view += 1;
-                state.plan_detail.scroll = Scroller::at_tail();
+            if plan.view + 1 < len {
+                plan.view += 1;
+                plan.scroll = Scroller::at_tail();
             }
             KeyAction::None
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            state.plan_detail.scroll.toward_bottom(3, scroll_max);
+            plan.scroll.toward_bottom(3, scroll_max);
             KeyAction::None
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            state.plan_detail.scroll.toward_top(3);
+            plan.scroll.toward_top(3);
             KeyAction::None
         }
         KeyCode::PageDown => {
-            state.plan_detail.scroll.toward_bottom(8, scroll_max);
+            plan.scroll.toward_bottom(8, scroll_max);
             KeyAction::None
         }
         KeyCode::PageUp => {
-            state.plan_detail.scroll.toward_top(8);
+            plan.scroll.toward_top(8);
             KeyAction::None
         }
         KeyCode::Home => {
-            state.plan_detail.scroll.home();
+            plan.scroll.home();
             KeyAction::None
         }
         KeyCode::End => {
-            state.plan_detail.scroll.end(scroll_max);
+            plan.scroll.end(scroll_max);
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -117,12 +116,16 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
 }
 
 pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
+    let plan = match &state.screen {
+        Screen::PlanDetail(plan) => plan,
+        _ => return,
+    };
     let (stages, _) = state
         .sessions
         .get(state.active)
         .and_then(|s| s.plan.clone())
         .unwrap_or((Vec::new(), 0));
-    let scroll_max = scroll_max(state);
+    let scroll_max = scroll_max(&stages, plan.view, state.viewport);
     let mut lines: Vec<Line> = Vec::new();
     let mut title_suffix = String::new();
     if stages.is_empty() {
@@ -130,8 +133,8 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
             " no plan",
             Style::default().fg(Color::Rgb(102, 102, 102)),
         )));
-    } else if let Some(stage) = stages.get(state.plan_detail.view) {
-        title_suffix = format!(" · Step {} of {}", state.plan_detail.view + 1, stages.len());
+    } else if let Some(stage) = stages.get(plan.view) {
+        title_suffix = format!(" · Step {} of {}", plan.view + 1, stages.len());
         let mut md = String::new();
         md.push_str(&stage.title);
         md.push_str("\n\n");
@@ -153,10 +156,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
     ));
     let all: Vec<Line> = lines.into_iter().chain(std::iter::once(hint)).collect();
     let visible = state.viewport.saturating_sub(4);
-    let start = if state.plan_detail.scroll.following() {
+    let start = if plan.scroll.following() {
         scroll_max
     } else {
-        state.plan_detail.scroll.offset().min(scroll_max)
+        plan.scroll.offset().min(scroll_max)
     };
     crate::tui::render_panel(
         frame,

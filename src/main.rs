@@ -8,6 +8,7 @@ mod message;
 mod mode;
 mod paths;
 mod plan_gate;
+mod screen;
 mod session;
 mod session_store;
 mod stream;

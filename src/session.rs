@@ -123,7 +123,7 @@ impl Session {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Cursor {
     pub pos: usize,
 }

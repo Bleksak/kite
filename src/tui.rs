@@ -105,11 +105,7 @@ pub struct TuiState {
     pub model: String,
     pub thinking: Arc<Mutex<ThinkingLevel>>,
     pub mode: Arc<Mutex<Mode>>,
-    pub picker: crate::components::session_picker::State,
-    pub task_list: crate::components::task_list::State,
-    pub task_detail: crate::components::task_detail::State,
-    pub plan_detail: crate::components::plan_detail::State,
-    pub code_review: crate::components::code_review::State,
+    pub screen: crate::screen::Screen,
     pub next_id: u64,
 }
 
@@ -123,11 +119,7 @@ impl TuiState {
             model,
             thinking: Arc::new(std::sync::Mutex::new(ThinkingLevel::Off)),
             mode: Arc::new(std::sync::Mutex::new(Mode::Yolo)),
-            picker: crate::components::session_picker::State::default(),
-            task_list: crate::components::task_list::State::default(),
-            task_detail: crate::components::task_detail::State::default(),
-            plan_detail: crate::components::plan_detail::State::default(),
-            code_review: crate::components::code_review::State::default(),
+            screen: crate::screen::Screen::Chat,
             next_id: 1,
         }
     }
@@ -166,18 +158,19 @@ impl TuiState {
         state
     }
 
-    pub fn filtered(&self) -> Vec<usize> {
-        if self.picker.query.is_empty() {
-            return (0..self.sessions.len()).collect();
-        }
-        let query = self.picker.query.to_lowercase();
-        (0..self.sessions.len())
-            .filter(|i| {
-                self.sessions[*i].label.to_lowercase().contains(&query)
-                    || i.to_string().contains(&query)
-            })
-            .collect()
+}
+
+pub(crate) fn filtered(sessions: &[Session], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..sessions.len()).collect();
     }
+    let query = query.to_lowercase();
+    (0..sessions.len())
+        .filter(|i| {
+            sessions[*i].label.to_lowercase().contains(&query)
+                || i.to_string().contains(&query)
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq)]
@@ -410,28 +403,29 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if key.code == KeyCode::Char('p') {
-            if !state.plan_detail.open {
+            if matches!(state.screen, crate::screen::Screen::PlanDetail(_)) {
+                state.screen = crate::screen::Screen::Chat;
+            } else {
                 let stage_index = state
                     .session()
                     .plan
                     .as_ref()
                     .map(|(_, i)| *i)
                     .unwrap_or(0);
-                state.plan_detail.view = stage_index;
-                state.plan_detail.scroll = Scroller::at_tail();
+                state.screen = crate::screen::Screen::PlanDetail(
+                    crate::components::plan_detail::State {
+                        view: stage_index,
+                        scroll: Scroller::at_tail(),
+                    },
+                );
             }
-            state.plan_detail.open = !state.plan_detail.open;
-            state.picker.open = false;
-            state.task_list.open = false;
             return KeyAction::None;
         }
         if key.code == KeyCode::Char('g') {
-            if !state.code_review.open {
-                crate::components::code_review::open(state);
-            }
-            state.code_review.open = !state.code_review.open;
-            state.picker.open = false;
-            state.task_list.open = false;
+            // when the review is open, its handle_key already closed it
+            state.screen = crate::screen::Screen::CodeReview(
+                crate::components::code_review::open(state),
+            );
             return KeyAction::None;
         }
         let session = state.session();
@@ -442,15 +436,21 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         }
         return match key.code {
             KeyCode::Char('s') => {
-                state.picker.open = true;
-                state.task_list.open = false;
-                state.picker.cursor.set(state.active);
+                let list = match &state.screen {
+                    crate::screen::Screen::TaskList(l) => l.clone(),
+                    _ => crate::components::task_list::State::default(),
+                };
+                let mut picker = crate::components::session_picker::State::default();
+                picker.cursor.set(state.active);
+                state.screen = crate::screen::Screen::SessionPicker {
+                    picker,
+                    list,
+                };
                 KeyAction::None
             }
             KeyCode::Char('q') => {
-                state.task_list.open = true;
-                state.picker.open = false;
-                state.task_list.cursor.set(0);
+                state.screen =
+                    crate::screen::Screen::TaskList(crate::components::task_list::State::default());
                 KeyAction::None
             }
             KeyCode::Char('t') => {
@@ -1527,10 +1527,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let input_lines = active_box_lines(&state.sessions[state.active], state.pane_width);
     let session = &state.sessions[state.active];
-    let suggest = if state.picker.open
-        || state.task_list.open
-        || state.plan_detail.open
-        || state.code_review.open
+    let suggest = if !matches!(state.screen, crate::screen::Screen::Chat)
         || session.question.is_some()
     {
         None
@@ -1632,24 +1629,23 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         );
     }
 
-    if state.picker.open {
-        crate::components::session_picker::draw(frame, state, chunks[1]);
-    }
-
-    if state.task_list.open && state.task_detail.task_id.is_none() {
-        crate::components::task_list::draw(frame, state, chunks[1]);
-    }
-
-    if state.plan_detail.open {
-        crate::components::plan_detail::draw(frame, state, chunks[1]);
-    }
-
-    if state.code_review.open {
-        crate::components::code_review::draw(frame, state, chunks[1]);
-    }
-
-    if state.task_detail.task_id.is_some() {
-        crate::components::task_detail::draw(frame, state, chunks[1]);
+    match state.screen {
+        crate::screen::Screen::SessionPicker { .. } => {
+            crate::components::session_picker::draw(frame, state, chunks[1])
+        }
+        crate::screen::Screen::TaskList(_) => {
+            crate::components::task_list::draw(frame, state, chunks[1])
+        }
+        crate::screen::Screen::PlanDetail(_) => {
+            crate::components::plan_detail::draw(frame, state, chunks[1])
+        }
+        crate::screen::Screen::CodeReview(_) => {
+            crate::components::code_review::draw(frame, state, chunks[1])
+        }
+        crate::screen::Screen::TaskDetail { .. } => {
+            crate::components::task_detail::draw(frame, state, chunks[1])
+        }
+        crate::screen::Screen::Chat => {}
     }
 
     let input = if session.question.is_some() {
@@ -2171,6 +2167,49 @@ mod test {
         TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT))
     }
 
+    fn picker_state(state: &mut TuiState) -> &mut crate::components::session_picker::State {
+        match &mut state.screen {
+            crate::screen::Screen::SessionPicker { picker: p, .. } => p,
+            _ => panic!("expected session picker screen"),
+        }
+    }
+
+    fn task_list_state(state: &mut TuiState) -> &mut crate::components::task_list::State {
+        match &mut state.screen {
+            crate::screen::Screen::TaskList(p) => p,
+            _ => panic!("expected task list screen"),
+        }
+    }
+
+    fn task_detail_state(state: &mut TuiState) -> &mut crate::components::task_detail::State {
+        match &mut state.screen {
+            crate::screen::Screen::TaskDetail { detail, .. } => detail,
+            _ => panic!("expected task detail screen"),
+        }
+    }
+
+    fn plan_state(state: &mut TuiState) -> &mut crate::components::plan_detail::State {
+        match &mut state.screen {
+            crate::screen::Screen::PlanDetail(p) => p,
+            _ => panic!("expected plan detail screen"),
+        }
+    }
+
+    fn review_state(state: &mut TuiState) -> &mut crate::components::code_review::State {
+        match &mut state.screen {
+            crate::screen::Screen::CodeReview(p) => p,
+            _ => panic!("expected code review screen"),
+        }
+    }
+
+    fn filtered_query(state: &TuiState) -> Vec<usize> {
+        let query = match &state.screen {
+            crate::screen::Screen::SessionPicker { picker, .. } => picker.query.clone(),
+            _ => String::new(),
+        };
+        crate::tui::filtered(&state.sessions, &query)
+    }
+
     #[test]
     fn ctrl_esc_csi_u_sequence_maps_to_esc_with_control() {
         let mut parser = termwiz::input::InputParser::new();
@@ -2290,8 +2329,8 @@ mod test {
             state.sessions.push(Session::new(i));
         }
         state.active = 39;
-        state.picker.open = true;
-        state.picker.cursor.set(39);
+        state.screen = crate::screen::Screen::SessionPicker { picker: crate::components::session_picker::State::default(), list: crate::components::task_list::State::default() };
+        picker_state(&mut state).cursor.set(39);
 
         let backend = TestBackend::new(174, 43);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2306,17 +2345,17 @@ mod test {
 
         handle_key(&mut state, &ctrl('s'));
 
-        assert!(state.picker.open);
-        assert_eq!(state.picker.cursor.pos, 1);
+        assert!(matches!(state.screen, crate::screen::Screen::SessionPicker { .. }));
+        assert_eq!(picker_state(&mut state).cursor.pos, 1);
 
         handle_key(&mut state, &ctrl('s'));
-        assert!(!state.picker.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
 
         handle_key(&mut state, &ctrl('q'));
-        assert!(state.task_list.open);
+        assert!(matches!(state.screen, crate::screen::Screen::TaskList(_)));
 
         handle_key(&mut state, &ctrl('q'));
-        assert!(!state.task_list.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[test]
@@ -2328,20 +2367,20 @@ mod test {
 
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &ctrl('k'));
-        assert_eq!(state.picker.cursor.pos, 1);
+        assert_eq!(picker_state(&mut state).cursor.pos, 1);
         handle_key(&mut state, &ctrl('k'));
-        assert_eq!(state.picker.cursor.pos, 0);
+        assert_eq!(picker_state(&mut state).cursor.pos, 0);
         handle_key(&mut state, &ctrl('j'));
-        assert_eq!(state.picker.cursor.pos, 1);
+        assert_eq!(picker_state(&mut state).cursor.pos, 1);
         if let KeyAction::PickerSelected(i) = handle_key(&mut state, &key(KeyCode::Enter)) {
             state.active = i;
         }
         assert_eq!(state.active, 1);
-        assert!(!state.picker.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
 
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.picker.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
         assert_eq!(state.active, 1);
     }
 
@@ -2354,7 +2393,7 @@ mod test {
 
         assert_eq!(state.sessions.len(), 2);
         assert_eq!(state.active, 1);
-        assert!(!state.picker.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[test]
@@ -2374,11 +2413,11 @@ mod test {
         assert_eq!(state.active, 0);
 
         handle_key(&mut state, &ctrl('s'));
-        assert!(!state.picker.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &ctrl('x'));
         assert_eq!(state.sessions.len(), 1);
-        assert!(state.picker.open);
+        assert!(matches!(state.screen, crate::screen::Screen::SessionPicker { .. }));
     }
 
     #[test]
@@ -2390,33 +2429,33 @@ mod test {
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &ctrl('j'));
         handle_key(&mut state, &ctrl('r'));
-        assert!(state.picker.rename.is_some());
+        assert!(picker_state(&mut state).rename.is_some());
         handle_key(&mut state, &key(KeyCode::Char('n')));
         handle_key(&mut state, &key(KeyCode::Char('e')));
         handle_key(&mut state, &key(KeyCode::Char('w')));
         handle_key(&mut state, &key(KeyCode::Backspace));
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.sessions[1].label, "ne");
-        assert!(state.picker.rename.is_none());
+        assert!(picker_state(&mut state).rename.is_none());
 
         handle_key(&mut state, &ctrl('r'));
         handle_key(&mut state, &key(KeyCode::Char('x')));
         handle_key(&mut state, &key(KeyCode::Esc));
         assert_eq!(state.sessions[1].label, "ne");
-        assert!(state.picker.rename.is_none());
+        assert!(picker_state(&mut state).rename.is_none());
     }
 
     #[test]
     fn picker_typing_searches_and_backspace_clears() {
         let mut state = TuiState::new("model".into());
-        state.picker.open = true;
+        state.screen = crate::screen::Screen::SessionPicker { picker: crate::components::session_picker::State::default(), list: crate::components::task_list::State::default() };
 
         handle_key(&mut state, &key(KeyCode::Char('f')));
-        assert_eq!(state.picker.query, "f");
+        assert_eq!(picker_state(&mut state).query, "f");
         assert_eq!(state.session().input, "");
         handle_key(&mut state, &key(KeyCode::Backspace));
-        assert_eq!(state.picker.query, "");
-        assert!(state.picker.open);
+        assert_eq!(picker_state(&mut state).query, "");
+        assert!(matches!(state.screen, crate::screen::Screen::SessionPicker { .. }));
     }
 
     #[test]
@@ -2426,17 +2465,17 @@ mod test {
         state.sessions.push(Session::new(2));
         state.sessions[0].label = "fix login".into();
         state.sessions[1].label = "refactor parser".into();
-        state.picker.open = true;
+        state.screen = crate::screen::Screen::SessionPicker { picker: crate::components::session_picker::State::default(), list: crate::components::task_list::State::default() };
 
         handle_key(&mut state, &key(KeyCode::Char('l')));
-        assert_eq!(state.filtered(), vec![0]);
-        assert_eq!(state.picker.cursor.pos, 0);
+        assert_eq!(filtered_query(&state), vec![0]);
+        assert_eq!(picker_state(&mut state).cursor.pos, 0);
 
         handle_key(&mut state, &key(KeyCode::Char('2')));
-        assert!(state.filtered().is_empty());
+        assert!(filtered_query(&state).is_empty());
 
         handle_key(&mut state, &key(KeyCode::Backspace));
-        assert_eq!(state.filtered(), vec![0]);
+        assert_eq!(filtered_query(&state), vec![0]);
     }
 
     #[tokio::test]
@@ -2445,23 +2484,20 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('q'));
-        state.task_list.cursor.set(
+        task_list_state(&mut state).cursor.set(
             crate::bg::REGISTRY
                 .list()
                 .iter()
                 .position(|t| t.id == id)
                 .unwrap(),
         );
-        assert!(state.task_list.open);
-        assert!(!state.picker.open);
+        assert!(matches!(state.screen, crate::screen::Screen::TaskList(_)));
 
         handle_key(&mut state, &ctrl('s'));
-        assert!(state.picker.open);
-        assert!(!state.task_list.open);
+        assert!(matches!(state.screen, crate::screen::Screen::SessionPicker { .. }));
 
         handle_key(&mut state, &ctrl('q'));
-        assert!(state.task_list.open);
-        assert!(!state.picker.open);
+        assert!(matches!(state.screen, crate::screen::Screen::TaskList(_)));
 
         handle_key(&mut state, &key(KeyCode::Char('x')));
         for _ in 0..200 {
@@ -2489,7 +2525,7 @@ mod test {
         ));
 
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.task_list.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[test]
@@ -2500,9 +2536,9 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert_eq!(state.task_list.cursor.pos, 0);
+        assert_eq!(task_list_state(&mut state).cursor.pos, 0);
         handle_key(&mut state, &key(KeyCode::Char('q')));
-        assert!(!state.task_list.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     fn plan_stages() -> Vec<crate::tool::PlanStage> {
@@ -2523,20 +2559,20 @@ mod test {
         state.session().plan = Some((plan_stages(), 1));
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::PlanDetail(_)));
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(!state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::PlanDetail(_)));
         handle_key(&mut state, &key(KeyCode::Char('q')));
-        assert!(!state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::PlanDetail(_)));
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[test]
@@ -2545,10 +2581,10 @@ mod test {
         state.session().running = true;
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::PlanDetail(_)));
 
         handle_key(&mut state, &key(KeyCode::Char('q')));
-        assert!(!state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[test]
@@ -2556,11 +2592,11 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::PlanDetail(_)));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.plan_detail.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[test]
@@ -2569,18 +2605,18 @@ mod test {
         state.session().plan = Some((plan_stages(), 0));
 
         handle_key(&mut state, &ctrl('p'));
-        assert_eq!(state.plan_detail.view, 0);
+        assert_eq!(plan_state(&mut state).view, 0);
 
         handle_key(&mut state, &key(KeyCode::Left));
-        assert_eq!(state.plan_detail.view, 0);
+        assert_eq!(plan_state(&mut state).view, 0);
         handle_key(&mut state, &key(KeyCode::Right));
-        assert_eq!(state.plan_detail.view, 1);
+        assert_eq!(plan_state(&mut state).view, 1);
         handle_key(&mut state, &key(KeyCode::Char('l')));
-        assert_eq!(state.plan_detail.view, 1);
+        assert_eq!(plan_state(&mut state).view, 1);
         handle_key(&mut state, &key(KeyCode::Char('h')));
-        assert_eq!(state.plan_detail.view, 0);
+        assert_eq!(plan_state(&mut state).view, 0);
         handle_key(&mut state, &key(KeyCode::Char('h')));
-        assert_eq!(state.plan_detail.view, 0);
+        assert_eq!(plan_state(&mut state).view, 0);
     }
 
     #[test]
@@ -2589,12 +2625,12 @@ mod test {
         state.session().plan = Some((plan_stages(), 0));
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_detail.scroll.following());
+        assert!(plan_state(&mut state).scroll.following());
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert!(!state.plan_detail.scroll.following());
+        assert!(!plan_state(&mut state).scroll.following());
         handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert!(state.plan_detail.scroll.following());
+        assert!(plan_state(&mut state).scroll.following());
     }
 
     #[test]
@@ -2602,20 +2638,20 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        assert!(state.code_review.open);
+        assert!(matches!(state.screen, crate::screen::Screen::CodeReview(_)));
 
         handle_key(&mut state, &ctrl('g'));
-        assert!(!state.code_review.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
 
         handle_key(&mut state, &ctrl('g'));
-        assert!(state.code_review.open);
+        assert!(matches!(state.screen, crate::screen::Screen::CodeReview(_)));
         handle_key(&mut state, &key(KeyCode::Char('q')));
-        assert!(!state.code_review.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
 
         handle_key(&mut state, &ctrl('g'));
-        assert!(state.code_review.open);
+        assert!(matches!(state.screen, crate::screen::Screen::CodeReview(_)));
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.code_review.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[test]
@@ -2623,18 +2659,18 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = format!(
+        review_state(&mut state).text = format!(
             "diff --git a/a.txt b/a.txt\n@@ -0,0 +1,100 @@\n{}",
             (0..100).map(|i| format!("+line {i}")).collect::<Vec<_>>().join("\n")
         );
-        assert_eq!(state.code_review.cursor, 0);
+        assert_eq!(review_state(&mut state).cursor, 0);
 
         handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert_eq!(state.code_review.cursor, 1);
+        assert_eq!(review_state(&mut state).cursor, 1);
         handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert_eq!(state.code_review.cursor, 2);
+        assert_eq!(review_state(&mut state).cursor, 2);
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert_eq!(state.code_review.cursor, 1);
+        assert_eq!(review_state(&mut state).cursor, 1);
     }
 
     #[test]
@@ -2642,17 +2678,17 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b.txt b/b.txt\n@@ -1 +1 @@\n-a\n+b".into();
-        assert_eq!(state.code_review.file_index, 0);
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b.txt b/b.txt\n@@ -1 +1 @@\n-a\n+b".into();
+        assert_eq!(review_state(&mut state).file_index, 0);
 
         handle_key(&mut state, &key(KeyCode::Right));
-        assert_eq!(state.code_review.file_index, 1);
+        assert_eq!(review_state(&mut state).file_index, 1);
         handle_key(&mut state, &key(KeyCode::Char('l')));
-        assert_eq!(state.code_review.file_index, 1);
+        assert_eq!(review_state(&mut state).file_index, 1);
         handle_key(&mut state, &key(KeyCode::Char('h')));
-        assert_eq!(state.code_review.file_index, 0);
+        assert_eq!(review_state(&mut state).file_index, 0);
         handle_key(&mut state, &key(KeyCode::Char('h')));
-        assert_eq!(state.code_review.file_index, 0);
+        assert_eq!(review_state(&mut state).file_index, 0);
     }
 
     #[test]
@@ -2660,23 +2696,23 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('v')));
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert!(state.code_review.anchor.is_some());
+        assert!(review_state(&mut state).anchor.is_some());
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert!(state.code_review.commenting);
+        assert!(review_state(&mut state).commenting);
         for c in "wrong".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert!(!state.code_review.commenting);
-        assert!(state.code_review.anchor.is_none());
+        assert!(!review_state(&mut state).commenting);
+        assert!(review_state(&mut state).anchor.is_none());
 
-        let comment = &state.code_review.comments[0];
+        let comment = &review_state(&mut state).comments[0];
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.text, "wrong");
         assert_eq!(comment.range, Some(1..2));
@@ -2687,17 +2723,17 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert!(state.code_review.commenting);
+        assert!(review_state(&mut state).commenting);
         for c in "bad".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
 
-        let comment = &state.code_review.comments[0];
+        let comment = &review_state(&mut state).comments[0];
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.text, "bad");
         assert_eq!(comment.range, Some(1..2));
@@ -2708,14 +2744,14 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
         for c in "note".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments.len(), 1);
         assert!(state.session().review_comments.is_empty());
 
         let action = handle_key(&mut state, &key(KeyCode::Char('g')));
@@ -2738,7 +2774,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &key(KeyCode::Char('r')));
         assert_eq!(state.session().review_reviewed, vec!["a.txt".to_string()]);
         handle_key(&mut state, &key(KeyCode::Char('r')));
@@ -2750,7 +2786,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
@@ -2758,10 +2794,10 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert_eq!(state.code_review.comment_draft, "bad");
+        assert_eq!(review_state(&mut state).comment_draft, "bad");
         for _ in 0..3 {
             handle_key(&mut state, &key(KeyCode::Backspace));
         }
@@ -2769,9 +2805,9 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.code_review.comments.len(), 1);
-        assert_eq!(state.code_review.comments[0].text, "worse");
-        assert_eq!(state.code_review.comments[0].range, Some(2..3));
+        assert_eq!(review_state(&mut state).comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments[0].text, "worse");
+        assert_eq!(review_state(&mut state).comments[0].range, Some(2..3));
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('v')));
@@ -2780,7 +2816,7 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert_eq!(state.code_review.comment_draft, "worse");
+        assert_eq!(review_state(&mut state).comment_draft, "worse");
         for _ in 0..5 {
             handle_key(&mut state, &key(KeyCode::Backspace));
         }
@@ -2788,9 +2824,9 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.code_review.comments.len(), 1);
-        assert_eq!(state.code_review.comments[0].text, "range");
-        assert_eq!(state.code_review.comments[0].range, Some(1..4));
+        assert_eq!(review_state(&mut state).comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments[0].text, "range");
+        assert_eq!(review_state(&mut state).comments[0].range, Some(1..4));
     }
 
     fn review_comments() -> Vec<ReviewComment> {
@@ -2853,14 +2889,14 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
-        state.code_review.comments.push(ReviewComment {
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        review_state(&mut state).comments.push(ReviewComment {
             file: "a.txt".into(),
             range: Some(1..2),
             text: "wrong".into(),
         });
 
-        let (lines, _) = crate::components::code_review::review_file_view(&state);
+        let (lines, _) = crate::components::code_review::review_file_view(review_state(&mut state));
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -2876,14 +2912,14 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
-        state.code_review.comments.push(ReviewComment {
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).comments.push(ReviewComment {
             file: "a.txt".into(),
             range: Some(9..10),
             text: "stale".into(),
         });
 
-        let (lines, _) = crate::components::code_review::review_file_view(&state);
+        let (lines, _) = crate::components::code_review::review_file_view(review_state(&mut state));
         let last = lines.last().unwrap();
         assert!(last.spans.iter().any(|s| s.content.as_ref() == "💬 9: stale"));
     }
@@ -2893,23 +2929,23 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
         for c in "old".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert_eq!(state.code_review.comment_draft, "old");
+        assert_eq!(review_state(&mut state).comment_draft, "old");
         handle_key(&mut state, &key(KeyCode::Backspace));
         handle_key(&mut state, &key(KeyCode::Backspace));
-        assert_eq!(state.code_review.comment_draft, "o");
+        assert_eq!(review_state(&mut state).comment_draft, "o");
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.code_review.comments.len(), 1);
-        assert_eq!(state.code_review.comments[0].text, "o");
+        assert_eq!(review_state(&mut state).comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments[0].text, "o");
     }
 
     #[test]
@@ -2955,29 +2991,29 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
         for c in "hello world".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
-        assert_eq!(state.code_review.comment_cursor, 11);
+        assert_eq!(review_state(&mut state).comment_cursor, 11);
 
         handle_key(&mut state, &key(KeyCode::Left));
-        assert_eq!(state.code_review.comment_cursor, 10);
+        assert_eq!(review_state(&mut state).comment_cursor, 10);
         handle_key(&mut state, &key(KeyCode::Right));
-        assert_eq!(state.code_review.comment_cursor, 11);
+        assert_eq!(review_state(&mut state).comment_cursor, 11);
         handle_key(&mut state, &ctrl_key(KeyCode::Left));
-        assert_eq!(state.code_review.comment_cursor, 6);
+        assert_eq!(review_state(&mut state).comment_cursor, 6);
 
         handle_key(&mut state, &key(KeyCode::Char('X')));
-        assert_eq!(state.code_review.comment_draft, "hello Xworld");
-        assert_eq!(state.code_review.comment_cursor, 7);
+        assert_eq!(review_state(&mut state).comment_draft, "hello Xworld");
+        assert_eq!(review_state(&mut state).comment_cursor, 7);
         handle_key(&mut state, &key(KeyCode::Backspace));
-        assert_eq!(state.code_review.comment_draft, "hello world");
-        assert_eq!(state.code_review.comment_cursor, 6);
+        assert_eq!(review_state(&mut state).comment_draft, "hello world");
+        assert_eq!(review_state(&mut state).comment_cursor, 6);
         handle_key(&mut state, &ctrl_key(KeyCode::Right));
-        assert_eq!(state.code_review.comment_cursor, 11);
+        assert_eq!(review_state(&mut state).comment_cursor, 11);
     }
 
     #[test]
@@ -2985,15 +3021,15 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &shift('c'));
-        assert!(state.code_review.commenting);
-        assert!(state.code_review.comment_whole_file);
+        assert!(review_state(&mut state).commenting);
+        assert!(review_state(&mut state).comment_whole_file);
         for c in "flaky".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        let comment = &state.code_review.comments[0];
+        let comment = &review_state(&mut state).comments[0];
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.range, None);
         assert_eq!(comment.text, "flaky");
@@ -3004,13 +3040,13 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(
             &mut state,
             &TermEvent::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
         );
-        assert!(state.code_review.commenting);
-        assert!(state.code_review.comment_whole_file);
+        assert!(review_state(&mut state).commenting);
+        assert!(review_state(&mut state).comment_whole_file);
     }
 
     #[test]
@@ -3018,7 +3054,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &shift('c'));
         for c in "flaky".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
@@ -3026,7 +3062,7 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Enter));
 
         handle_key(&mut state, &shift('c'));
-        assert_eq!(state.code_review.comment_draft, "flaky");
+        assert_eq!(review_state(&mut state).comment_draft, "flaky");
         for _ in 0..5 {
             handle_key(&mut state, &key(KeyCode::Backspace));
         }
@@ -3034,9 +3070,9 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.code_review.comments.len(), 1);
-        assert_eq!(state.code_review.comments[0].range, None);
-        assert_eq!(state.code_review.comments[0].text, "stable");
+        assert_eq!(review_state(&mut state).comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments[0].range, None);
+        assert_eq!(review_state(&mut state).comments[0].text, "stable");
     }
 
     #[test]
@@ -3044,7 +3080,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &shift('c'));
         for c in "flaky".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
@@ -3053,11 +3089,11 @@ mod test {
 
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert!(state.code_review.comments.is_empty());
+        assert!(review_state(&mut state).comments.is_empty());
     }
 
     #[test]
@@ -3065,14 +3101,14 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
-        state.code_review.comments.push(ReviewComment {
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        review_state(&mut state).comments.push(ReviewComment {
             file: "a.txt".into(),
             range: None,
             text: "flaky".into(),
         });
 
-        let (lines, _) = crate::components::code_review::review_file_view(&state);
+        let (lines, _) = crate::components::code_review::review_file_view(review_state(&mut state));
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -3099,23 +3135,23 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
         for c in "bad".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(review_state(&mut state).comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert!(state.code_review.comments.is_empty());
+        assert!(review_state(&mut state).comments.is_empty());
     }
 
     #[tokio::test]
@@ -3138,7 +3174,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('q'));
-        state.task_list.cursor.set(
+        task_list_state(&mut state).cursor.set(
             crate::bg::REGISTRY
                 .list()
                 .iter()
@@ -3146,29 +3182,28 @@ mod test {
                 .unwrap(),
         );
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.task_detail.task_id.as_deref(), Some(id.as_str()));
+        assert_eq!(task_detail_state(&mut state).task_id, id);
 
         handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert_eq!(state.task_detail.scroll.offset(), 3);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 3);
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert_eq!(state.task_detail.scroll.offset(), 0);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 0);
         handle_key(&mut state, &key(KeyCode::PageUp));
-        assert_eq!(state.task_detail.scroll.offset(), 0);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 0);
         handle_key(&mut state, &key(KeyCode::PageDown));
-        assert_eq!(state.task_detail.scroll.offset(), 8);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 8);
         handle_key(&mut state, &key(KeyCode::Home));
-        assert_eq!(state.task_detail.scroll.offset(), 0);
-        assert!(!state.task_detail.scroll.following());
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 0);
+        assert!(!task_detail_state(&mut state).scroll.following());
         handle_key(&mut state, &key(KeyCode::End));
-        assert_eq!(state.task_detail.scroll.offset(), 18);
-        assert!(state.task_detail.scroll.following());
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 18);
+        assert!(task_detail_state(&mut state).scroll.following());
 
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(state.task_detail.task_id.is_none());
-        assert!(state.task_list.open);
+        assert!(matches!(state.screen, crate::screen::Screen::TaskList(_)));
 
         handle_key(&mut state, &ctrl('q'));
-        assert!(!state.task_list.open);
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[tokio::test]
@@ -3189,8 +3224,8 @@ mod test {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let mut state = TuiState::new("model".into());
-        state.task_list.open = true;
-        state.task_detail.task_id = Some(id);
+        state.screen = crate::screen::Screen::TaskList(crate::components::task_list::State::default());
+        state.screen = crate::screen::Screen::TaskDetail { detail: crate::components::task_detail::State { task_id: id.clone(), scroll: crate::session::Scroller::default() }, list: crate::components::task_list::State::default() };
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3225,9 +3260,9 @@ mod test {
         for i in 0..5 {
             state.session().renderer.push_user(&format!("CHATLINE-{i}"));
         }
-        state.task_list.open = true;
-        state.task_detail.task_id = Some(id);
-        state.task_detail.scroll.set_following(true);
+        state.screen = crate::screen::Screen::TaskList(crate::components::task_list::State::default());
+        state.screen = crate::screen::Screen::TaskDetail { detail: crate::components::task_detail::State { task_id: id.clone(), scroll: crate::session::Scroller::default() }, list: crate::components::task_list::State::default() };
+        task_detail_state(&mut state).scroll.set_following(true);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3259,13 +3294,13 @@ mod test {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let mut state = TuiState::new("model".into());
-        state.task_detail.task_id = Some(id);
-        state.task_detail.scroll.offset = 10;
+        state.screen = crate::screen::Screen::TaskDetail { detail: crate::components::task_detail::State { task_id: id.clone(), scroll: crate::session::Scroller::default() }, list: crate::components::task_list::State::default() };
+        task_detail_state(&mut state).scroll.offset = 10;
 
         handle_key(&mut state, &mouse(MouseEventKind::ScrollUp));
-        assert_eq!(state.task_detail.scroll.offset(), 7);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 7);
         handle_key(&mut state, &mouse(MouseEventKind::ScrollDown));
-        assert_eq!(state.task_detail.scroll.offset(), 10);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 10);
     }
 
     #[tokio::test]
@@ -3286,18 +3321,18 @@ mod test {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let mut state = TuiState::new("model".into());
-        state.task_detail.task_id = Some(id);
+        state.screen = crate::screen::Screen::TaskDetail { detail: crate::components::task_detail::State { task_id: id.clone(), scroll: crate::session::Scroller::default() }, list: crate::components::task_list::State::default() };
 
         for _ in 0..10 {
             handle_key(&mut state, &key(KeyCode::Char('j')));
         }
-        assert_eq!(state.task_detail.scroll.offset(), 18);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 18);
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert_eq!(state.task_detail.scroll.offset(), 15);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 15);
         handle_key(&mut state, &key(KeyCode::PageDown));
-        assert_eq!(state.task_detail.scroll.offset(), 18);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 18);
         handle_key(&mut state, &key(KeyCode::PageUp));
-        assert_eq!(state.task_detail.scroll.offset(), 10);
+        assert_eq!(task_detail_state(&mut state).scroll.offset(), 10);
     }
 
     #[tokio::test]
@@ -3326,9 +3361,9 @@ mod test {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
 
-        state.task_list.open = true;
-        state.task_detail.task_id = Some(id);
-        state.task_detail.scroll.set_following(true);
+        state.screen = crate::screen::Screen::TaskList(crate::components::task_list::State::default());
+        state.screen = crate::screen::Screen::TaskDetail { detail: crate::components::task_detail::State { task_id: id.clone(), scroll: crate::session::Scroller::default() }, list: crate::components::task_list::State::default() };
+        task_detail_state(&mut state).scroll.set_following(true);
         terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -3344,9 +3379,9 @@ mod test {
         let mut state = TuiState::new("llama".into());
         state.sessions.push(Session::new(1));
         state.sessions[1].label = "old name".into();
-        state.picker.open = true;
-        state.picker.cursor.set(1);
-        state.picker.rename = Some("new na".into());
+        state.screen = crate::screen::Screen::SessionPicker { picker: crate::components::session_picker::State::default(), list: crate::components::task_list::State::default() };
+        picker_state(&mut state).cursor.set(1);
+        picker_state(&mut state).rename = Some("new na".into());
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3384,7 +3419,7 @@ mod test {
         state.session().renderer.finish();
         state.sessions.push(Session::new(1));
         state.sessions[1].running = true;
-        state.picker.open = true;
+        state.screen = crate::screen::Screen::SessionPicker { picker: crate::components::session_picker::State::default(), list: crate::components::task_list::State::default() };
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
