@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 type EntryKind = gix::objs::tree::EntryKind;
@@ -179,22 +180,97 @@ pub fn head_tree(cwd: Option<&Path>) -> String {
     }
 }
 
-pub fn diff(from: &str, to: &str) -> String {
-    match std::process::Command::new("git")
-        .args(["diff", from, to])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).into_owned()
+pub fn diff(cwd: Option<&Path>, from: &str, to: &str) -> String {
+    let base = match cwd {
+        Some(p) => p.to_path_buf(),
+        None => match std::env::current_dir() {
+            Ok(c) => c,
+            Err(_) => return String::new(),
+        },
+    };
+    let repo = match gix::open(&base) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    let mut old_files: BTreeMap<String, String> = BTreeMap::new();
+    let mut new_files: BTreeMap<String, String> = BTreeMap::new();
+    read_tree_flat(&repo, from, "", &mut old_files);
+    read_tree_flat(&repo, to, "", &mut new_files);
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for p in old_files.keys().chain(new_files.keys()) {
+        paths.insert(p.clone());
+    }
+    let mut out = String::new();
+    for path in &paths {
+        let (old_oid, new_oid) = (old_files.get(path), new_files.get(path));
+        let changed = match (old_oid, new_oid) {
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(o), Some(n)) => o != n,
+            _ => false,
+        };
+        if !changed {
+            continue;
         }
-        Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
-        Err(source) => format!("git failed: {source}"),
+        let old_data = old_oid.map(|o| read_blob(&repo, o)).unwrap_or_default();
+        let new_data = new_oid.map(|o| read_blob(&repo, o)).unwrap_or_default();
+        let old_text = String::from_utf8_lossy(&old_data);
+        let new_text = String::from_utf8_lossy(&new_data);
+        let old_s: &str = &old_text;
+        let new_s: &str = &new_text;
+        let text_diff = similar::TextDiff::from_lines(old_s, new_s);
+        let mut udiff = similar::udiff::UnifiedDiff::from_text_diff(&text_diff);
+        udiff.context_radius(3);
+        udiff.header(&format!("a/{path}"), &format!("b/{path}"));
+        out.push_str(&format!("diff --git a/{path} b/{path}\n"));
+        out.push_str(&udiff.to_string());
+    }
+    out
+}
+
+fn read_tree_flat(
+    repo: &gix::Repository,
+    tree_id: &str,
+    prefix: &str,
+    out: &mut BTreeMap<String, String>,
+) {
+    let oid: gix::hash::ObjectId = match tree_id.parse() {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let tree = match repo.find_tree(oid) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for entry in tree.iter().flatten() {
+        let name = entry.inner.filename.to_string();
+        let full = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let oid = entry.inner.oid.to_string();
+        if entry.inner.mode.is_tree() {
+            read_tree_flat(repo, &oid, &full, out);
+        } else {
+            out.insert(full, oid);
+        }
+    }
+}
+
+fn read_blob(repo: &gix::Repository, oid: &str) -> Vec<u8> {
+    let oid: gix::hash::ObjectId = match oid.parse() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    match repo.find_blob(oid) {
+        Ok(blob) => blob.data.to_vec(),
+        Err(_) => Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::{head_tree, is_ignored, snapshot_tree};
+    use super::{diff, head_tree, is_ignored, snapshot_tree};
 
     fn temp_repo() -> test_files::TestFiles {
         let dir = test_files::TestFiles::new();
@@ -280,6 +356,78 @@ mod test {
         let source = gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped;
         let mut excludes = repo.excludes(&***index, None, source).unwrap();
         assert!(is_ignored(&mut excludes, "target", true));
+    }
+
+    #[test]
+    fn diff_produces_a_unified_diff() {
+        let dir = temp_repo();
+        dir.file("a.txt", "one\ntwo\nthree\n");
+        dir.file("b.txt", "keep\n");
+        let commit = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        commit(&["add", "-A"]);
+        commit(&["commit", "-q", "-m", "c1"]);
+        let tree1 = head_tree(Some(dir.path()));
+        dir.file("a.txt", "one\nTWO\nthree\nfour\n");
+        dir.file("c.txt", "new file\n");
+        std::fs::remove_file(dir.path().join("b.txt")).unwrap();
+        commit(&["add", "-A"]);
+        commit(&["commit", "-q", "-m", "c2"]);
+        let tree2 = head_tree(Some(dir.path()));
+        let diff = diff(Some(dir.path()), &tree1, &tree2);
+        assert!(diff.contains("diff --git a/a.txt b/a.txt"), "missing a.txt header: {diff}");
+        assert!(diff.contains("-two"), "missing removed line: {diff}");
+        assert!(diff.contains("+TWO"), "missing added line: {diff}");
+        assert!(diff.contains("+four"), "missing inserted line: {diff}");
+        assert!(diff.contains("diff --git a/c.txt b/c.txt"), "missing c.txt header: {diff}");
+        assert!(diff.contains("+new file"), "missing c.txt content: {diff}");
+        assert!(diff.contains("diff --git a/b.txt b/b.txt"), "missing b.txt header: {diff}");
+        assert!(diff.contains("-keep"), "missing b.txt removed line: {diff}");
+        assert!(!diff.contains("@@ -0,0 +1,0 @@"), "empty hunk: {diff}");
+    }
+
+    #[test]
+    fn diff_matches_git_diff() {
+        let dir = temp_repo();
+        dir.file("a.txt", "one\ntwo\nthree\n");
+        let commit = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        commit(&["add", "-A"]);
+        commit(&["commit", "-q", "-m", "c1"]);
+        let tree1 = head_tree(Some(dir.path()));
+        dir.file("a.txt", "one\nTWO\nthree\nfour\n");
+        commit(&["add", "-A"]);
+        commit(&["commit", "-q", "-m", "c2"]);
+        let tree2 = head_tree(Some(dir.path()));
+        let expected = git(dir.path(), &["diff", &tree1, &tree2]);
+        let got = diff(Some(dir.path()), &tree1, &tree2);
+        let norm = |s: &str| -> Vec<String> {
+            s.lines()
+                .filter(|l| !l.starts_with("index ") && !l.starts_with("diff --git"))
+                .map(|l| l.to_string())
+                .collect()
+        };
+        assert_eq!(norm(&got), norm(&expected), "\n--- got ---\n{got}\n--- expected ---\n{expected}");
     }
 
     #[test]

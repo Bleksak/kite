@@ -56,7 +56,7 @@ fn review_diff_text(cwd: Option<&std::path::Path>, baseline: Option<&str>) -> St
     if baseline.is_empty() {
         return "git has no baseline".to_string();
     }
-    crate::git::diff(&baseline, &current)
+    crate::git::diff(cwd, &baseline, &current)
 }
 
 fn diff_file_sections(text: &str) -> Vec<(String, String)> {
