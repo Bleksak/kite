@@ -81,7 +81,7 @@ use crate::context::Context;
 use crate::mode::Mode;
 use crate::paths::CONTEXT_DIR;
 use crate::plan_gate::spawn_agent;
-use crate::session::{Cursor, QuestionState, ReviewComment, Scroller, Session};
+use crate::session::{QuestionState, ReviewComment, Scroller, Session};
 use crate::session_store::{self, SessionFile};
 use crate::stream::AgentEvent;
 use crate::thinking::ThinkingLevel;
@@ -105,10 +105,7 @@ pub struct TuiState {
     pub model: String,
     pub thinking: Arc<Mutex<ThinkingLevel>>,
     pub mode: Arc<Mutex<Mode>>,
-    pub picker_open: bool,
-    pub picker_cursor: Cursor,
-    pub picker_query: String,
-    pub picker_rename: Option<String>,
+    pub picker: crate::components::session_picker::State,
     pub task_list: crate::components::task_list::State,
     pub task_detail: crate::components::task_detail::State,
     pub plan_detail: crate::components::plan_detail::State,
@@ -126,10 +123,7 @@ impl TuiState {
             model,
             thinking: Arc::new(std::sync::Mutex::new(ThinkingLevel::Off)),
             mode: Arc::new(std::sync::Mutex::new(Mode::Yolo)),
-            picker_open: false,
-            picker_cursor: Cursor::default(),
-            picker_query: String::new(),
-            picker_rename: None,
+            picker: crate::components::session_picker::State::default(),
             task_list: crate::components::task_list::State::default(),
             task_detail: crate::components::task_detail::State::default(),
             plan_detail: crate::components::plan_detail::State::default(),
@@ -173,10 +167,10 @@ impl TuiState {
     }
 
     pub fn filtered(&self) -> Vec<usize> {
-        if self.picker_query.is_empty() {
+        if self.picker.query.is_empty() {
             return (0..self.sessions.len()).collect();
         }
-        let query = self.picker_query.to_lowercase();
+        let query = self.picker.query.to_lowercase();
         (0..self.sessions.len())
             .filter(|i| {
                 self.sessions[*i].label.to_lowercase().contains(&query)
@@ -425,7 +419,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 state.plan_detail.scroll = Scroller::at_tail();
             }
             state.plan_detail.open = !state.plan_detail.open;
-            state.picker_open = false;
+            state.picker.open = false;
             state.task_list.open = false;
             return KeyAction::None;
         }
@@ -434,7 +428,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 crate::components::code_review::open(state);
             }
             state.code_review.open = !state.code_review.open;
-            state.picker_open = false;
+            state.picker.open = false;
             state.task_list.open = false;
             return KeyAction::None;
         }
@@ -446,14 +440,14 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         }
         return match key.code {
             KeyCode::Char('s') => {
-                state.picker_open = true;
+                state.picker.open = true;
                 state.task_list.open = false;
-                state.picker_cursor.set(state.active);
+                state.picker.cursor.set(state.active);
                 KeyAction::None
             }
             KeyCode::Char('q') => {
                 state.task_list.open = true;
-                state.picker_open = false;
+                state.picker.open = false;
                 state.task_list.cursor.set(0);
                 KeyAction::None
             }
@@ -1531,7 +1525,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let input_lines = active_box_lines(&state.sessions[state.active], state.pane_width);
     let session = &state.sessions[state.active];
-    let suggest = if state.picker_open
+    let suggest = if state.picker.open
         || state.task_list.open
         || state.plan_detail.open
         || state.code_review.open
@@ -1636,7 +1630,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         );
     }
 
-    if state.picker_open {
+    if state.picker.open {
         crate::components::session_picker::draw(frame, state, chunks[1]);
     }
 
@@ -2288,8 +2282,8 @@ mod test {
             state.sessions.push(Session::new(i));
         }
         state.active = 39;
-        state.picker_open = true;
-        state.picker_cursor.set(39);
+        state.picker.open = true;
+        state.picker.cursor.set(39);
 
         let backend = TestBackend::new(174, 43);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2304,11 +2298,11 @@ mod test {
 
         handle_key(&mut state, &ctrl('s'));
 
-        assert!(state.picker_open);
-        assert_eq!(state.picker_cursor.pos, 1);
+        assert!(state.picker.open);
+        assert_eq!(state.picker.cursor.pos, 1);
 
         handle_key(&mut state, &ctrl('s'));
-        assert!(!state.picker_open);
+        assert!(!state.picker.open);
 
         handle_key(&mut state, &ctrl('q'));
         assert!(state.task_list.open);
@@ -2326,18 +2320,18 @@ mod test {
 
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &ctrl('k'));
-        assert_eq!(state.picker_cursor.pos, 1);
+        assert_eq!(state.picker.cursor.pos, 1);
         handle_key(&mut state, &ctrl('k'));
-        assert_eq!(state.picker_cursor.pos, 0);
+        assert_eq!(state.picker.cursor.pos, 0);
         handle_key(&mut state, &ctrl('j'));
-        assert_eq!(state.picker_cursor.pos, 1);
+        assert_eq!(state.picker.cursor.pos, 1);
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.active, 1);
-        assert!(!state.picker_open);
+        assert!(!state.picker.open);
 
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.picker_open);
+        assert!(!state.picker.open);
         assert_eq!(state.active, 1);
     }
 
@@ -2350,7 +2344,7 @@ mod test {
 
         assert_eq!(state.sessions.len(), 2);
         assert_eq!(state.active, 1);
-        assert!(!state.picker_open);
+        assert!(!state.picker.open);
     }
 
     #[test]
@@ -2370,11 +2364,11 @@ mod test {
         assert_eq!(state.active, 0);
 
         handle_key(&mut state, &ctrl('s'));
-        assert!(!state.picker_open);
+        assert!(!state.picker.open);
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &ctrl('x'));
         assert_eq!(state.sessions.len(), 1);
-        assert!(state.picker_open);
+        assert!(state.picker.open);
     }
 
     #[test]
@@ -2386,33 +2380,33 @@ mod test {
         handle_key(&mut state, &ctrl('s'));
         handle_key(&mut state, &ctrl('j'));
         handle_key(&mut state, &ctrl('r'));
-        assert!(state.picker_rename.is_some());
+        assert!(state.picker.rename.is_some());
         handle_key(&mut state, &key(KeyCode::Char('n')));
         handle_key(&mut state, &key(KeyCode::Char('e')));
         handle_key(&mut state, &key(KeyCode::Char('w')));
         handle_key(&mut state, &key(KeyCode::Backspace));
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.sessions[1].label, "ne");
-        assert!(state.picker_rename.is_none());
+        assert!(state.picker.rename.is_none());
 
         handle_key(&mut state, &ctrl('r'));
         handle_key(&mut state, &key(KeyCode::Char('x')));
         handle_key(&mut state, &key(KeyCode::Esc));
         assert_eq!(state.sessions[1].label, "ne");
-        assert!(state.picker_rename.is_none());
+        assert!(state.picker.rename.is_none());
     }
 
     #[test]
     fn picker_typing_searches_and_backspace_clears() {
         let mut state = TuiState::new("model".into());
-        state.picker_open = true;
+        state.picker.open = true;
 
         handle_key(&mut state, &key(KeyCode::Char('f')));
-        assert_eq!(state.picker_query, "f");
+        assert_eq!(state.picker.query, "f");
         assert_eq!(state.session().input, "");
         handle_key(&mut state, &key(KeyCode::Backspace));
-        assert_eq!(state.picker_query, "");
-        assert!(state.picker_open);
+        assert_eq!(state.picker.query, "");
+        assert!(state.picker.open);
     }
 
     #[test]
@@ -2422,11 +2416,11 @@ mod test {
         state.sessions.push(Session::new(2));
         state.sessions[0].label = "fix login".into();
         state.sessions[1].label = "refactor parser".into();
-        state.picker_open = true;
+        state.picker.open = true;
 
         handle_key(&mut state, &key(KeyCode::Char('l')));
         assert_eq!(state.filtered(), vec![0]);
-        assert_eq!(state.picker_cursor.pos, 0);
+        assert_eq!(state.picker.cursor.pos, 0);
 
         handle_key(&mut state, &key(KeyCode::Char('2')));
         assert!(state.filtered().is_empty());
@@ -2449,15 +2443,15 @@ mod test {
                 .unwrap(),
         );
         assert!(state.task_list.open);
-        assert!(!state.picker_open);
+        assert!(!state.picker.open);
 
         handle_key(&mut state, &ctrl('s'));
-        assert!(state.picker_open);
+        assert!(state.picker.open);
         assert!(!state.task_list.open);
 
         handle_key(&mut state, &ctrl('q'));
         assert!(state.task_list.open);
-        assert!(!state.picker_open);
+        assert!(!state.picker.open);
 
         handle_key(&mut state, &key(KeyCode::Char('x')));
         for _ in 0..200 {
@@ -3310,9 +3304,9 @@ mod test {
         let mut state = TuiState::new("llama".into());
         state.sessions.push(Session::new(1));
         state.sessions[1].label = "old name".into();
-        state.picker_open = true;
-        state.picker_cursor.set(1);
-        state.picker_rename = Some("new na".into());
+        state.picker.open = true;
+        state.picker.cursor.set(1);
+        state.picker.rename = Some("new na".into());
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -3350,7 +3344,7 @@ mod test {
         state.session().renderer.finish();
         state.sessions.push(Session::new(1));
         state.sessions[1].running = true;
-        state.picker_open = true;
+        state.picker.open = true;
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();

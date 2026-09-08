@@ -3,34 +3,52 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-use crate::session::Session;
+use crate::session::{Cursor, Session};
 use crate::tui::{KeyAction, KeyCode, KeyEvent, KeyModifiers, TuiState};
 
+pub struct State {
+    pub open: bool,
+    pub cursor: Cursor,
+    pub query: String,
+    pub rename: Option<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            open: false,
+            cursor: Cursor::default(),
+            query: String::new(),
+            rename: None,
+        }
+    }
+}
+
 pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
-    if !state.picker_open {
+    if !state.picker.open {
         return None;
     }
-    if state.picker_rename.is_some() {
+    if state.picker.rename.is_some() {
         return Some(match key.code {
             KeyCode::Enter => {
-                let buf = state.picker_rename.take().unwrap();
-                if let Some(i) = state.filtered().get(state.picker_cursor.pos).copied() {
+                let buf = state.picker.rename.take().unwrap();
+                if let Some(i) = state.filtered().get(state.picker.cursor.pos).copied() {
                     state.sessions[i].label = buf;
                 }
                 KeyAction::None
             }
             KeyCode::Esc => {
-                state.picker_rename = None;
+                state.picker.rename = None;
                 KeyAction::None
             }
             KeyCode::Backspace => {
-                if let Some(buf) = &mut state.picker_rename {
+                if let Some(buf) = &mut state.picker.rename {
                     buf.pop();
                 }
                 KeyAction::None
             }
             KeyCode::Char(c) => {
-                if let Some(buf) = &mut state.picker_rename {
+                if let Some(buf) = &mut state.picker.rename {
                     buf.push(c);
                 }
                 KeyAction::None
@@ -41,23 +59,23 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(match key.code {
             KeyCode::Char('j') => {
-                state.picker_cursor.down(state.filtered().len());
+                state.picker.cursor.down(state.filtered().len());
                 KeyAction::None
             }
             KeyCode::Char('k') => {
-                state.picker_cursor.up(state.filtered().len());
+                state.picker.cursor.up(state.filtered().len());
                 KeyAction::None
             }
             KeyCode::Char('n') => {
                 state.sessions.push(Session::new(state.next_id));
                 state.active = state.sessions.len() - 1;
                 state.next_id += 1;
-                state.picker_open = false;
+                state.picker.open = false;
                 KeyAction::NewSession
             }
             KeyCode::Char('x') => {
                 let filtered = state.filtered();
-                if let Some(i) = filtered.get(state.picker_cursor.pos).copied()
+                if let Some(i) = filtered.get(state.picker.cursor.pos).copied()
                     && state.sessions.len() > 1
                     && !state.sessions[i].running
                 {
@@ -66,20 +84,20 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
                         state.active = state.sessions.len() - 1;
                     }
                 }
-                state.picker_cursor.clamp(state.filtered().len());
+                state.picker.cursor.clamp(state.filtered().len());
                 KeyAction::CloseSession
             }
             KeyCode::Char('r') => {
-                state.picker_rename = Some(String::new());
+                state.picker.rename = Some(String::new());
                 KeyAction::None
             }
             KeyCode::Char('q') => {
                 state.task_list.open = true;
-                state.picker_open = false;
+                state.picker.open = false;
                 KeyAction::None
             }
             KeyCode::Char('s') => {
-                state.picker_open = false;
+                state.picker.open = false;
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -87,33 +105,33 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     }
     Some(match key.code {
         KeyCode::Up => {
-            state.picker_cursor.up(state.filtered().len());
+            state.picker.cursor.up(state.filtered().len());
             KeyAction::None
         }
         KeyCode::Down => {
-            state.picker_cursor.down(state.filtered().len());
+            state.picker.cursor.down(state.filtered().len());
             KeyAction::None
         }
         KeyCode::Enter => {
             let filtered = state.filtered();
-            if let Some(i) = filtered.get(state.picker_cursor.pos).copied() {
+            if let Some(i) = filtered.get(state.picker.cursor.pos).copied() {
                 state.active = i;
             }
-            state.picker_open = false;
+            state.picker.open = false;
             KeyAction::None
         }
         KeyCode::Esc => {
-            state.picker_open = false;
+            state.picker.open = false;
             KeyAction::None
         }
         KeyCode::Backspace => {
-            state.picker_query.pop();
-            state.picker_cursor.clamp(state.filtered().len());
+            state.picker.query.pop();
+            state.picker.cursor.clamp(state.filtered().len());
             KeyAction::None
         }
         KeyCode::Char(c) => {
-            state.picker_query.push(c);
-            state.picker_cursor.clamp(state.filtered().len());
+            state.picker.query.push(c);
+            state.picker.cursor.clamp(state.filtered().len());
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -122,13 +140,13 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
 
 pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
     let filtered = state.filtered();
-    let renaming = state.picker_rename.clone();
+    let renaming = state.picker.rename.clone();
     let height = area.height;
     let visible = height.saturating_sub(3) as usize;
     let start = if filtered.len() <= visible {
         0
     } else {
-        let mut s = state.picker_cursor.pos.saturating_sub(visible / 2);
+        let mut s = state.picker.cursor.pos.saturating_sub(visible / 2);
         if s + visible > filtered.len() {
             s = filtered.len() - visible;
         }
@@ -146,7 +164,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
             .skip(start)
             .take(visible)
             .map(|(i, session_idx)| {
-                let selected = i + start == state.picker_cursor.pos;
+                let selected = i + start == state.picker.cursor.pos;
                 let session = &state.sessions[*session_idx];
                 let marker = if selected { "›" } else { " " };
                 let status = if session.running {
@@ -195,10 +213,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
     ));
     let title = if renaming.is_some() {
         " rename".to_string()
-    } else if state.picker_query.is_empty() {
+    } else if state.picker.query.is_empty() {
         " sessions".to_string()
     } else {
-        format!(" sessions · {}", state.picker_query)
+        format!(" sessions · {}", state.picker.query)
     };
     crate::tui::render_panel(
         frame,

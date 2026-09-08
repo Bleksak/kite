@@ -37,7 +37,7 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
                 KeyAction::None
             }
             KeyCode::Char('s') => {
-                state.picker_open = true;
+                state.picker.open = true;
                 state.task_list.open = false;
                 KeyAction::None
             }
