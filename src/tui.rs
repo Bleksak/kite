@@ -126,7 +126,7 @@ pub struct TuiState {
     pub diff_comment_draft: String,
     pub diff_comment_cursor: usize,
     pub diff_comment_whole_file: bool,
-    next_id: u64,
+    pub next_id: u64,
 }
 
 impl TuiState {
@@ -240,7 +240,7 @@ fn task_output_scroll_max(state: &TuiState) -> usize {
 
 const PANEL_BASE: Color = Color::Rgb(0xc0, 0xc0, 0xd0);
 
-fn render_panel<'a>(
+pub(crate) fn render_panel<'a>(
     frame: &mut Frame,
     rect: Rect,
     title: String,
@@ -749,115 +749,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             _ => KeyAction::None,
         };
     }
-    if state.picker_open {
-        if state.picker_rename.is_some() {
-            return match key.code {
-                KeyCode::Enter => {
-                    let buf = state.picker_rename.take().unwrap();
-                    if let Some(i) = state.filtered().get(state.picker_cursor.pos).copied() {
-                        state.sessions[i].label = buf;
-                    }
-                    KeyAction::None
-                }
-                KeyCode::Esc => {
-                    state.picker_rename = None;
-                    KeyAction::None
-                }
-                KeyCode::Backspace => {
-                    if let Some(buf) = &mut state.picker_rename {
-                        buf.pop();
-                    }
-                    KeyAction::None
-                }
-                KeyCode::Char(c) => {
-                    if let Some(buf) = &mut state.picker_rename {
-                        buf.push(c);
-                    }
-                    KeyAction::None
-                }
-                _ => KeyAction::None,
-            };
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('j') => {
-                    state.picker_cursor.down(state.filtered().len());
-                    KeyAction::None
-                }
-                KeyCode::Char('k') => {
-                    state.picker_cursor.up(state.filtered().len());
-                    KeyAction::None
-                }
-                KeyCode::Char('n') => {
-                    state.sessions.push(Session::new(state.next_id));
-                    state.active = state.sessions.len() - 1;
-                    state.next_id += 1;
-                    state.picker_open = false;
-                    KeyAction::NewSession
-                }
-                KeyCode::Char('x') => {
-                    let filtered = state.filtered();
-                    if let Some(i) = filtered.get(state.picker_cursor.pos).copied()
-                        && state.sessions.len() > 1
-                        && !state.sessions[i].running
-                    {
-                        state.sessions.remove(i);
-                        if state.active >= state.sessions.len() {
-                            state.active = state.sessions.len() - 1;
-                        }
-                    }
-                    state.picker_cursor.clamp(state.filtered().len());
-                    KeyAction::CloseSession
-                }
-                KeyCode::Char('r') => {
-                    state.picker_rename = Some(String::new());
-                    KeyAction::None
-                }
-                KeyCode::Char('q') => {
-                    state.tasks_open = true;
-                    state.picker_open = false;
-                    KeyAction::None
-                }
-                KeyCode::Char('s') => {
-                    state.picker_open = false;
-                    KeyAction::None
-                }
-                _ => KeyAction::None,
-            };
-        }
-        return match key.code {
-            KeyCode::Up => {
-                state.picker_cursor.up(state.filtered().len());
-                KeyAction::None
-            }
-            KeyCode::Down => {
-                state.picker_cursor.down(state.filtered().len());
-                KeyAction::None
-            }
-            KeyCode::Enter => {
-                let filtered = state.filtered();
-                if let Some(i) = filtered.get(state.picker_cursor.pos).copied() {
-                    state.active = i;
-                }
-                state.picker_open = false;
-                KeyAction::None
-            }
-            KeyCode::Esc => {
-                state.picker_open = false;
-                KeyAction::None
-            }
-            KeyCode::Backspace => {
-                state.picker_query.pop();
-                state.picker_cursor.clamp(state.filtered().len());
-                KeyAction::None
-            }
-            KeyCode::Char(c) => {
-                state.picker_query.push(c);
-                state.picker_cursor.clamp(state.filtered().len());
-                KeyAction::None
-            }
-            _ => KeyAction::None,
-        };
+    if let Some(action) = crate::components::session_picker::handle_key(state, key) {
+        return action;
     }
     if state.plan_open {
         let len = state
@@ -2408,98 +2301,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     }
 
     if state.picker_open {
-        let filtered = state.filtered();
-        let renaming = state.picker_rename.clone();
-        let height = chunks[1].height;
-        let visible = height.saturating_sub(3) as usize;
-        let start = if filtered.len() <= visible {
-            0
-        } else {
-            let mut s = state.picker_cursor.pos.saturating_sub(visible / 2);
-            if s + visible > filtered.len() {
-                s = filtered.len() - visible;
-            }
-            s
-        };
-        let width = chunks[1].width;
-        let x = chunks[1].x;
-        let y = chunks[1].y;
-        let lines: Vec<Line> = if filtered.is_empty() {
-            vec![Line::from(Span::styled(
-                " no matches",
-                Style::default().fg(Color::Rgb(102, 102, 102)),
-            ))]
-        } else {
-            filtered
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(visible)
-                .map(|(i, session_idx)| {
-                    let selected = i + start == state.picker_cursor.pos;
-                    let session = &state.sessions[*session_idx];
-                    let marker = if selected { "›" } else { " " };
-                    let status = if session.running {
-                        "working…"
-                    } else {
-                        "idle"
-                    };
-                    let style = if selected {
-                        Style::default().bold().fg(Color::Rgb(95, 135, 255))
-                    } else {
-                        Style::default()
-                    };
-                    let label = match &renaming {
-                        Some(buf) if selected => {
-                            if buf.is_empty() {
-                                "rename…".to_string()
-                            } else {
-                                buf.chars().take(60).collect()
-                            }
-                        }
-                        _ => {
-                            if session.label.is_empty() {
-                                "—".to_string()
-                            } else {
-                                session.label.chars().take(60).collect()
-                            }
-                        }
-                    };
-                    Line::from(vec![
-                        Span::styled(format!(" {marker} {}  ", session_idx + 1), style),
-                        Span::styled(label, style),
-                        Span::styled(
-                            format!(
-                                "  {} · {} / {}",
-                                status, session.prompt_tokens, session.completion_tokens
-                            ),
-                            style,
-                        ),
-                    ])
-                })
-                .collect()
-        };
-        let hint = Line::from(Span::styled(
-            " C-jk · enter · C-n · C-x · C-r · search",
-            Style::default().fg(Color::Rgb(102, 102, 102)),
-        ));
-        let title = if renaming.is_some() {
-            " rename".to_string()
-        } else if state.picker_query.is_empty() {
-            " sessions".to_string()
-        } else {
-            format!(" sessions · {}", state.picker_query)
-        };
-        render_panel(
-            frame,
-            Rect::new(x, y, width, height),
-            format!(" {} ", title),
-            lines
-                .into_iter()
-                .chain(std::iter::once(hint))
-                .collect::<Vec<Line>>(),
-            false,
-        );
+        crate::components::session_picker::draw(frame, state, chunks[1]);
     }
 
     if state.tasks_open && state.task_output_id.is_none() {

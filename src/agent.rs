@@ -1606,7 +1606,7 @@ mod test {
             content: "read @a.rs\n<file path=\"a.rs\">\nfn main() {}\n</file>".into(),
         });
 
-        let outcome = agent.chat("go", &mut |event| {}).await.unwrap();
+        let outcome = agent.chat("go", &mut |_| {}).await.unwrap();
         assert!(matches!(outcome, ChatOutcome::Answer(_)));
         let user = agent
             .context

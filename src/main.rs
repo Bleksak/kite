@@ -1,6 +1,7 @@
 mod agent;
 mod bg;
 mod commands;
+mod components;
 mod auto_complete;
 mod context;
 mod message;
