@@ -189,6 +189,8 @@ pub enum KeyAction {
     NewSession,
     CloseSession,
     Cancel,
+    ReviewClosed(Vec<ReviewComment>),
+    PickerSelected(usize),
 }
 
 const PAGE: usize = 10;
@@ -2004,6 +2006,12 @@ pub async fn run(
                             session_store::remove_session_file(Path::new(CONTEXT_DIR), id);
                         }
                     }
+                    KeyAction::ReviewClosed(comments) => {
+                        state.session().review_comments = comments;
+                    }
+                    KeyAction::PickerSelected(i) => {
+                        state.active = i;
+                    }
                     KeyAction::Cancel => {
                         let session = state.session();
                         session.question = None;
@@ -2325,7 +2333,9 @@ mod test {
         assert_eq!(state.picker.cursor.pos, 0);
         handle_key(&mut state, &ctrl('j'));
         assert_eq!(state.picker.cursor.pos, 1);
-        handle_key(&mut state, &key(KeyCode::Enter));
+        if let KeyAction::PickerSelected(i) = handle_key(&mut state, &key(KeyCode::Enter)) {
+            state.active = i;
+        }
         assert_eq!(state.active, 1);
         assert!(!state.picker.open);
 
@@ -2666,7 +2676,7 @@ mod test {
         assert!(!state.code_review.commenting);
         assert!(state.code_review.anchor.is_none());
 
-        let comment = &state.session().review_comments[0];
+        let comment = &state.code_review.comments[0];
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.text, "wrong");
         assert_eq!(comment.range, Some(1..2));
@@ -2687,10 +2697,40 @@ mod test {
         }
         handle_key(&mut state, &key(KeyCode::Enter));
 
-        let comment = &state.session().review_comments[0];
+        let comment = &state.code_review.comments[0];
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.text, "bad");
         assert_eq!(comment.range, Some(1..2));
+    }
+
+    #[test]
+    fn review_close_returns_the_comments_to_the_session() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('g'));
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        handle_key(&mut state, &key(KeyCode::Char('c')));
+        for c in "note".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+        handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(state.code_review.comments.len(), 1);
+        assert!(state.session().review_comments.is_empty());
+
+        let action = handle_key(&mut state, &key(KeyCode::Char('g')));
+        assert_eq!(
+            action,
+            KeyAction::ReviewClosed(vec![ReviewComment {
+                file: "a.txt".into(),
+                range: Some(1..2),
+                text: "note".into(),
+            }])
+        );
+        if let KeyAction::ReviewClosed(comments) = action {
+            state.session().review_comments = comments;
+        }
+        assert_eq!(state.session().review_comments.len(), 1);
     }
 
     #[test]
@@ -2718,7 +2758,7 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.session().review_comments.len(), 1);
+        assert_eq!(state.code_review.comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
         assert_eq!(state.code_review.comment_draft, "bad");
@@ -2729,9 +2769,9 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.session().review_comments.len(), 1);
-        assert_eq!(state.session().review_comments[0].text, "worse");
-        assert_eq!(state.session().review_comments[0].range, Some(2..3));
+        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(state.code_review.comments[0].text, "worse");
+        assert_eq!(state.code_review.comments[0].range, Some(2..3));
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('v')));
@@ -2748,9 +2788,9 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.session().review_comments.len(), 1);
-        assert_eq!(state.session().review_comments[0].text, "range");
-        assert_eq!(state.session().review_comments[0].range, Some(1..4));
+        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(state.code_review.comments[0].text, "range");
+        assert_eq!(state.code_review.comments[0].range, Some(1..4));
     }
 
     fn review_comments() -> Vec<ReviewComment> {
@@ -2814,7 +2854,7 @@ mod test {
 
         handle_key(&mut state, &ctrl('g'));
         state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
-        state.session().review_comments.push(ReviewComment {
+        state.code_review.comments.push(ReviewComment {
             file: "a.txt".into(),
             range: Some(1..2),
             text: "wrong".into(),
@@ -2837,7 +2877,7 @@ mod test {
 
         handle_key(&mut state, &ctrl('g'));
         state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
-        state.session().review_comments.push(ReviewComment {
+        state.code_review.comments.push(ReviewComment {
             file: "a.txt".into(),
             range: Some(9..10),
             text: "stale".into(),
@@ -2860,7 +2900,7 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.session().review_comments.len(), 1);
+        assert_eq!(state.code_review.comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
         assert_eq!(state.code_review.comment_draft, "old");
@@ -2868,8 +2908,8 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Backspace));
         assert_eq!(state.code_review.comment_draft, "o");
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.session().review_comments.len(), 1);
-        assert_eq!(state.session().review_comments[0].text, "o");
+        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(state.code_review.comments[0].text, "o");
     }
 
     #[test]
@@ -2953,7 +2993,7 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        let comment = &state.session().review_comments[0];
+        let comment = &state.code_review.comments[0];
         assert_eq!(comment.file, "a.txt");
         assert_eq!(comment.range, None);
         assert_eq!(comment.text, "flaky");
@@ -2994,9 +3034,9 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.session().review_comments.len(), 1);
-        assert_eq!(state.session().review_comments[0].range, None);
-        assert_eq!(state.session().review_comments[0].text, "stable");
+        assert_eq!(state.code_review.comments.len(), 1);
+        assert_eq!(state.code_review.comments[0].range, None);
+        assert_eq!(state.code_review.comments[0].text, "stable");
     }
 
     #[test]
@@ -3013,11 +3053,11 @@ mod test {
 
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert_eq!(state.session().review_comments.len(), 1);
+        assert_eq!(state.code_review.comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert!(state.session().review_comments.is_empty());
+        assert!(state.code_review.comments.is_empty());
     }
 
     #[test]
@@ -3026,7 +3066,7 @@ mod test {
 
         handle_key(&mut state, &ctrl('g'));
         state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
-        state.session().review_comments.push(ReviewComment {
+        state.code_review.comments.push(ReviewComment {
             file: "a.txt".into(),
             range: None,
             text: "flaky".into(),
@@ -3066,16 +3106,16 @@ mod test {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert_eq!(state.session().review_comments.len(), 1);
+        assert_eq!(state.code_review.comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert_eq!(state.session().review_comments.len(), 1);
+        assert_eq!(state.code_review.comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert!(state.session().review_comments.is_empty());
+        assert!(state.code_review.comments.is_empty());
     }
 
     #[tokio::test]

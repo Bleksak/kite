@@ -13,6 +13,7 @@ pub struct State {
     pub file_index: usize,
     pub cursor: usize,
     pub anchor: Option<usize>,
+    pub comments: Vec<ReviewComment>,
     pub commenting: bool,
     pub comment_draft: String,
     pub comment_cursor: usize,
@@ -28,6 +29,7 @@ impl Default for State {
             file_index: 0,
             cursor: 0,
             anchor: None,
+            comments: Vec::new(),
             commenting: false,
             comment_draft: String::new(),
             comment_cursor: 0,
@@ -80,6 +82,7 @@ fn review_diff_text(baseline: Option<&str>) -> String {
 }
 
 pub fn open(state: &mut TuiState) {
+    state.code_review.comments = std::mem::take(&mut state.session().review_comments);
     state.code_review.text = review_diff_text(
         state.session().review_baseline.as_deref(),
     );
@@ -147,10 +150,11 @@ pub(crate) fn review_file_view(state: &TuiState) -> (Vec<Line<'static>>, usize) 
         (anchor.min(state.code_review.cursor), anchor.max(state.code_review.cursor))
     });
     let comments: Vec<&ReviewComment> = state
-        .sessions
-        .get(state.active)
-        .map(|s| s.review_comments.iter().filter(|c| &c.file == path).collect())
-        .unwrap_or_default();
+        .code_review
+        .comments
+        .iter()
+        .filter(|c| &c.file == path)
+        .collect();
     let mut placed = vec![false; comments.len()];
     let mut lines = Vec::new();
     for (index, d) in numbered.iter().enumerate() {
@@ -222,15 +226,15 @@ fn commit_review_comment(state: &mut TuiState) {
         return;
     }
     if whole_file {
-        let session = state.session();
-        if let Some(existing) = session
-            .review_comments
+        if let Some(existing) = state
+            .code_review
+            .comments
             .iter_mut()
             .find(|c| c.file == *path && c.range.is_none())
         {
             existing.text = text.to_string();
         } else {
-            session.review_comments.push(ReviewComment {
+            state.code_review.comments.push(ReviewComment {
                 file: path.clone(),
                 range: None,
                 text: text.to_string(),
@@ -249,9 +253,9 @@ fn commit_review_comment(state: &mut TuiState) {
     }
     let start = numbers.first().copied().unwrap();
     let end = numbers.last().copied().unwrap();
-    let session = state.session();
-    if let Some(existing) = session
-        .review_comments
+    if let Some(existing) = state
+        .code_review
+        .comments
         .iter_mut()
         .find(|c| {
             c.file == *path
@@ -263,7 +267,7 @@ fn commit_review_comment(state: &mut TuiState) {
         existing.text = text.to_string();
         existing.range = Some(start..end + 1);
     } else {
-        session.review_comments.push(ReviewComment {
+        state.code_review.comments.push(ReviewComment {
             file: path.clone(),
             range: Some(start..end + 1),
             text: text.to_string(),
@@ -362,7 +366,7 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     Some(match key.code {
         KeyCode::Char('g') | KeyCode::Char('q') | KeyCode::Esc => {
             state.code_review.open = false;
-            KeyAction::None
+            KeyAction::ReviewClosed(std::mem::take(&mut state.code_review.comments))
         }
         KeyCode::Left | KeyCode::Char('h') => {
             state.code_review.file_index = state.code_review.file_index.saturating_sub(1);
@@ -429,14 +433,13 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
             let sections = diff_file_sections(&state.code_review.text);
             let mut draft = String::new();
             if let Some((path, _)) = sections.get(state.code_review.file_index) {
-                let session = state.session();
                 let existing = if whole_file {
-                    session
-                        .review_comments
+                    state.code_review
+                        .comments
                         .iter()
                         .find(|c| c.file == *path && c.range.is_none())
                 } else {
-                    session.review_comments.iter().find(|c| {
+                    state.code_review.comments.iter().find(|c| {
                         c.file == *path
                             && c.range
                                 .as_ref()
@@ -473,22 +476,20 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
                     .get(state.code_review.cursor)
                     .and_then(|d| d.new.or(d.old));
                 let on_title = state.code_review.cursor == 0;
-                let session = state.session();
                 let pos = match cursor_number {
-                    Some(number) => session.review_comments.iter().position(|c| {
+                    Some(number) => state.code_review.comments.iter().position(|c| {
                         c.file == *path
                             && c.range
                                 .as_ref()
                                 .is_some_and(|r| r.contains(&number))
                     }),
-                    None if on_title => session
-                        .review_comments
-                        .iter()
-                        .position(|c| c.file == *path && c.range.is_none()),
+                    None if on_title => state.code_review.comments.iter().position(
+                        |c| c.file == *path && c.range.is_none(),
+                    ),
                     None => None,
                 };
                 if let Some(pos) = pos {
-                    session.review_comments.remove(pos);
+                    state.code_review.comments.remove(pos);
                 }
             }
             KeyAction::None

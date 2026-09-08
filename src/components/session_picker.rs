@@ -114,11 +114,11 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
         }
         KeyCode::Enter => {
             let filtered = state.filtered();
-            if let Some(i) = filtered.get(state.picker.cursor.pos).copied() {
-                state.active = i;
-            }
             state.picker.open = false;
-            KeyAction::None
+            match filtered.get(state.picker.cursor.pos).copied() {
+                Some(i) => KeyAction::PickerSelected(i),
+                None => KeyAction::None,
+            }
         }
         KeyCode::Esc => {
             state.picker.open = false;

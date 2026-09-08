@@ -45,6 +45,7 @@ impl QuestionState {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
 pub struct ReviewComment {
     pub file: String,
     pub range: Option<std::ops::Range<usize>>,
