@@ -301,6 +301,7 @@ pub fn spawn_agent(
     new_agent: std::sync::Arc<dyn Fn() -> Agent + Send + Sync>,
     restored: Option<Context>,
     event_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
+    cwd: Option<std::path::PathBuf>,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<String>,
     tokio::task::AbortHandle,
@@ -372,7 +373,7 @@ pub fn spawn_agent(
                                 input = stage_replan_message(&stages, &input);
                             }
                             (GatePhase::ReviewStep, true) => {
-                                let baseline = crate::git::snapshot_tree(None);
+                                let baseline = crate::git::snapshot_tree(cwd.as_deref());
                                 let _ = event_tx.send(TuiEvent::ReviewBaseline {
                                     session: id,
                                     baseline,
@@ -488,6 +489,18 @@ mod test {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
+    fn git_repo() -> test_files::TestFiles {
+        let dir = test_files::TestFiles::new();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        dir.file("a.txt", "one\n");
+        dir
+    }
+
+
     fn complete_request(data: &[u8]) -> Option<String> {
         let header_end = data.windows(4).position(|w| w == b"\r\n\r\n")?;
         let headers = std::str::from_utf8(&data[..header_end]).unwrap();
@@ -528,6 +541,7 @@ mod test {
 
     #[tokio::test]
     async fn plan_gate_approval_runs_the_implement_stage_then_resets() {
+        let repo = git_repo();
         let (tx_req, mut rx_req) = tokio::sync::mpsc::unbounded_channel::<String>();
         let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"tasks\\\":[\\\"do it\\\"]}]}\"}}]}}]}\n\ndata: [DONE]\n\n".to_string(),
@@ -583,7 +597,7 @@ mod test {
             .with_pinned_mode(Mode::Plan)
         });
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx);
+        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx, Some(repo.path().to_path_buf()));
 
         input_tx.send("plan me a feature".to_string()).unwrap();
         let mut events = vec![];
@@ -683,6 +697,7 @@ mod test {
 
     #[tokio::test]
     async fn staged_plan_walks_through_every_stage_with_a_review_gate() {
+        let repo = git_repo();
         let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
         let (base_url, mut rx_req) = staged_mock_server(vec![
             plan_sse("c1", stages),
@@ -704,7 +719,7 @@ mod test {
             .with_pinned_mode(Mode::Plan)
         });
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx);
+        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx, Some(repo.path().to_path_buf()));
         let mut events = vec![];
 
         input_tx.send("plan me".to_string()).unwrap();
@@ -774,6 +789,7 @@ mod test {
 
     #[tokio::test]
     async fn review_gate_feedback_replans_only_the_rejected_step() {
+        let repo = git_repo();
         let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
         let (base_url, mut rx_req) = staged_mock_server(vec![
             plan_sse("c1", stages),
@@ -794,7 +810,7 @@ mod test {
             .with_pinned_mode(Mode::Plan)
         });
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx);
+        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx, Some(repo.path().to_path_buf()));
         let mut events = vec![];
 
         input_tx.send("plan me".to_string()).unwrap();
@@ -848,6 +864,7 @@ mod test {
 
     #[tokio::test]
     async fn implementation_gate_feedback_reimplements_the_current_stage() {
+        let repo = git_repo();
         let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
         let (base_url, mut rx_req) = staged_mock_server(vec![
             plan_sse("c1", stages),
@@ -869,7 +886,7 @@ mod test {
             .with_pinned_mode(Mode::Plan)
         });
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx);
+        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx, Some(repo.path().to_path_buf()));
         let mut events = vec![];
 
         input_tx.send("plan me".to_string()).unwrap();

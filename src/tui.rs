@@ -48,6 +48,7 @@ pub struct TuiState {
     pub mode: Arc<Mutex<Mode>>,
     pub screen: crate::screen::Screen,
     pub next_id: u64,
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl TuiState {
@@ -62,6 +63,7 @@ impl TuiState {
             mode: Arc::new(std::sync::Mutex::new(Mode::Yolo)),
             screen: crate::screen::Screen::Chat,
             next_id: 1,
+            cwd: None,
         }
     }
 
@@ -1383,7 +1385,7 @@ pub async fn run(
     for session in &state.sessions {
         let restored = session.context.clone();
         let (input_tx, input_handle, cancel_tx, steer_tx) =
-            spawn_agent(session.id, new_agent.clone(), restored, agent_tx.clone());
+            spawn_agent(session.id, new_agent.clone(), restored, agent_tx.clone(), state.cwd.clone());
         inputs.insert(session.id, input_tx);
         handles.insert(session.id, input_handle);
         cancels.insert(session.id, (cancel_tx, 0));
@@ -1571,7 +1573,7 @@ pub async fn run(
                     KeyAction::NewSession => {
                         let id = state.sessions[state.active].id;
                         let (input_tx, input_handle, cancel_tx, steer_tx) =
-                            spawn_agent(id, new_agent.clone(), None, agent_tx.clone());
+                            spawn_agent(id, new_agent.clone(), None, agent_tx.clone(), state.cwd.clone());
                         inputs.insert(id, input_tx);
                         handles.insert(id, input_handle);
                         cancels.insert(id, (cancel_tx, 0));
@@ -1674,6 +1676,16 @@ mod test {
 
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
+
+    fn git_repo() -> test_files::TestFiles {
+        let dir = test_files::TestFiles::new();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        dir
+    }
 
 struct InputParser {
     pending: Vec<u8>,
@@ -2508,7 +2520,16 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
 
     #[test]
     fn ctrl_g_toggles_the_review_popup() {
+        let repo = test_files::TestFiles::new();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        repo.file("a.txt", "one\n");
+
         let mut state = TuiState::new("model".into());
+        state.cwd = Some(repo.path().to_path_buf());
 
         handle_key(&mut state, &ctrl('g'));
         assert!(matches!(state.screen, crate::screen::Screen::CodeReview(_)));
@@ -2529,7 +2550,9 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
 
     #[test]
     fn review_popup_jk_moves_the_cursor() {
+        let repo = git_repo();
         let mut state = TuiState::new("model".into());
+        state.cwd = Some(repo.path().to_path_buf());
 
         handle_key(&mut state, &ctrl('g'));
         review_state(&mut state).text = format!(
@@ -2548,7 +2571,9 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
 
     #[test]
     fn review_popup_arrows_switch_files() {
+        let repo = git_repo();
         let mut state = TuiState::new("model".into());
+        state.cwd = Some(repo.path().to_path_buf());
 
         handle_key(&mut state, &ctrl('g'));
         review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b.txt b/b.txt\n@@ -1 +1 @@\n-a\n+b".into();
@@ -2566,7 +2591,9 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
 
     #[test]
     fn review_popup_v_selects_and_c_comments() {
+        let repo = git_repo();
         let mut state = TuiState::new("model".into());
+        state.cwd = Some(repo.path().to_path_buf());
 
         handle_key(&mut state, &ctrl('g'));
         review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
@@ -2593,7 +2620,9 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
 
     #[test]
     fn review_popup_c_comments_the_cursor_line_without_a_selection() {
+        let repo = git_repo();
         let mut state = TuiState::new("model".into());
+        state.cwd = Some(repo.path().to_path_buf());
 
         handle_key(&mut state, &ctrl('g'));
         review_state(&mut state).text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
@@ -2614,7 +2643,9 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
 
     #[test]
     fn review_file_view_renders_the_comment_draft_under_the_commented_span() {
+        let repo = git_repo();
         let mut state = TuiState::new("model".into());
+        state.cwd = Some(repo.path().to_path_buf());
 
         handle_key(&mut state, &ctrl('g'));
         review_state(&mut state).text =
@@ -2640,7 +2671,9 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
 
     #[test]
     fn review_file_view_renders_the_selection_draft_under_the_selection_end() {
+        let repo = git_repo();
         let mut state = TuiState::new("model".into());
+        state.cwd = Some(repo.path().to_path_buf());
 
         handle_key(&mut state, &ctrl('g'));
         review_state(&mut state).text =

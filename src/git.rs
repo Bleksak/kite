@@ -52,6 +52,9 @@ fn walk(
             };
             out.push((rel, EntryKind::Link, oid));
         } else if meta.is_dir() {
+            if path.file_name() == Some(std::ffi::OsStr::new(".git")) {
+                continue;
+            }
             if is_ignored(excludes, &rel, true) {
                 continue;
             }
@@ -158,12 +161,15 @@ fn build_tree(repo: &gix::Repository, files: &[(String, EntryKind, ObjectId)]) -
     Some((*id).to_owned())
 }
 
-pub fn head_tree() -> String {
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(_) => return String::new(),
+pub fn head_tree(cwd: Option<&Path>) -> String {
+    let base = match cwd {
+        Some(p) => p.to_path_buf(),
+        None => match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(_) => return String::new(),
+        },
     };
-    let repo = match gix::open(&cwd) {
+    let repo = match gix::open(&base) {
         Ok(repo) => repo,
         Err(_) => return String::new(),
     };
@@ -188,30 +194,25 @@ pub fn diff(from: &str, to: &str) -> String {
 
 #[cfg(test)]
 mod test {
-    use super::{head_tree, snapshot_tree};
+    use super::{head_tree, is_ignored, snapshot_tree};
 
-    fn temp_repo(prefix: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kite-git-{}-{}-{}",
-            prefix,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let git = |args: &[&str]| -> String {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        git(&["init", "-q"]);
+    fn temp_repo() -> test_files::TestFiles {
+        let dir = test_files::TestFiles::new();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         dir
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     fn git_empty_tree(dir: &std::path::Path) -> String {
@@ -226,25 +227,21 @@ mod test {
 
     #[test]
     fn head_tree_of_a_fresh_repo_matches_git_empty_tree() {
-        let dir = temp_repo("head-fresh");
-        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
-        let expected = git_empty_tree(&dir);
-        let before = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let got = head_tree();
-        std::env::set_current_dir(before).unwrap();
+        let dir = temp_repo();
+        dir.file("a.txt", "one\n");
+        let expected = git_empty_tree(dir.path());
+        let got = head_tree(Some(dir.path()));
         assert_eq!(got, expected);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn head_tree_matches_git_after_a_commit() {
-        let dir = temp_repo("head-commit");
-        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
-        let git = |args: &[&str]| -> String {
+        let dir = temp_repo();
+        dir.file("a.txt", "one\n");
+        let commit = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
-                .current_dir(&dir)
+                .current_dir(dir.path())
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
@@ -253,65 +250,49 @@ mod test {
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
-        git(&["add", "-A"]);
-        git(&["commit", "-q", "-m", "c"]);
-        let expected = git(&["rev-parse", "HEAD^{tree}"]).trim().to_string();
-        let before = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let got = head_tree();
-        std::env::set_current_dir(before).unwrap();
+        commit(&["add", "-A"]);
+        commit(&["commit", "-q", "-m", "c"]);
+        let expected = commit(&["rev-parse", "HEAD^{tree}"]).trim().to_string();
+        let got = head_tree(Some(dir.path()));
         assert_eq!(got, expected);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn snapshot_respects_gitignore() {
-        let dir = temp_repo("snapshot-ignore");
-        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
-        std::fs::write(dir.join("keep.txt"), "keep\n").unwrap();
-        std::fs::write(dir.join("skip.log"), "skip\n").unwrap();
-        let tree = snapshot_tree(Some(&dir)).expect("snapshot");
-        let out = std::process::Command::new("git")
-            .args(["ls-tree", "-r", &tree])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        let ls = String::from_utf8_lossy(&out.stdout);
+        let dir = temp_repo();
+        dir.file(".gitignore", "*.log\n");
+        dir.file("keep.txt", "keep\n");
+        dir.file("skip.log", "skip\n");
+        let tree = snapshot_tree(Some(dir.path())).expect("snapshot");
+        let ls = git(dir.path(), &["ls-tree", "-r", &tree]);
         assert!(ls.contains("keep.txt"));
         assert!(!ls.contains("skip.log"));
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exclude_stack_ignores_a_gitignored_dir() {
+        let dir = temp_repo();
+        dir.file(".gitignore", "target/\n");
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/a.txt"), "x\n").unwrap();
+        let repo = gix::open(dir.path()).unwrap();
+        let index = repo.index_or_empty().unwrap();
+        let source = gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped;
+        let mut excludes = repo.excludes(&***index, None, source).unwrap();
+        assert!(is_ignored(&mut excludes, "target", true));
     }
 
     #[test]
     fn snapshot_captures_new_and_modified_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "kite-git-snapshot-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let git = |args: &[&str]| -> String {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        git(&["init", "-q"]);
-        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
-        let tree1 = snapshot_tree(Some(&dir)).expect("first snapshot");
-        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
-        std::fs::write(dir.join("b.txt"), "new file\n").unwrap();
-        let tree2 = snapshot_tree(Some(&dir)).expect("second snapshot");
-        let diff = git(&["diff", &tree1, &tree2]);
+        let dir = temp_repo();
+        dir.file("a.txt", "one\n");
+        let tree1 = snapshot_tree(Some(dir.path())).expect("first snapshot");
+        dir.file("a.txt", "one\ntwo\n");
+        dir.file("b.txt", "new file\n");
+        let tree2 = snapshot_tree(Some(dir.path())).expect("second snapshot");
+        let diff = git(dir.path(), &["diff", &tree1, &tree2]);
         assert!(diff.contains("+two"));
         assert!(diff.contains("b.txt"));
         assert!(diff.contains("+new file"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

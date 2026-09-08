@@ -41,15 +41,18 @@ impl Default for State {
 pub fn open(state: &mut TuiState) -> State {
     let mut s = State::default();
     s.comments = std::mem::take(&mut state.session().review_comments);
-    s.text = review_diff_text(state.session().review_baseline.as_deref());
+    let baseline = state.session().review_baseline.clone();
+    s.text = review_diff_text(state.cwd.as_deref(), baseline.as_deref());
     s
 }
 
-fn review_diff_text(baseline: Option<&str>) -> String {
-    let Some(current) = crate::git::snapshot_tree(None) else {
+fn review_diff_text(cwd: Option<&std::path::Path>, baseline: Option<&str>) -> String {
+    let Some(current) = crate::git::snapshot_tree(cwd) else {
         return "not a git repository".to_string();
     };
-    let baseline = baseline.map(|b| b.to_string()).unwrap_or_else(crate::git::head_tree);
+    let baseline = baseline
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| crate::git::head_tree(cwd));
     if baseline.is_empty() {
         return "git has no baseline".to_string();
     }
