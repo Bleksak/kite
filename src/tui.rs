@@ -2410,7 +2410,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     if state.picker_open {
         let filtered = state.filtered();
         let renaming = state.picker_rename.clone();
-        let height = (filtered.len().max(1) as u16 + 3).min(chunks[1].height);
+        let height = chunks[1].height;
         let visible = height.saturating_sub(3) as usize;
         let start = if filtered.len() <= visible {
             0
@@ -2421,9 +2421,9 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             }
             s
         };
-        let width = 52u16.min(chunks[1].width.saturating_sub(2));
-        let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
-        let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
+        let width = chunks[1].width;
+        let x = chunks[1].x;
+        let y = chunks[1].y;
         let lines: Vec<Line> = if filtered.is_empty() {
             vec![Line::from(Span::styled(
                 " no matches",
@@ -2454,14 +2454,14 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                             if buf.is_empty() {
                                 "rename…".to_string()
                             } else {
-                                buf.clone()
+                                buf.chars().take(60).collect()
                             }
                         }
                         _ => {
                             if session.label.is_empty() {
                                 "—".to_string()
                             } else {
-                                session.label.clone()
+                                session.label.chars().take(60).collect()
                             }
                         }
                     };
@@ -2504,12 +2504,20 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
 
     if state.tasks_open && state.task_output_id.is_none() {
         let tasks = crate::bg::REGISTRY.list();
-        let list_height = tasks.len().max(1) as u16;
-        let height = (list_height + 3).min(chunks[1].height);
+        let height = chunks[1].height;
         let visible = height.saturating_sub(3) as usize;
-        let width = 52u16.min(chunks[1].width.saturating_sub(2));
-        let x = chunks[1].x + (chunks[1].width.saturating_sub(width)) / 2;
-        let y = chunks[1].y + (chunks[1].height.saturating_sub(height)) / 2;
+        let start = if tasks.len() <= visible {
+            0
+        } else {
+            let mut s = state.tasks_cursor.pos.saturating_sub(visible / 2);
+            if s + visible > tasks.len() {
+                s = tasks.len() - visible;
+            }
+            s
+        };
+        let width = chunks[1].width;
+        let x = chunks[1].x;
+        let y = chunks[1].y;
         let lines: Vec<Line> = if tasks.is_empty() {
             vec![Line::from(Span::styled(
                 " no tasks",
@@ -2519,9 +2527,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             tasks
                 .iter()
                 .enumerate()
+                .skip(start)
                 .take(visible)
                 .map(|(i, task)| {
-                    let selected = i == state.tasks_cursor.pos;
+                    let selected = i + start == state.tasks_cursor.pos;
                     let status = match &task.status {
                         crate::bg::BgStatus::Running => "running  ".to_string(),
                         crate::bg::BgStatus::Finished(None) => "killed   ".to_string(),
@@ -2540,7 +2549,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
                         Style::default()
                     };
                     let marker = if selected { "›" } else { " " };
-                    let command: String = task.command.chars().take(28).collect();
+                    let command: String = task.command.chars().take(60).collect();
                     Line::from(vec![
                         Span::styled(format!(" {marker} {}  ", task.id), style),
                         Span::styled(status, style),
@@ -4473,7 +4482,6 @@ mod test {
         assert!(joined.contains("working…"));
         assert!(joined.contains("idle"));
         assert!(joined.contains("search"));
-        assert!(joined.contains("hello"));
     }
 
     #[test]
