@@ -272,18 +272,6 @@ pub(crate) fn render_panel<'a>(
     frame.render_widget(paragraph.block(block), rect);
 }
 
-fn plan_scroll_max(state: &TuiState) -> usize {    let Some((stages, _)) = state.sessions.get(state.active).and_then(|s| s.plan.clone()) else {
-        return 0;
-    };
-    let Some(stage) = stages.get(state.plan_view) else {
-        return 0;
-    };
-    let total = 1 + 1 + if stage.tasks.is_empty() { 1 } else { stage.tasks.len() } + 1;
-    let visible = state.viewport.saturating_sub(4);
-    total.saturating_sub(visible)
-}
-
-
 fn format_review_comments(comments: &[ReviewComment]) -> String {
     let mut out = String::from("Review comments:");
     for comment in comments {
@@ -392,18 +380,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         }
     }
     if let TermEvent::Mouse(mouse) = event {
-        if state.plan_open {
-            let max = plan_scroll_max(state);
-            return match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    state.plan_scroll.toward_top(3);
-                    KeyAction::None
-                }
-                MouseEventKind::ScrollDown => {
-                    state.plan_scroll.toward_bottom(3, max);
-                    KeyAction::None
-                }
-            };
+        if let Some(action) = crate::components::plan_detail::mouse(state, mouse) {
+            return action;
         }
         if let Some(action) = crate::components::code_review::mouse(state, mouse) {
             return action;
@@ -451,59 +429,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     if let Some(action) = crate::components::session_picker::handle_key(state, key) {
         return action;
     }
-    if state.plan_open {
-        let len = state
-            .session()
-            .plan
-            .as_ref()
-            .map(|(stages, _)| stages.len())
-            .unwrap_or(0);
-        let scroll_max = plan_scroll_max(state);
-        return match key.code {
-            KeyCode::Char('p') | KeyCode::Char('q') | KeyCode::Esc => {
-                state.plan_open = false;
-                KeyAction::None
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if state.plan_view > 0 {
-                    state.plan_view -= 1;
-                    state.plan_scroll = Scroller::at_tail();
-                }
-                KeyAction::None
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if state.plan_view + 1 < len {
-                    state.plan_view += 1;
-                    state.plan_scroll = Scroller::at_tail();
-                }
-                KeyAction::None
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                state.plan_scroll.toward_bottom(3, scroll_max);
-                KeyAction::None
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                state.plan_scroll.toward_top(3);
-                KeyAction::None
-            }
-            KeyCode::PageDown => {
-                state.plan_scroll.toward_bottom(8, scroll_max);
-                KeyAction::None
-            }
-            KeyCode::PageUp => {
-                state.plan_scroll.toward_top(8);
-                KeyAction::None
-            }
-            KeyCode::Home => {
-                state.plan_scroll.home();
-                KeyAction::None
-            }
-            KeyCode::End => {
-                state.plan_scroll.end(scroll_max);
-                KeyAction::None
-            }
-            _ => KeyAction::None,
-        };
+    if let Some(action) = crate::components::plan_detail::handle_key(state, key) {
+        return action;
     }
     if let Some(action) = crate::components::code_review::handle_key(state, key) {
         return action;
@@ -1744,58 +1671,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     }
 
     if state.plan_open {
-        let (stages, _) = state
-            .sessions
-            .get(state.active)
-            .and_then(|s| s.plan.clone())
-            .unwrap_or((Vec::new(), 0));
-        let scroll_max = plan_scroll_max(state);
-        let mut lines: Vec<Line> = Vec::new();
-        let mut title_suffix = String::new();
-        if stages.is_empty() {
-            lines.push(Line::from(Span::styled(
-                " no plan",
-                Style::default().fg(Color::Rgb(102, 102, 102)),
-            )));
-        } else if let Some(stage) = stages.get(state.plan_view) {
-            title_suffix = format!(" · Step {} of {}", state.plan_view + 1, stages.len());
-            let mut md = String::new();
-            md.push_str(&stage.title);
-            md.push_str("\n\n");
-            if stage.tasks.is_empty() {
-                md.push_str("_no tasks_");
-            } else {
-                for (i, task) in stage.tasks.iter().enumerate() {
-                    md.push_str(&format!("{}. {}\n", i + 1, task));
-                }
-                if md.ends_with('\n') {
-                    md.pop();
-                }
-            }
-            lines = crate::transcript::render_markdown_lines(&md);
-        }
-        let hint = Line::from(Span::styled(
-            " ←→ step · jk/ PgUp PgDn scroll · ctrl+p close",
-            Style::default().fg(Color::Rgb(102, 102, 102)),
-        ));
-        let all: Vec<Line> = lines.into_iter().chain(std::iter::once(hint)).collect();
-        let visible = state.viewport.saturating_sub(4);
-        let start = if state.plan_scroll.following() {
-            scroll_max
-        } else {
-            state.plan_scroll.offset().min(scroll_max)
-        };
-        let width = chunks[1].width;
-        let height = chunks[1].height;
-        let x = chunks[1].x;
-        let y = chunks[1].y;
-        render_panel(
-            frame,
-            Rect::new(x, y, width, height),
-            format!(" plan {title_suffix} "),
-            all[start..].iter().take(visible).cloned().collect::<Vec<Line>>(),
-            true,
-        );
+        crate::components::plan_detail::draw(frame, state, chunks[1]);
     }
 
     if state.diff_open {
