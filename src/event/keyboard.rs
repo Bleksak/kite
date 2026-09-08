@@ -1,5 +1,11 @@
 use bitflags::bitflags;
 
+const ESC_CODEPOINT: char = '\x1b';
+const ENTER_CODEPOINT: char = '\r';
+const CTRL_A_CODEPOINT: char = '\x01';
+const CTRL_Z_CODEPOINT: char = '\x1a';
+const LETTER_A: u8 = b'a';
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyCode {
     Char(char),
@@ -66,10 +72,10 @@ pub fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent>
     match event {
         termwiz::input::InputEvent::Key(key_event) => {
             let code = match key_event.key {
-                TermwizKeyCode::Char('\x1b') => KeyCode::Esc,
-                TermwizKeyCode::Char('\r') => KeyCode::Enter,
-                TermwizKeyCode::Char(c @ '\x01'..='\x1a') => {
-                    KeyCode::Char((c as u8 - 0x01 + b'a') as char)
+                TermwizKeyCode::Char(ESC_CODEPOINT) => KeyCode::Esc,
+                TermwizKeyCode::Char(ENTER_CODEPOINT) => KeyCode::Enter,
+                TermwizKeyCode::Char(c @ CTRL_A_CODEPOINT..=CTRL_Z_CODEPOINT) => {
+                    KeyCode::Char((c as u8 - CTRL_A_CODEPOINT as u8 + LETTER_A) as char)
                 }
                 TermwizKeyCode::Char(c)
                     if c.is_ascii_uppercase()
