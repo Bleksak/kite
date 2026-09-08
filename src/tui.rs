@@ -111,9 +111,7 @@ pub struct TuiState {
     pub picker_rename: Option<String>,
     pub task_list: crate::components::task_list::State,
     pub task_detail: crate::components::task_detail::State,
-    pub plan_open: bool,
-    pub plan_view: usize,
-    pub plan_scroll: Scroller,
+    pub plan_detail: crate::components::plan_detail::State,
     pub code_review: crate::components::code_review::State,
     pub next_id: u64,
 }
@@ -134,9 +132,7 @@ impl TuiState {
             picker_rename: None,
             task_list: crate::components::task_list::State::default(),
             task_detail: crate::components::task_detail::State::default(),
-            plan_open: false,
-            plan_view: 0,
-            plan_scroll: Scroller::default(),
+            plan_detail: crate::components::plan_detail::State::default(),
             code_review: crate::components::code_review::State::default(),
             next_id: 1,
         }
@@ -418,17 +414,17 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if key.code == KeyCode::Char('p') {
-            if !state.plan_open {
+            if !state.plan_detail.open {
                 let stage_index = state
                     .session()
                     .plan
                     .as_ref()
                     .map(|(_, i)| *i)
                     .unwrap_or(0);
-                state.plan_view = stage_index;
-                state.plan_scroll = Scroller::at_tail();
+                state.plan_detail.view = stage_index;
+                state.plan_detail.scroll = Scroller::at_tail();
             }
-            state.plan_open = !state.plan_open;
+            state.plan_detail.open = !state.plan_detail.open;
             state.picker_open = false;
             state.task_list.open = false;
             return KeyAction::None;
@@ -1537,7 +1533,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let session = &state.sessions[state.active];
     let suggest = if state.picker_open
         || state.task_list.open
-        || state.plan_open
+        || state.plan_detail.open
         || state.code_review.open
         || session.question.is_some()
     {
@@ -1648,7 +1644,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         crate::components::task_list::draw(frame, state, chunks[1]);
     }
 
-    if state.plan_open {
+    if state.plan_detail.open {
         crate::components::plan_detail::draw(frame, state, chunks[1]);
     }
 
@@ -2523,20 +2519,20 @@ mod test {
         state.session().plan = Some((plan_stages(), 1));
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_open);
+        assert!(state.plan_detail.open);
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(!state.plan_open);
+        assert!(!state.plan_detail.open);
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_open);
+        assert!(state.plan_detail.open);
         handle_key(&mut state, &key(KeyCode::Char('q')));
-        assert!(!state.plan_open);
+        assert!(!state.plan_detail.open);
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_open);
+        assert!(state.plan_detail.open);
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.plan_open);
+        assert!(!state.plan_detail.open);
     }
 
     #[test]
@@ -2545,10 +2541,10 @@ mod test {
         state.session().running = true;
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_open);
+        assert!(state.plan_detail.open);
 
         handle_key(&mut state, &key(KeyCode::Char('q')));
-        assert!(!state.plan_open);
+        assert!(!state.plan_detail.open);
     }
 
     #[test]
@@ -2556,11 +2552,11 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_open);
+        assert!(state.plan_detail.open);
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.plan_open);
+        assert!(!state.plan_detail.open);
     }
 
     #[test]
@@ -2569,18 +2565,18 @@ mod test {
         state.session().plan = Some((plan_stages(), 0));
 
         handle_key(&mut state, &ctrl('p'));
-        assert_eq!(state.plan_view, 0);
+        assert_eq!(state.plan_detail.view, 0);
 
         handle_key(&mut state, &key(KeyCode::Left));
-        assert_eq!(state.plan_view, 0);
+        assert_eq!(state.plan_detail.view, 0);
         handle_key(&mut state, &key(KeyCode::Right));
-        assert_eq!(state.plan_view, 1);
+        assert_eq!(state.plan_detail.view, 1);
         handle_key(&mut state, &key(KeyCode::Char('l')));
-        assert_eq!(state.plan_view, 1);
+        assert_eq!(state.plan_detail.view, 1);
         handle_key(&mut state, &key(KeyCode::Char('h')));
-        assert_eq!(state.plan_view, 0);
+        assert_eq!(state.plan_detail.view, 0);
         handle_key(&mut state, &key(KeyCode::Char('h')));
-        assert_eq!(state.plan_view, 0);
+        assert_eq!(state.plan_detail.view, 0);
     }
 
     #[test]
@@ -2589,12 +2585,12 @@ mod test {
         state.session().plan = Some((plan_stages(), 0));
 
         handle_key(&mut state, &ctrl('p'));
-        assert!(state.plan_scroll.following());
+        assert!(state.plan_detail.scroll.following());
 
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert!(!state.plan_scroll.following());
+        assert!(!state.plan_detail.scroll.following());
         handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert!(state.plan_scroll.following());
+        assert!(state.plan_detail.scroll.following());
     }
 
     #[test]
