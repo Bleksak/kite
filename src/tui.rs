@@ -2740,6 +2740,79 @@ mod test {
     }
 
     #[test]
+    fn review_file_view_renders_the_comment_draft_under_the_commented_span() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('g'));
+        review_state(&mut state).text =
+            "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        for _ in 0..3 {
+            handle_key(&mut state, &key(KeyCode::Char('j')));
+        }
+        handle_key(&mut state, &key(KeyCode::Char('c')));
+        for c in "note".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+
+        let (lines, _) =
+            crate::components::code_review::review_file_view(review_state(&mut state));
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let idx = texts.iter().position(|t| t.contains("note")).unwrap();
+        assert_eq!(texts[idx - 1], "    2   z");
+        assert!(texts[idx].starts_with(" 💬 "));
+    }
+
+    #[test]
+    fn review_file_view_renders_the_selection_draft_under_the_selection_end() {
+        let mut state = TuiState::new("model".into());
+
+        handle_key(&mut state, &ctrl('g'));
+        review_state(&mut state).text =
+            "diff --git a/a.txt b/a.txt\n@@ -1,3 +1,3 @@\n-x\n+y\n z".into();
+        for _ in 0..2 {
+            handle_key(&mut state, &key(KeyCode::Char('j')));
+        }
+        handle_key(&mut state, &key(KeyCode::Char('v')));
+        handle_key(&mut state, &key(KeyCode::Char('j')));
+        handle_key(&mut state, &key(KeyCode::Char('c')));
+        for c in "sel".chars() {
+            handle_key(&mut state, &key(KeyCode::Char(c)));
+        }
+
+        let (lines, _) =
+            crate::components::code_review::review_file_view(review_state(&mut state));
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let idx = texts.iter().position(|t| t.contains("sel")).unwrap();
+        assert_eq!(texts[idx - 1], "    2   z");
+    }
+
+    #[test]
+    fn review_popup_c_scrolls_the_draft_into_view() {
+        let mut state = TuiState::new("model".into());
+        state.viewport = 10;
+        let mut text = String::from("diff --git a/a.txt b/a.txt\n@@ -1,30 +1,30 @@\n");
+        for i in 1..=30 {
+            text.push_str(&format!("-{i}\n"));
+        }
+
+        handle_key(&mut state, &ctrl('g'));
+        review_state(&mut state).text = text;
+        for _ in 0..30 {
+            handle_key(&mut state, &key(KeyCode::Char('j')));
+        }
+        assert_eq!(review_state(&mut state).cursor, 30);
+
+        handle_key(&mut state, &key(KeyCode::Char('c')));
+        assert_eq!(review_state(&mut state).start, 26);
+    }
+
+    #[test]
     fn review_close_returns_the_comments_to_the_session() {
         let mut state = TuiState::new("model".into());
 

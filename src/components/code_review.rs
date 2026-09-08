@@ -133,6 +133,87 @@ fn review_comment_line(comment: &ReviewComment) -> Line<'static> {
     ))
 }
 
+fn comment_draft_line(cr: &State) -> Line<'static> {
+    let cursor = cr.comment_cursor.min(cr.comment_draft.chars().count());
+    let cursor_style = Style::default()
+        .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
+        .fg(Color::Rgb(0x28, 0x28, 0x32));
+    let mut spans = vec![Span::styled(
+        " 💬 ".to_string(),
+        Style::default().fg(Color::Rgb(0xd2, 0xa2, 0x6c)),
+    )];
+    let chars: Vec<char> = cr.comment_draft.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if i == cursor {
+            spans.push(Span::styled(c.to_string(), cursor_style));
+        } else {
+            spans.push(Span::raw(c.to_string()));
+        }
+    }
+    if cursor == chars.len() {
+        spans.push(Span::styled(" ".to_string(), cursor_style));
+    }
+    Line::from(spans)
+}
+
+fn draft_after_index(cr: &State) -> Option<usize> {
+    if !cr.commenting {
+        return None;
+    }
+    Some(if cr.comment_whole_file {
+        0
+    } else {
+        cr.anchor
+            .map(|anchor| anchor.max(cr.cursor))
+            .unwrap_or(cr.cursor)
+    })
+}
+
+fn draft_mixed_index(cr: &State) -> Option<usize> {
+    let sections = diff_file_sections(&cr.text);
+    let (path, section) = sections.get(cr.file_index)?;
+    let numbered = crate::transcript::diff_lines_numbered(section);
+    let after = draft_after_index(cr)?;
+    if after >= numbered.len() {
+        return None;
+    }
+    let comments: Vec<&ReviewComment> = cr
+        .comments
+        .iter()
+        .filter(|c| c.file == *path)
+        .collect();
+    let mut placed = vec![false; comments.len()];
+    let mut index = 0;
+    for (i, d) in numbered.iter().enumerate() {
+        index += 1;
+        if i == 0 {
+            for (ci, comment) in comments.iter().enumerate() {
+                if !placed[ci] && comment.range.is_none() {
+                    index += 1;
+                    placed[ci] = true;
+                }
+            }
+        }
+        if let Some(number) = d.new.or(d.old) {
+            for (ci, comment) in comments.iter().enumerate() {
+                if !placed[ci]
+                    && comment
+                        .range
+                        .as_ref()
+                        .is_some_and(|r| r.end - 1 == number)
+                {
+                    index += 1;
+                    placed[ci] = true;
+                }
+            }
+        }
+        if i == after {
+            return Some(index);
+        }
+    }
+    None
+}
+
 pub(crate) fn review_file_view(cr: &State) -> (Vec<Line<'static>>, usize) {
     let sections = diff_file_sections(&cr.text);
     let Some((path, section)) = sections.get(cr.file_index) else {
@@ -149,6 +230,7 @@ pub(crate) fn review_file_view(cr: &State) -> (Vec<Line<'static>>, usize) {
         .filter(|c| &c.file == path)
         .collect();
     let mut placed = vec![false; comments.len()];
+    let draft_after = draft_after_index(cr);
     let mut lines = Vec::new();
     for (index, d) in numbered.iter().enumerate() {
         let selected = sel_range
@@ -186,6 +268,9 @@ pub(crate) fn review_file_view(cr: &State) -> (Vec<Line<'static>>, usize) {
                     placed[i] = true;
                 }
             }
+        }
+        if draft_after == Some(index) {
+            lines.push(comment_draft_line(cr));
         }
     }
     for (i, comment) in comments.iter().enumerate() {
@@ -440,6 +525,13 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
             cr.comment_cursor = cr.comment_draft.chars().count();
             cr.comment_whole_file = whole_file;
             cr.commenting = true;
+            if whole_file {
+                cr.start = 0;
+            } else if let Some(draft_index) = draft_mixed_index(cr)
+                && draft_index >= cr.start + visible
+            {
+                cr.start = draft_index - visible + 1;
+            }
             KeyAction::None
         }
         KeyCode::Char('r') => {
@@ -519,28 +611,6 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
             )
         }
     };
-    if cr.commenting {
-        let cursor = cr.comment_cursor.min(cr.comment_draft.chars().count());
-        let cursor_style = Style::default()
-            .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
-            .fg(Color::Rgb(0x28, 0x28, 0x32));
-        let mut spans = vec![Span::styled(
-            " 💬 ".to_string(),
-            Style::default().fg(Color::Rgb(0xd2, 0xa2, 0x6c)),
-        )];
-        let chars: Vec<char> = cr.comment_draft.chars().collect();
-        for (i, c) in chars.iter().enumerate() {
-            if i == cursor {
-                spans.push(Span::styled(c.to_string(), cursor_style));
-            } else {
-                spans.push(Span::raw(c.to_string()));
-            }
-        }
-        if cursor == chars.len() {
-            spans.push(Span::styled(" ".to_string(), cursor_style));
-        }
-        lines.push(Line::from(spans));
-    }
     let hint = if cr.commenting {
         Line::from(Span::styled(
             " enter submit · esc cancel · backspace delete",
