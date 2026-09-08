@@ -3,9 +3,10 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::event::keyboard::{KeyCode, KeyEvent, KeyModifiers};
 use crate::screen::Screen;
 use crate::session::{Cursor, Scroller};
-use crate::tui::{KeyAction, KeyCode, KeyEvent, KeyModifiers, TuiState};
+use crate::tui::{KeyAction, TuiState};
 
 #[derive(Clone)]
 pub struct State {

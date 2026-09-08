@@ -3,12 +3,10 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
+use crate::event::keyboard::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use crate::screen::Screen;
 use crate::session::ReviewComment;
-use crate::tui::{
-    word_left, word_right, KeyAction, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
-    MouseEventKind, TuiState,
-};
+use crate::tui::{word_left, word_right, KeyAction, TuiState};
 
 pub struct State {
     pub start: usize,
