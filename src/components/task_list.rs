@@ -3,11 +3,25 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
-use crate::session::Scroller;
+use crate::session::{Cursor, Scroller};
 use crate::tui::{KeyAction, KeyCode, KeyEvent, KeyModifiers, TuiState};
 
+pub struct State {
+    pub open: bool,
+    pub cursor: Cursor,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            open: false,
+            cursor: Cursor::default(),
+        }
+    }
+}
+
 pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
-    if !state.tasks_open {
+    if !state.task_list.open {
         return None;
     }
     let tasks = crate::bg::REGISTRY.list();
@@ -15,20 +29,20 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(match key.code {
             KeyCode::Char('j') => {
-                state.tasks_cursor.down(len);
+                state.task_list.cursor.down(len);
                 KeyAction::None
             }
             KeyCode::Char('k') => {
-                state.tasks_cursor.up(len);
+                state.task_list.cursor.up(len);
                 KeyAction::None
             }
             KeyCode::Char('s') => {
                 state.picker_open = true;
-                state.tasks_open = false;
+                state.task_list.open = false;
                 KeyAction::None
             }
             KeyCode::Char('q') => {
-                state.tasks_open = false;
+                state.task_list.open = false;
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -36,36 +50,36 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     }
     Some(match key.code {
         KeyCode::Up => {
-            state.tasks_cursor.up(len);
+            state.task_list.cursor.up(len);
             KeyAction::None
         }
         KeyCode::Down => {
-            state.tasks_cursor.down(len);
+            state.task_list.cursor.down(len);
             KeyAction::None
         }
         KeyCode::Char('j') => {
-            state.tasks_cursor.down(len);
+            state.task_list.cursor.down(len);
             KeyAction::None
         }
         KeyCode::Char('k') => {
-            state.tasks_cursor.up(len);
+            state.task_list.cursor.up(len);
             KeyAction::None
         }
         KeyCode::Char('x') => {
-            if let Some(task) = tasks.get(state.tasks_cursor.pos) {
+            if let Some(task) = tasks.get(state.task_list.cursor.pos) {
                 let _ = crate::bg::REGISTRY.kill(&task.id);
             }
             KeyAction::None
         }
         KeyCode::Enter => {
-            if let Some(task) = tasks.get(state.tasks_cursor.pos) {
+            if let Some(task) = tasks.get(state.task_list.cursor.pos) {
                 state.task_output_id = Some(task.id.clone());
                 state.task_output_scroll = Scroller::at_tail();
             }
             KeyAction::None
         }
         KeyCode::Char('q') | KeyCode::Esc => {
-            state.tasks_open = false;
+            state.task_list.open = false;
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -79,7 +93,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
     let start = if tasks.len() <= visible {
         0
     } else {
-        let mut s = state.tasks_cursor.pos.saturating_sub(visible / 2);
+        let mut s = state.task_list.cursor.pos.saturating_sub(visible / 2);
         if s + visible > tasks.len() {
             s = tasks.len() - visible;
         }
@@ -97,7 +111,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
             .skip(start)
             .take(visible)
             .map(|(i, task)| {
-                let selected = i + start == state.tasks_cursor.pos;
+                let selected = i + start == state.task_list.cursor.pos;
                 let status = match &task.status {
                     crate::bg::BgStatus::Running => "running  ".to_string(),
                     crate::bg::BgStatus::Finished(None) => "killed   ".to_string(),

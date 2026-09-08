@@ -44,8 +44,8 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(match key.code {
             KeyCode::Char('q') => {
+                state.task_list.open = false;
                 state.task_output_id = None;
-                state.tasks_open = false;
                 KeyAction::None
             }
             _ => KeyAction::None,

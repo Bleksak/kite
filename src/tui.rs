@@ -109,8 +109,7 @@ pub struct TuiState {
     pub picker_cursor: Cursor,
     pub picker_query: String,
     pub picker_rename: Option<String>,
-    pub tasks_open: bool,
-    pub tasks_cursor: Cursor,
+    pub task_list: crate::components::task_list::State,
     pub task_output_id: Option<String>,
     pub task_output_scroll: Scroller,
     pub plan_open: bool,
@@ -143,8 +142,7 @@ impl TuiState {
             picker_cursor: Cursor::default(),
             picker_query: String::new(),
             picker_rename: None,
-            tasks_open: false,
-            tasks_cursor: Cursor::default(),
+            task_list: crate::components::task_list::State::default(),
             task_output_id: None,
             task_output_scroll: Scroller::default(),
             plan_open: false,
@@ -452,7 +450,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             }
             state.plan_open = !state.plan_open;
             state.picker_open = false;
-            state.tasks_open = false;
+            state.task_list.open = false;
             return KeyAction::None;
         }
         if key.code == KeyCode::Char('g') {
@@ -461,7 +459,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             }
             state.diff_open = !state.diff_open;
             state.picker_open = false;
-            state.tasks_open = false;
+            state.task_list.open = false;
             return KeyAction::None;
         }
         let session = state.session();
@@ -473,14 +471,14 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         return match key.code {
             KeyCode::Char('s') => {
                 state.picker_open = true;
-                state.tasks_open = false;
+                state.task_list.open = false;
                 state.picker_cursor.set(state.active);
                 KeyAction::None
             }
             KeyCode::Char('q') => {
-                state.tasks_open = true;
+                state.task_list.open = true;
                 state.picker_open = false;
-                state.tasks_cursor.set(0);
+                state.task_list.cursor.set(0);
                 KeyAction::None
             }
             KeyCode::Char('t') => {
@@ -1558,7 +1556,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let input_lines = active_box_lines(&state.sessions[state.active], state.pane_width);
     let session = &state.sessions[state.active];
     let suggest = if state.picker_open
-        || state.tasks_open
+        || state.task_list.open
         || state.plan_open
         || state.diff_open
         || session.question.is_some()
@@ -1666,7 +1664,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         crate::components::session_picker::draw(frame, state, chunks[1]);
     }
 
-    if state.tasks_open && state.task_output_id.is_none() {
+    if state.task_list.open && state.task_output_id.is_none() {
         crate::components::task_list::draw(frame, state, chunks[1]);
     }
 
@@ -2337,10 +2335,10 @@ mod test {
         assert!(!state.picker_open);
 
         handle_key(&mut state, &ctrl('q'));
-        assert!(state.tasks_open);
+        assert!(state.task_list.open);
 
         handle_key(&mut state, &ctrl('q'));
-        assert!(!state.tasks_open);
+        assert!(!state.task_list.open);
     }
 
     #[test]
@@ -2467,22 +2465,22 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('q'));
-        state.tasks_cursor.set(
+        state.task_list.cursor.set(
             crate::bg::REGISTRY
                 .list()
                 .iter()
                 .position(|t| t.id == id)
                 .unwrap(),
         );
-        assert!(state.tasks_open);
+        assert!(state.task_list.open);
         assert!(!state.picker_open);
 
         handle_key(&mut state, &ctrl('s'));
         assert!(state.picker_open);
-        assert!(!state.tasks_open);
+        assert!(!state.task_list.open);
 
         handle_key(&mut state, &ctrl('q'));
-        assert!(state.tasks_open);
+        assert!(state.task_list.open);
         assert!(!state.picker_open);
 
         handle_key(&mut state, &key(KeyCode::Char('x')));
@@ -2511,7 +2509,7 @@ mod test {
         ));
 
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.tasks_open);
+        assert!(!state.task_list.open);
     }
 
     #[test]
@@ -2522,9 +2520,9 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('k')));
         handle_key(&mut state, &key(KeyCode::Char('x')));
-        assert_eq!(state.tasks_cursor.pos, 0);
+        assert_eq!(state.task_list.cursor.pos, 0);
         handle_key(&mut state, &key(KeyCode::Char('q')));
-        assert!(!state.tasks_open);
+        assert!(!state.task_list.open);
     }
 
     fn plan_stages() -> Vec<crate::tool::PlanStage> {
@@ -3130,7 +3128,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('q'));
-        state.tasks_cursor.set(
+        state.task_list.cursor.set(
             crate::bg::REGISTRY
                 .list()
                 .iter()
@@ -3157,10 +3155,10 @@ mod test {
 
         handle_key(&mut state, &key(KeyCode::Esc));
         assert!(state.task_output_id.is_none());
-        assert!(state.tasks_open);
+        assert!(state.task_list.open);
 
         handle_key(&mut state, &ctrl('q'));
-        assert!(!state.tasks_open);
+        assert!(!state.task_list.open);
     }
 
     #[tokio::test]
@@ -3181,7 +3179,7 @@ mod test {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let mut state = TuiState::new("model".into());
-        state.tasks_open = true;
+        state.task_list.open = true;
         state.task_output_id = Some(id);
 
         let backend = TestBackend::new(80, 24);
@@ -3217,7 +3215,7 @@ mod test {
         for i in 0..5 {
             state.session().renderer.push_user(&format!("CHATLINE-{i}"));
         }
-        state.tasks_open = true;
+        state.task_list.open = true;
         state.task_output_id = Some(id);
         state.task_output_scroll.set_following(true);
 
@@ -3318,7 +3316,7 @@ mod test {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
 
-        state.tasks_open = true;
+        state.task_list.open = true;
         state.task_output_id = Some(id);
         state.task_output_scroll.set_following(true);
         terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
