@@ -14,8 +14,6 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::event::keyboard::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind, TermEvent};
-#[cfg(test)]
-use crate::event::keyboard::MouseEvent;
 use crate::event::keyboard::map_termwiz_event;
 
 use crate::agent::Agent;
@@ -787,293 +785,7 @@ fn handle_question_key(state: &mut TuiState, key: &KeyEvent) -> KeyAction {
     KeyAction::None
 }
 
-#[cfg(test)]
-struct InputParser {
-    pending: Vec<u8>,
-}
 
-#[cfg(test)]
-impl InputParser {
-    fn new() -> Self {
-        Self { pending: Vec::new() }
-    }
-
-    fn feed(&mut self, chunk: &[u8]) -> Vec<TermEvent> {
-        self.pending.extend_from_slice(chunk);
-        let mut events = Vec::new();
-        while let Some(event) = self.next_event() {
-            events.push(event);
-        }
-        events
-    }
-
-    fn flush_escape(&mut self) -> Vec<TermEvent> {
-        if self.pending == [0x1Bu8] {
-            self.pending.clear();
-            vec![TermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))]
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn next_event(&mut self) -> Option<TermEvent> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        if self.pending[0] == 0x1B {
-            self.parse_escape()
-        } else {
-            self.parse_byte()
-        }
-    }
-
-    fn control_byte(&self, b: u8) -> Option<(KeyCode, KeyModifiers)> {
-        Some(match b {
-            0x0D => (KeyCode::Enter, KeyModifiers::NONE),
-            0x0A => (KeyCode::Char('j'), KeyModifiers::CONTROL),
-            0x09 => (KeyCode::Tab, KeyModifiers::NONE),
-            0x7F => (KeyCode::Backspace, KeyModifiers::NONE),
-            0x00 => (KeyCode::Char(' '), KeyModifiers::CONTROL),
-            0x01..=0x1A => (
-                KeyCode::Char((b - 0x01 + b'a') as char),
-                KeyModifiers::CONTROL,
-            ),
-            0x1C..=0x1F => (
-                KeyCode::Char((b - 0x1C + b'4') as char),
-                KeyModifiers::CONTROL,
-            ),
-            _ => return None,
-        })
-    }
-
-    fn parse_byte(&mut self) -> Option<TermEvent> {
-        let b = self.pending[0];
-        if b >= 0x80 {
-            let len = match b & 0xF8 {
-                0xF0 => 4,
-                0xE0 => 3,
-                0xC0 => 2,
-                _ => 1,
-            };
-            if self.pending.len() < len {
-                return None;
-            }
-            let bytes = self.pending[..len].to_vec();
-            self.pending.drain(..len);
-            let c = String::from_utf8(bytes).ok()?.chars().next()?;
-            let modifiers = if c.is_uppercase() {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::NONE
-            };
-            return Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)));
-        }
-        self.pending.remove(0);
-        if let Some((code, modifiers)) = self.control_byte(b) {
-            return Some(TermEvent::Key(KeyEvent::new(code, modifiers)));
-        }
-        let c = b as char;
-        let modifiers = if c.is_uppercase() {
-            KeyModifiers::SHIFT
-        } else {
-            KeyModifiers::NONE
-        };
-        Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)))
-    }
-
-    fn parse_escape(&mut self) -> Option<TermEvent> {
-        if self.pending.len() == 1 {
-            return None;
-        }
-        match self.pending[1] {
-            0x1B => {
-                self.pending.drain(..2);
-                Some(TermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT)))
-            }
-            b'[' => self.parse_csi(),
-            b'O' => self.parse_ss3(),
-            c @ 0x20..=0x7E => {
-                self.pending.drain(..2);
-                let c = c as char;
-                let modifiers = if c.is_uppercase() {
-                    KeyModifiers::ALT | KeyModifiers::SHIFT
-                } else {
-                    KeyModifiers::ALT
-                };
-                Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)))
-            }
-            c @ 0x00..=0x1F => {
-                self.pending.drain(..2);
-                let (code, modifiers) = self.control_byte(c)?;
-                Some(TermEvent::Key(KeyEvent::new(code, modifiers | KeyModifiers::ALT)))
-            }
-            _ => {
-                self.pending.remove(0);
-                self.next_event()
-            }
-        }
-    }
-
-    fn parse_ss3(&mut self) -> Option<TermEvent> {
-        if self.pending.len() < 3 {
-            return None;
-        }
-        let b = self.pending[2];
-        self.pending.drain(..3);
-        Some(match b {
-            b'A' => TermEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            b'B' => TermEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-            b'C' => TermEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
-            b'D' => TermEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
-            b'H' => TermEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
-            b'F' => TermEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
-            b'P'..=b'S' => TermEvent::Key(KeyEvent::new(KeyCode::F(1 + (b - b'P')), KeyModifiers::NONE)),
-            _ => return None,
-        })
-    }
-
-    fn parse_csi(&mut self) -> Option<TermEvent> {
-        if self.pending.len() > 32 {
-            self.pending.clear();
-            return None;
-        }
-        let final_idx = self.pending[2..]
-            .iter()
-            .position(|&b| (0x40..=0x7E).contains(&b))?;
-        let total = 2 + final_idx + 1;
-        if self.pending.len() < total {
-            return None;
-        }
-        let seq = String::from_utf8_lossy(&self.pending[2..total]).into_owned();
-        self.pending.drain(..total);
-        self.parse_csi_seq(&seq)
-    }
-
-    fn parse_csi_seq(&self, seq: &str) -> Option<TermEvent> {
-        let bytes = seq.as_bytes();
-        let final_byte = bytes[bytes.len() - 1];
-        let params = &seq[..seq.len() - 1];
-        match final_byte {
-            b'~' => {
-                if let Some(rest) = params.strip_prefix("27;") {
-                    let (mod_s, key_s) = rest.split_once(';')?;
-                    let modifier = mod_to_flags_xterm(mod_s.parse().ok()?);
-                    let code = codepoint_to_keycode(key_s.parse().ok()?)?;
-                    Some(TermEvent::Key(KeyEvent::new(code, modifier)))
-                } else {
-                    let n: u32 = params.parse().ok()?;
-                    let code = match n {
-                        1 | 7 => KeyCode::Home,
-                        2 => KeyCode::Insert,
-                        3 => KeyCode::Delete,
-                        4 | 8 => KeyCode::End,
-                        5 => KeyCode::PageUp,
-                        6 => KeyCode::PageDown,
-                        11..=15 => KeyCode::F((n - 10) as u8),
-                        17..=21 => KeyCode::F((n - 11) as u8),
-                        23..=26 => KeyCode::F((n - 12) as u8),
-                        28..=29 => KeyCode::F((n - 15) as u8),
-                        31..=34 => KeyCode::F((n - 17) as u8),
-                        _ => return None,
-                    };
-                    Some(TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
-                }
-            }
-            b'u' => {
-                if params.starts_with('?') {
-                    return None;
-                }
-                let mut parts = params.split(';');
-                let code = codepoint_to_keycode(parts.next()?.parse().ok()?)?;
-                let modifier = parts
-                    .next()
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(1);
-                Some(TermEvent::Key(KeyEvent::new(code, mod_to_flags(modifier))))
-            }
-            b'A' | b'B' | b'C' | b'D' => {
-                let code = match final_byte {
-                    b'A' => KeyCode::Up,
-                    b'B' => KeyCode::Down,
-                    b'C' => KeyCode::Right,
-                    _ => KeyCode::Left,
-                };
-                let modifier = params
-                    .split(';')
-                    .nth(1)
-                    .and_then(|s| s.parse::<u8>().ok())
-                    .unwrap_or(1);
-                Some(TermEvent::Key(KeyEvent::new(code, mod_to_flags_xterm(modifier))))
-            }
-            b'M' | b'm' => {
-                let button = params
-                    .trim_start_matches('<')
-                    .split(';')
-                    .next()?
-                    .parse::<u32>()
-                    .ok()?;
-                let kind = match button {
-                    64 => MouseEventKind::ScrollUp,
-                    65 => MouseEventKind::ScrollDown,
-                    _ => return None,
-                };
-                Some(TermEvent::Mouse(MouseEvent { kind }))
-            }
-            _ => None,
-        }
-    }
-}
-
-#[cfg(test)]
-fn mod_to_flags(modifier: u8) -> KeyModifiers {
-    match modifier {
-        2 => KeyModifiers::SHIFT,
-        3 => KeyModifiers::ALT,
-        4 => KeyModifiers::SHIFT | KeyModifiers::ALT,
-        5 => KeyModifiers::CONTROL,
-        6 => KeyModifiers::SHIFT | KeyModifiers::CONTROL,
-        7 => KeyModifiers::ALT | KeyModifiers::CONTROL,
-        8 => KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
-        _ => KeyModifiers::NONE,
-    }
-}
-
-#[cfg(test)]
-fn mod_to_flags_xterm(modifier: u8) -> KeyModifiers {
-    match modifier {
-        2 => KeyModifiers::SHIFT,
-        3 => KeyModifiers::ALT,
-        4 => KeyModifiers::CONTROL,
-        5 => KeyModifiers::SHIFT | KeyModifiers::ALT,
-        6 => KeyModifiers::SHIFT | KeyModifiers::CONTROL,
-        7 => KeyModifiers::ALT | KeyModifiers::CONTROL,
-        8 => KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
-        _ => KeyModifiers::NONE,
-    }
-}
-
-#[cfg(test)]
-fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
-    Some(match codepoint {
-        3 | 13 | 57414 => KeyCode::Enter,
-        9 => KeyCode::Tab,
-        27 => KeyCode::Esc,
-        127 => KeyCode::Backspace,
-        32..=126 => KeyCode::Char(codepoint as u8 as char),
-        57417 => KeyCode::Left,
-        57418 => KeyCode::Right,
-        57419 => KeyCode::Up,
-        57420 => KeyCode::Down,
-        57421 => KeyCode::PageUp,
-        57422 => KeyCode::PageDown,
-        57423 => KeyCode::Home,
-        57424 => KeyCode::End,
-        57425 => KeyCode::Insert,
-        57426 => KeyCode::Delete,
-        57376..=57395 => KeyCode::F((codepoint - 57376 + 13) as u8),
-        _ => return None,
-    })
-}
 
 fn input_visual_ranges(chars: &[char], width: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
@@ -1955,12 +1667,296 @@ pub async fn run(
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::event::keyboard::MouseEvent;
     use crate::message::Message;
     use crate::stream::ChunkTokens;
     use crate::transcript::TuiRenderer;
 
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
+
+struct InputParser {
+    pending: Vec<u8>,
+}
+
+impl InputParser {
+    fn new() -> Self {
+        Self { pending: Vec::new() }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) -> Vec<TermEvent> {
+        self.pending.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(event) = self.next_event() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn flush_escape(&mut self) -> Vec<TermEvent> {
+        if self.pending == [0x1Bu8] {
+            self.pending.clear();
+            vec![TermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn next_event(&mut self) -> Option<TermEvent> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        if self.pending[0] == 0x1B {
+            self.parse_escape()
+        } else {
+            self.parse_byte()
+        }
+    }
+
+    fn control_byte(&self, b: u8) -> Option<(KeyCode, KeyModifiers)> {
+        Some(match b {
+            0x0D => (KeyCode::Enter, KeyModifiers::NONE),
+            0x0A => (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            0x09 => (KeyCode::Tab, KeyModifiers::NONE),
+            0x7F => (KeyCode::Backspace, KeyModifiers::NONE),
+            0x00 => (KeyCode::Char(' '), KeyModifiers::CONTROL),
+            0x01..=0x1A => (
+                KeyCode::Char((b - 0x01 + b'a') as char),
+                KeyModifiers::CONTROL,
+            ),
+            0x1C..=0x1F => (
+                KeyCode::Char((b - 0x1C + b'4') as char),
+                KeyModifiers::CONTROL,
+            ),
+            _ => return None,
+        })
+    }
+
+    fn parse_byte(&mut self) -> Option<TermEvent> {
+        let b = self.pending[0];
+        if b >= 0x80 {
+            let len = match b & 0xF8 {
+                0xF0 => 4,
+                0xE0 => 3,
+                0xC0 => 2,
+                _ => 1,
+            };
+            if self.pending.len() < len {
+                return None;
+            }
+            let bytes = self.pending[..len].to_vec();
+            self.pending.drain(..len);
+            let c = String::from_utf8(bytes).ok()?.chars().next()?;
+            let modifiers = if c.is_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            return Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)));
+        }
+        self.pending.remove(0);
+        if let Some((code, modifiers)) = self.control_byte(b) {
+            return Some(TermEvent::Key(KeyEvent::new(code, modifiers)));
+        }
+        let c = b as char;
+        let modifiers = if c.is_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)))
+    }
+
+    fn parse_escape(&mut self) -> Option<TermEvent> {
+        if self.pending.len() == 1 {
+            return None;
+        }
+        match self.pending[1] {
+            0x1B => {
+                self.pending.drain(..2);
+                Some(TermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT)))
+            }
+            b'[' => self.parse_csi(),
+            b'O' => self.parse_ss3(),
+            c @ 0x20..=0x7E => {
+                self.pending.drain(..2);
+                let c = c as char;
+                let modifiers = if c.is_uppercase() {
+                    KeyModifiers::ALT | KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::ALT
+                };
+                Some(TermEvent::Key(KeyEvent::new(KeyCode::Char(c), modifiers)))
+            }
+            c @ 0x00..=0x1F => {
+                self.pending.drain(..2);
+                let (code, modifiers) = self.control_byte(c)?;
+                Some(TermEvent::Key(KeyEvent::new(code, modifiers | KeyModifiers::ALT)))
+            }
+            _ => {
+                self.pending.remove(0);
+                self.next_event()
+            }
+        }
+    }
+
+    fn parse_ss3(&mut self) -> Option<TermEvent> {
+        if self.pending.len() < 3 {
+            return None;
+        }
+        let b = self.pending[2];
+        self.pending.drain(..3);
+        Some(match b {
+            b'A' => TermEvent::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            b'B' => TermEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            b'C' => TermEvent::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            b'D' => TermEvent::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            b'H' => TermEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            b'F' => TermEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            b'P'..=b'S' => TermEvent::Key(KeyEvent::new(KeyCode::F(1 + (b - b'P')), KeyModifiers::NONE)),
+            _ => return None,
+        })
+    }
+
+    fn parse_csi(&mut self) -> Option<TermEvent> {
+        if self.pending.len() > 32 {
+            self.pending.clear();
+            return None;
+        }
+        let final_idx = self.pending[2..]
+            .iter()
+            .position(|&b| (0x40..=0x7E).contains(&b))?;
+        let total = 2 + final_idx + 1;
+        if self.pending.len() < total {
+            return None;
+        }
+        let seq = String::from_utf8_lossy(&self.pending[2..total]).into_owned();
+        self.pending.drain(..total);
+        self.parse_csi_seq(&seq)
+    }
+
+    fn parse_csi_seq(&self, seq: &str) -> Option<TermEvent> {
+        let bytes = seq.as_bytes();
+        let final_byte = bytes[bytes.len() - 1];
+        let params = &seq[..seq.len() - 1];
+        match final_byte {
+            b'~' => {
+                if let Some(rest) = params.strip_prefix("27;") {
+                    let (mod_s, key_s) = rest.split_once(';')?;
+                    let modifier = mod_to_flags_xterm(mod_s.parse().ok()?);
+                    let code = codepoint_to_keycode(key_s.parse().ok()?)?;
+                    Some(TermEvent::Key(KeyEvent::new(code, modifier)))
+                } else {
+                    let n: u32 = params.parse().ok()?;
+                    let code = match n {
+                        1 | 7 => KeyCode::Home,
+                        2 => KeyCode::Insert,
+                        3 => KeyCode::Delete,
+                        4 | 8 => KeyCode::End,
+                        5 => KeyCode::PageUp,
+                        6 => KeyCode::PageDown,
+                        11..=15 => KeyCode::F((n - 10) as u8),
+                        17..=21 => KeyCode::F((n - 11) as u8),
+                        23..=26 => KeyCode::F((n - 12) as u8),
+                        28..=29 => KeyCode::F((n - 15) as u8),
+                        31..=34 => KeyCode::F((n - 17) as u8),
+                        _ => return None,
+                    };
+                    Some(TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                }
+            }
+            b'u' => {
+                if params.starts_with('?') {
+                    return None;
+                }
+                let mut parts = params.split(';');
+                let code = codepoint_to_keycode(parts.next()?.parse().ok()?)?;
+                let modifier = parts
+                    .next()
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(1);
+                Some(TermEvent::Key(KeyEvent::new(code, mod_to_flags(modifier))))
+            }
+            b'A' | b'B' | b'C' | b'D' => {
+                let code = match final_byte {
+                    b'A' => KeyCode::Up,
+                    b'B' => KeyCode::Down,
+                    b'C' => KeyCode::Right,
+                    _ => KeyCode::Left,
+                };
+                let modifier = params
+                    .split(';')
+                    .nth(1)
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .unwrap_or(1);
+                Some(TermEvent::Key(KeyEvent::new(code, mod_to_flags_xterm(modifier))))
+            }
+            b'M' | b'm' => {
+                let button = params
+                    .trim_start_matches('<')
+                    .split(';')
+                    .next()?
+                    .parse::<u32>()
+                    .ok()?;
+                let kind = match button {
+                    64 => MouseEventKind::ScrollUp,
+                    65 => MouseEventKind::ScrollDown,
+                    _ => return None,
+                };
+                Some(TermEvent::Mouse(MouseEvent { kind }))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn mod_to_flags(modifier: u8) -> KeyModifiers {
+    match modifier {
+        2 => KeyModifiers::SHIFT,
+        3 => KeyModifiers::ALT,
+        4 => KeyModifiers::SHIFT | KeyModifiers::ALT,
+        5 => KeyModifiers::CONTROL,
+        6 => KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        7 => KeyModifiers::ALT | KeyModifiers::CONTROL,
+        8 => KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+        _ => KeyModifiers::NONE,
+    }
+}
+
+fn mod_to_flags_xterm(modifier: u8) -> KeyModifiers {
+    match modifier {
+        2 => KeyModifiers::SHIFT,
+        3 => KeyModifiers::ALT,
+        4 => KeyModifiers::CONTROL,
+        5 => KeyModifiers::SHIFT | KeyModifiers::ALT,
+        6 => KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        7 => KeyModifiers::ALT | KeyModifiers::CONTROL,
+        8 => KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+        _ => KeyModifiers::NONE,
+    }
+}
+
+fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
+    Some(match codepoint {
+        3 | 13 | 57414 => KeyCode::Enter,
+        9 => KeyCode::Tab,
+        27 => KeyCode::Esc,
+        127 => KeyCode::Backspace,
+        32..=126 => KeyCode::Char(codepoint as u8 as char),
+        57417 => KeyCode::Left,
+        57418 => KeyCode::Right,
+        57419 => KeyCode::Up,
+        57420 => KeyCode::Down,
+        57421 => KeyCode::PageUp,
+        57422 => KeyCode::PageDown,
+        57423 => KeyCode::Home,
+        57424 => KeyCode::End,
+        57425 => KeyCode::Insert,
+        57426 => KeyCode::Delete,
+        57376..=57395 => KeyCode::F((codepoint - 57376 + 13) as u8),
+        _ => return None,
+    })
+}
 
     fn lines(events: Vec<AgentEvent>) -> Vec<Line<'static>> {
         let mut renderer = TuiRenderer::new();
