@@ -225,19 +225,6 @@ pub enum KeyAction {
 
 const PAGE: usize = 10;
 
-fn task_output_scroll_max(state: &TuiState) -> usize {
-    let Some(id) = &state.task_output_id else {
-        return 0;
-    };
-    let Some(task) = crate::bg::REGISTRY.list().into_iter().find(|t| t.id == *id) else {
-        return 0;
-    };
-    let text = std::fs::read_to_string(&task.output_path).unwrap_or_default();
-    let total = text.lines().count();
-    let visible = state.viewport.saturating_sub(10);
-    total.saturating_sub(visible)
-}
-
 const PANEL_BASE: Color = Color::Rgb(0xc0, 0xc0, 0xd0);
 
 pub(crate) fn render_panel<'a>(
@@ -421,18 +408,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         if let Some(action) = crate::components::code_review::mouse(state, mouse) {
             return action;
         }
-        if state.task_output_id.is_some() {
-            let max = task_output_scroll_max(state);
-            return match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    state.task_output_scroll.toward_top(3);
-                    KeyAction::None
-                }
-                MouseEventKind::ScrollDown => {
-                    state.task_output_scroll.toward_bottom(3, max);
-                    KeyAction::None
-                }
-            };
+        if let Some(action) = crate::components::task_detail::mouse(state, mouse) {
+            return action;
         }
         let (pane_width, viewport) = (state.pane_width, state.viewport);
         let session = state.session();
@@ -468,49 +445,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return KeyAction::Quit;
     }
-    if state.task_output_id.is_some() {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('q') => {
-                    state.task_output_id = None;
-                    state.tasks_open = false;
-                    KeyAction::None
-                }
-                _ => KeyAction::None,
-            };
-        }
-        let scroll_max = task_output_scroll_max(state);
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                state.task_output_id = None;
-                KeyAction::None
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                state.task_output_scroll.toward_bottom(3, scroll_max);
-                KeyAction::None
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                state.task_output_scroll.toward_top(3);
-                KeyAction::None
-            }
-            KeyCode::PageDown => {
-                state.task_output_scroll.toward_bottom(8, scroll_max);
-                KeyAction::None
-            }
-            KeyCode::PageUp => {
-                state.task_output_scroll.toward_top(8);
-                KeyAction::None
-            }
-            KeyCode::Home => {
-                state.task_output_scroll.home();
-                KeyAction::None
-            }
-            KeyCode::End => {
-                state.task_output_scroll.end(scroll_max);
-                KeyAction::None
-            }
-            _ => KeyAction::None,
-        };
+    if let Some(action) = crate::components::task_detail::handle_key(state, key) {
+        return action;
     }
     if let Some(action) = crate::components::session_picker::handle_key(state, key) {
         return action;
@@ -572,67 +508,8 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     if let Some(action) = crate::components::code_review::handle_key(state, key) {
         return action;
     }
-    if state.tasks_open {
-        let tasks = crate::bg::REGISTRY.list();
-        let len = tasks.len();
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('j') => {
-                    state.tasks_cursor.down(len);
-                    KeyAction::None
-                }
-                KeyCode::Char('k') => {
-                    state.tasks_cursor.up(len);
-                    KeyAction::None
-                }
-                KeyCode::Char('s') => {
-                    state.picker_open = true;
-                    state.tasks_open = false;
-                    KeyAction::None
-                }
-                KeyCode::Char('q') => {
-                    state.tasks_open = false;
-                    KeyAction::None
-                }
-                _ => KeyAction::None,
-            };
-        }
-        return match key.code {
-            KeyCode::Up => {
-                state.tasks_cursor.up(len);
-                KeyAction::None
-            }
-            KeyCode::Down => {
-                state.tasks_cursor.down(len);
-                KeyAction::None
-            }
-            KeyCode::Char('j') => {
-                state.tasks_cursor.down(len);
-                KeyAction::None
-            }
-            KeyCode::Char('k') => {
-                state.tasks_cursor.up(len);
-                KeyAction::None
-            }
-            KeyCode::Char('x') => {
-                if let Some(task) = tasks.get(state.tasks_cursor.pos) {
-                    let _ = crate::bg::REGISTRY.kill(&task.id);
-                }
-                KeyAction::None
-            }
-            KeyCode::Enter => {
-                if let Some(task) = tasks.get(state.tasks_cursor.pos) {
-                    state.task_output_id = Some(task.id.clone());
-                    state.task_output_scroll = Scroller::at_tail();
-                }
-                KeyAction::None
-            }
-            KeyCode::Char('q') | KeyCode::Esc => {
-                state.tasks_open = false;
-                KeyAction::None
-            }
-            _ => KeyAction::None,
-        };
+    if let Some(action) = crate::components::task_list::handle_key(state, key) {
+        return action;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if key.code == KeyCode::Char('p') {
@@ -1863,76 +1740,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     }
 
     if state.tasks_open && state.task_output_id.is_none() {
-        let tasks = crate::bg::REGISTRY.list();
-        let height = chunks[1].height;
-        let visible = height.saturating_sub(3) as usize;
-        let start = if tasks.len() <= visible {
-            0
-        } else {
-            let mut s = state.tasks_cursor.pos.saturating_sub(visible / 2);
-            if s + visible > tasks.len() {
-                s = tasks.len() - visible;
-            }
-            s
-        };
-        let width = chunks[1].width;
-        let x = chunks[1].x;
-        let y = chunks[1].y;
-        let lines: Vec<Line> = if tasks.is_empty() {
-            vec![Line::from(Span::styled(
-                " no tasks",
-                Style::default().fg(Color::Rgb(102, 102, 102)),
-            ))]
-        } else {
-            tasks
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(visible)
-                .map(|(i, task)| {
-                    let selected = i + start == state.tasks_cursor.pos;
-                    let status = match &task.status {
-                        crate::bg::BgStatus::Running => "running  ".to_string(),
-                        crate::bg::BgStatus::Finished(None) => "killed   ".to_string(),
-                        crate::bg::BgStatus::Finished(Some(0)) => "exit 0   ".to_string(),
-                        crate::bg::BgStatus::Finished(Some(code)) => format!("exit {code:<4}"),
-                    };
-                    let duration = task
-                        .finished_at
-                        .map(|finished| finished.duration_since(task.started_at))
-                        .unwrap_or_else(|| {
-                            std::time::Instant::now().duration_since(task.started_at)
-                        });
-                    let style = if selected {
-                        Style::default().bold().fg(Color::Rgb(95, 135, 255))
-                    } else {
-                        Style::default()
-                    };
-                    let marker = if selected { "›" } else { " " };
-                    let command: String = task.command.chars().take(60).collect();
-                    Line::from(vec![
-                        Span::styled(format!(" {marker} {}  ", task.id), style),
-                        Span::styled(status, style),
-                        Span::styled(format!("{}  ", crate::bg::format_duration(duration)), style),
-                        Span::styled(command, style),
-                    ])
-                })
-                .collect()
-        };
-        let hint = Line::from(Span::styled(
-            " jk · x kill · q close",
-            Style::default().fg(Color::Rgb(102, 102, 102)),
-        ));
-        render_panel(
-            frame,
-            Rect::new(x, y, width, height),
-            " background tasks ".to_string(),
-            lines
-                .into_iter()
-                .chain(std::iter::once(hint))
-                .collect::<Vec<Line>>(),
-            false,
-        );
+        crate::components::task_list::draw(frame, state, chunks[1]);
     }
 
     if state.plan_open {
@@ -1994,68 +1802,8 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         crate::components::code_review::draw(frame, state, chunks[1]);
     }
 
-    if let Some(id) = &state.task_output_id {
-        let tasks = crate::bg::REGISTRY.list();
-        if let Some(task) = tasks.iter().find(|t| t.id == *id) {
-            let text = std::fs::read_to_string(&task.output_path).unwrap_or_default();
-            let lines: Vec<&str> = text.lines().collect();
-            let width = chunks[1].width;
-            let height = chunks[1].height;
-            let x = chunks[1].x;
-            let y = chunks[1].y;
-            let visible = height as usize - 4;
-            let total = lines.len();
-            let max = total.saturating_sub(visible);
-            let start = if state.task_output_scroll.following() {
-                max
-            } else {
-                state.task_output_scroll.offset().min(max)
-            };
-            let status = match &task.status {
-                crate::bg::BgStatus::Running => "running".to_string(),
-                crate::bg::BgStatus::Finished(None) => "killed".to_string(),
-                crate::bg::BgStatus::Finished(Some(0)) => "exit 0".to_string(),
-                crate::bg::BgStatus::Finished(Some(code)) => format!("exit {code}"),
-            };
-            let mut body: Vec<Line> = vec![Line::from(vec![
-                Span::styled(format!("$ {}", task.command), Style::default().bold()),
-                Span::styled(
-                    format!("  ·  {}", status),
-                    Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe)),
-                ),
-            ])];
-            if total == 0 {
-                body.push(Line::from(Span::styled(
-                    if matches!(task.status, crate::bg::BgStatus::Running) {
-                        " (no output yet — task is running) "
-                    } else {
-                        " (no output) "
-                    },
-                    Style::default().fg(Color::Rgb(102, 102, 102)),
-                )));
-            } else {
-                body.extend(lines[start..].iter().take(visible).map(|line| {
-                    Line::from(Span::styled(
-                        *line,
-                        Style::default().fg(Color::Rgb(0x80, 0x80, 0x80)),
-                    ))
-                }));
-            }
-            let hint = Line::from(Span::styled(
-                " jk scroll · q close · C-q close all",
-                Style::default().fg(Color::Rgb(102, 102, 102)),
-            ));
-            render_panel(
-                frame,
-                Rect::new(x, y, width, height),
-                format!(" task {} output ", task.id),
-                body
-                    .into_iter()
-                    .chain(std::iter::once(hint))
-                    .collect::<Vec<Line>>(),
-                true,
-            );
-        }
+    if state.task_output_id.is_some() {
+        crate::components::task_detail::draw(frame, state, chunks[1]);
     }
 
     let input = if session.question.is_some() {
