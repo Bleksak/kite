@@ -61,6 +61,8 @@ pub enum BlockKind {
     ToolRunning,
 
     ToolDone,
+
+    Command,
 }
 
 pub struct TuiRenderer {
@@ -140,6 +142,32 @@ impl TuiRenderer {
         }
 
         self.push_line(padding_line(), BlockKind::User);
+    }
+
+    pub fn push_command(&mut self, text: &str) {
+        self.close_thinking();
+
+        self.push_line(padding_line(), BlockKind::Command);
+
+        if has_markdown(text) {
+            self.push_markdown(text, BlockKind::Command);
+        } else {
+            for line in text.trim_end_matches('\n').split('\n') {
+                if line.is_empty() {
+                    self.push_line(Line::default(), BlockKind::Command);
+                } else {
+                    self.push_line(
+                        Line::from(Span::styled(
+                            strip_vs16(line),
+                            Style::default().fg(Color::Rgb(0xf0, 0xc6, 0x74)),
+                        )),
+                        BlockKind::Command,
+                    );
+                }
+            }
+        }
+
+        self.push_line(padding_line(), BlockKind::Command);
     }
 
     pub fn replay_context(&mut self, context: &Context) {
@@ -1143,6 +1171,49 @@ mod test {
         assert_eq!(span.style.bg, None);
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(renderer.blocks()[1], BlockKind::User);
+    }
+
+    #[test]
+    fn push_command_renders_a_command_block() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_user("/help");
+        renderer.push_command("some info");
+
+        let blocks = renderer.blocks().to_vec();
+        assert!(blocks.iter().any(|b| *b == BlockKind::Command));
+        let command_lines: Vec<&Line<'static>> = renderer
+            .scrollback()
+            .iter()
+            .zip(blocks.iter())
+            .filter(|(_, b)| **b == BlockKind::Command)
+            .map(|(line, _)| line)
+            .collect();
+        let text: String = command_lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("some info"));
+    }
+
+    #[test]
+    fn push_command_with_markdown_renders_as_markdown() {
+        let mut renderer = TuiRenderer::new();
+        renderer.push_command("**bold** info");
+
+        let blocks = renderer.blocks().to_vec();
+        let command_lines: Vec<&Line<'static>> = renderer
+            .scrollback()
+            .iter()
+            .zip(blocks.iter())
+            .filter(|(_, b)| **b == BlockKind::Command)
+            .map(|(line, _)| line)
+            .collect();
+        let text: String = command_lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("bold"));
+        assert!(!text.contains("**"));
     }
 
     #[test]

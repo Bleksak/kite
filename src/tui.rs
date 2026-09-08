@@ -76,6 +76,7 @@ pub enum TermEvent {
 }
 
 use crate::agent::Agent;
+use crate::commands::Command;
 use crate::context::Context;
 use crate::mode::Mode;
 use crate::paths::CONTEXT_DIR;
@@ -2893,23 +2894,28 @@ pub async fn run(
                         let mode = *state.mode.lock().unwrap();
                         let session = &mut state.sessions[state.active];
                         session.error = None;
-                        session.running = true;
-                        let consumed = !session.review_comments.is_empty()
-                            && session.stage.unwrap_or(mode) != Mode::Plan;
-                        let task = append_review_comments(
-                            &task,
-                            mode,
-                            session.stage,
-                            &session.review_comments,
-                        );
-                        if !task.is_empty() {
+                        if let Some(command) = Command::parse(&task) {
                             session.renderer.push_user(&task);
-                        }
-                        let max = session.max_scroll(state.pane_width, state.viewport);
-                        session.scroller.end(max);
-                        inputs[&id].send(task)?;
-                        if consumed {
-                            session.review_comments.clear();
+                            session.renderer.push_command(&command.output());
+                        } else {
+                            session.running = true;
+                            let consumed = !session.review_comments.is_empty()
+                                && session.stage.unwrap_or(mode) != Mode::Plan;
+                            let task = append_review_comments(
+                                &task,
+                                mode,
+                                session.stage,
+                                &session.review_comments,
+                            );
+                            if !task.is_empty() {
+                                session.renderer.push_user(&task);
+                            }
+                            let max = session.max_scroll(state.pane_width, state.viewport);
+                            session.scroller.end(max);
+                            inputs[&id].send(task)?;
+                            if consumed {
+                                session.review_comments.clear();
+                            }
                         }
                     }
                     KeyAction::Steer(text) => {
@@ -2917,10 +2923,14 @@ pub async fn run(
                         let session = &mut state.sessions[state.active];
                         session.error = None;
                         session.renderer.push_user(&text);
-                        let max = session.max_scroll(state.pane_width, state.viewport);
-                        session.scroller.end(max);
-                        if let Some(steer) = steers.get(&id) {
-                            steer.push(text);
+                        if let Some(command) = Command::parse(&text) {
+                            session.renderer.push_command(&command.output());
+                        } else {
+                            let max = session.max_scroll(state.pane_width, state.viewport);
+                            session.scroller.end(max);
+                            if let Some(steer) = steers.get(&id) {
+                                steer.push(text);
+                            }
                         }
                     }
                     KeyAction::Quit => break,

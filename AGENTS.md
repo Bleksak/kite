@@ -55,6 +55,10 @@
   finishes a message — a queued message at turn end starts an extra round
   instead of ending the turn)
 - C-c: quit
+- /help: show the in-app help (keybindings + commands) directly in the
+  chat — in-app commands are rendered in the chat and are never sent to
+  the model; anything else that starts with / (unknown commands, file
+  paths) is sent to the model as a normal prompt
 - Picker: C-j/↓ down, C-k/↑ up, enter select, esc cancel, C-n new session,
   C-x close the session under the cursor, C-r rename it, typing searches
   (backspace clears)

@@ -1,5 +1,6 @@
 mod agent;
 mod bg;
+mod commands;
 mod context;
 mod message;
 mod mode;
