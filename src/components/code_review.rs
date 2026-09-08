@@ -45,47 +45,15 @@ pub fn open(state: &mut TuiState) -> State {
     s
 }
 
-fn git_head_tree() -> String {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD^{tree}"])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        _ => {
-            let empty = std::process::Command::new("git")
-                .arg("mktree")
-                .stdin(std::process::Stdio::null())
-                .output();
-            match empty {
-                Ok(output) if output.status.success() => {
-                    String::from_utf8_lossy(&output.stdout).trim().to_string()
-                }
-                _ => String::new(),
-            }
-        }
-    }
-}
-
 fn review_diff_text(baseline: Option<&str>) -> String {
-    let Some(current) = crate::plan_gate::git_snapshot_tree(None) else {
+    let Some(current) = crate::git::snapshot_tree(None) else {
         return "not a git repository".to_string();
     };
-    let baseline = baseline.map(|b| b.to_string()).unwrap_or_else(git_head_tree);
+    let baseline = baseline.map(|b| b.to_string()).unwrap_or_else(crate::git::head_tree);
     if baseline.is_empty() {
         return "git has no baseline".to_string();
     }
-    match std::process::Command::new("git")
-        .args(["diff", &baseline, &current])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        }
-        Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
-        Err(source) => format!("git failed: {source}"),
-    }
+    crate::git::diff(&baseline, &current)
 }
 
 fn diff_file_sections(text: &str) -> Vec<(String, String)> {

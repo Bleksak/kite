@@ -5,6 +5,7 @@ mod components;
 mod auto_complete;
 mod context;
 mod event;
+mod git;
 mod message;
 mod mode;
 mod paths;
