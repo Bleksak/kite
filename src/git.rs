@@ -37,25 +37,17 @@ pub fn snapshot_tree(cwd: Option<&Path>) -> Option<String> {
 }
 
 pub fn head_tree() -> String {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD^{tree}"])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        _ => {
-            let empty = std::process::Command::new("git")
-                .arg("mktree")
-                .stdin(std::process::Stdio::null())
-                .output();
-            match empty {
-                Ok(output) if output.status.success() => {
-                    String::from_utf8_lossy(&output.stdout).trim().to_string()
-                }
-                _ => String::new(),
-            }
-        }
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return String::new(),
+    };
+    let repo = match gix::open(&cwd) {
+        Ok(repo) => repo,
+        Err(_) => return String::new(),
+    };
+    match repo.head_tree_id_or_empty() {
+        Ok(id) => id.to_string(),
+        Err(_) => String::new(),
     }
 }
 
@@ -74,7 +66,81 @@ pub fn diff(from: &str, to: &str) -> String {
 
 #[cfg(test)]
 mod test {
-    use super::snapshot_tree;
+    use super::{head_tree, snapshot_tree};
+
+    fn temp_repo(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kite-git-{}-{}-{}",
+            prefix,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["init", "-q"]);
+        dir
+    }
+
+    fn git_empty_tree(dir: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("mktree")
+            .stdin(std::process::Stdio::null())
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn head_tree_of_a_fresh_repo_matches_git_empty_tree() {
+        let dir = temp_repo("head-fresh");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let expected = git_empty_tree(&dir);
+        let before = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let got = head_tree();
+        std::env::set_current_dir(before).unwrap();
+        assert_eq!(got, expected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn head_tree_matches_git_after_a_commit() {
+        let dir = temp_repo("head-commit");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "c"]);
+        let expected = git(&["rev-parse", "HEAD^{tree}"]).trim().to_string();
+        let before = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let got = head_tree();
+        std::env::set_current_dir(before).unwrap();
+        assert_eq!(got, expected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn snapshot_captures_new_and_modified_files() {
