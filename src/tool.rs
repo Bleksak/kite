@@ -188,6 +188,16 @@ fn cap_output(text: String) -> String {
     format!("[truncated {start} bytes]\n{}", &text[start..])
 }
 
+struct KillOnDrop(Option<tokio::process::Child>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 impl Tool {
     pub fn label(&self) -> &'static str {
         match &self {
@@ -438,11 +448,13 @@ impl Tool {
     }
 
     async fn run_captured(
-        mut child: tokio::process::Child,
+        child: tokio::process::Child,
         timeout: Duration,
         tool: &'static str,
     ) -> Result<String, ToolError> {
+        let mut guard = KillOnDrop(Some(child));
         let collected = tokio::time::timeout(timeout, async {
+            let child = guard.0.as_mut().unwrap();
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             if let Some(mut out) = child.stdout.take() {
@@ -460,7 +472,9 @@ impl Tool {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => return Err(error),
             Err(_) => {
-                let _ = child.kill().await;
+                if let Some(mut child) = guard.0.take() {
+                    let _ = child.kill().await;
+                }
                 return Err(ToolError::TimedOut {
                     tool,
                     seconds: timeout.as_secs(),
@@ -769,11 +783,16 @@ fn parameters(tool: &Tool) -> serde_json::Value {
 
 #[cfg(test)]
 mod test {
-    use crate::tool::{Tool, ToolError, Question, QuestionKind, PlanStage, plan_text, parse_stages, tool_definitions};
+    use crate::tool::{
+        KillOnDrop, Tool, ToolError, Question, QuestionKind, PlanStage, plan_text, parse_stages,
+        tool_definitions,
+    };
     use openai_oxide::types::chat::{FunctionCall, ToolCall as OpenAIToolCall};
     use std::io::{Read, Write};
+    use std::process::Stdio;
     use std::time::Duration;
     use test_files::TestFiles;
+    use tokio::process::Command;
 
     fn timeout() -> Duration {
         Duration::from_secs(30)
@@ -1170,6 +1189,43 @@ version: 3"#,
                 seconds: 1
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_guard_kills_the_child() {
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let guard = KillOnDrop(Some(child));
+        drop(guard);
+        let mut dead = false;
+        for _ in 0..200 {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => {
+                    let state = stat
+                        .rsplit(')')
+                        .next()
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .unwrap_or_default();
+                    if state == "Z" || state.is_empty() {
+                        dead = true;
+                        break;
+                    }
+                }
+                Err(_) => {
+                    dead = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(dead, "child {pid} was not killed by dropping the guard");
     }
 
     #[tokio::test]

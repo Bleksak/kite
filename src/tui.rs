@@ -215,9 +215,11 @@ impl TuiState {
 pub enum KeyAction {
     None,
     Submit(String),
+    Steer(String),
     Quit,
     NewSession,
     CloseSession,
+    Cancel,
 }
 
 const PAGE: usize = 10;
@@ -558,6 +560,7 @@ fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent> {
     match event {
         termwiz::input::InputEvent::Key(key_event) => {
             let code = match key_event.key {
+                TermwizKeyCode::Char('\x1b') => KeyCode::Esc,
                 TermwizKeyCode::Char('\r') => KeyCode::Enter,
                 TermwizKeyCode::Char(c) => KeyCode::Char(c),
                 TermwizKeyCode::Enter => KeyCode::Enter,
@@ -610,6 +613,14 @@ fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent> {
 }
 
 pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
+    if let TermEvent::Key(key) = event {
+        if key.code == KeyCode::Esc
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && state.session().running
+        {
+            return KeyAction::Cancel;
+        }
+    }
     if let TermEvent::Mouse(mouse) = event {
         if state.plan_open {
             let max = plan_scroll_max(state);
@@ -1253,6 +1264,50 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             }
             KeyCode::End => {
                 to_bottom(session, pane_width, viewport);
+                KeyAction::None
+            }
+            KeyCode::Enter
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                if session.input.is_empty() {
+                    KeyAction::None
+                } else {
+                    let text = mem::take(&mut session.input);
+                    session.input_cursor = 0;
+                    session.error = None;
+                    KeyAction::Steer(text)
+                }
+            }
+            KeyCode::Enter => {
+                insert_newline(session);
+                KeyAction::None
+            }
+            KeyCode::Backspace => {
+                if session.input_cursor > 0 {
+                    session.input_cursor -= 1;
+                    let mut chars: Vec<char> = session.input.chars().collect();
+                    chars.remove(session.input_cursor);
+                    session.input = chars.into_iter().collect();
+                    session.error = None;
+                }
+                KeyAction::None
+            }
+            KeyCode::Left => {
+                session.input_cursor = session.input_cursor.saturating_sub(1);
+                KeyAction::None
+            }
+            KeyCode::Right => {
+                session.input_cursor = (session.input_cursor + 1).min(session.input.chars().count());
+                KeyAction::None
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut chars: Vec<char> = session.input.chars().collect();
+                chars.insert(session.input_cursor, c);
+                session.input_cursor += 1;
+                session.input = chars.into_iter().collect();
+                session.error = None;
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -2556,9 +2611,9 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
             session.question.as_ref().unwrap(),
             state.pane_width,
         ))
-    } else if session.running {
+    } else if session.running && session.input.is_empty() {
         Paragraph::new(Line::from(Span::styled(
-            "working…".to_string(),
+            "working… · enter steer · ctrl+esc cancel".to_string(),
             Style::default().dim(),
         )))
     } else if let Some(error) = &session.error {
@@ -2691,13 +2746,17 @@ pub async fn run(
         .unwrap_or(22);
     let mut inputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<String>> = HashMap::new();
     let mut handles: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
+    let mut cancels: HashMap<u64, (tokio::sync::watch::Sender<u64>, u64)> = HashMap::new();
+    let mut steers: HashMap<u64, crate::agent::Steering> = HashMap::new();
 
     for session in &state.sessions {
         let restored = session.context.clone();
-        let (input_tx, input_handle) =
+        let (input_tx, input_handle, cancel_tx, steer_tx) =
             spawn_agent(session.id, new_agent.clone(), restored, agent_tx.clone());
         inputs.insert(session.id, input_tx);
         handles.insert(session.id, input_handle);
+        cancels.insert(session.id, (cancel_tx, 0));
+        steers.insert(session.id, steer_tx);
     }
 
     for session in &mut state.sessions {
@@ -2735,6 +2794,7 @@ pub async fn run(
                         handle.abort();
                     }
                     inputs.remove(&id);
+                    cancels.remove(&id);
                     let pos = state.sessions.iter().position(|s| s.id == id).unwrap();
                     state.sessions.remove(pos);
                     if state.active > pos && state.active > 0 {
@@ -2852,13 +2912,26 @@ pub async fn run(
                             session.review_comments.clear();
                         }
                     }
+                    KeyAction::Steer(text) => {
+                        let id = state.sessions[state.active].id;
+                        let session = &mut state.sessions[state.active];
+                        session.error = None;
+                        session.renderer.push_user(&text);
+                        let max = session.max_scroll(state.pane_width, state.viewport);
+                        session.scroller.end(max);
+                        if let Some(steer) = steers.get(&id) {
+                            steer.push(text);
+                        }
+                    }
                     KeyAction::Quit => break,
                     KeyAction::NewSession => {
                         let id = state.sessions[state.active].id;
-                        let (input_tx, input_handle) =
+                        let (input_tx, input_handle, cancel_tx, steer_tx) =
                             spawn_agent(id, new_agent.clone(), None, agent_tx.clone());
                         inputs.insert(id, input_tx);
                         handles.insert(id, input_handle);
+                        cancels.insert(id, (cancel_tx, 0));
+                        steers.insert(id, steer_tx);
                     }
                     KeyAction::CloseSession => {
                         let removed = ids_before
@@ -2869,7 +2942,17 @@ pub async fn run(
                                 handle.abort();
                             }
                             inputs.remove(&id);
+                            cancels.remove(&id);
+                            steers.remove(&id);
                             session_store::remove_session_file(Path::new(CONTEXT_DIR), id);
+                        }
+                    }
+                    KeyAction::Cancel => {
+                        let session = state.session();
+                        session.question = None;
+                        if let Some((tx, counter)) = cancels.get_mut(&session.id) {
+                            *counter += 1;
+                            let _ = tx.send(*counter);
                         }
                     }
                     KeyAction::None => {}
@@ -3021,6 +3104,82 @@ mod test {
 
     fn shift(c: char) -> TermEvent {
         TermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT))
+    }
+
+    #[test]
+    fn ctrl_esc_csi_u_sequence_maps_to_esc_with_control() {
+        let mut parser = termwiz::input::InputParser::new();
+        let mut events = Vec::new();
+        parser.parse(
+            b"\x1b[27;5u",
+            |event| {
+                if let Some(mapped) = map_termwiz_event(event) {
+                    events.push(mapped);
+                }
+            },
+            false,
+        );
+        assert_eq!(events.len(), 1);
+        let TermEvent::Key(key) = &events[0] else {
+            panic!("expected a key event");
+        };
+        assert_eq!(key.code, KeyCode::Esc);
+        assert!(key.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn ctrl_esc_while_running_cancels_the_turn() {
+        let mut state = TuiState::new("model".into());
+        state.session().running = true;
+
+        assert_eq!(
+            handle_key(&mut state, &ctrl_key(KeyCode::Esc)),
+            KeyAction::Cancel
+        );
+    }
+
+    #[test]
+    fn ctrl_esc_when_idle_is_a_noop() {
+        let mut state = TuiState::new("model".into());
+
+        assert_eq!(
+            handle_key(&mut state, &ctrl_key(KeyCode::Esc)),
+            KeyAction::None
+        );
+    }
+
+    #[test]
+    fn typing_while_running_goes_into_the_input() {
+        let mut state = TuiState::new("model".into());
+        state.session().running = true;
+
+        handle_key(&mut state, &TermEvent::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)));
+
+        assert_eq!(state.session().input, "s");
+    }
+
+    #[test]
+    fn enter_while_running_steers_the_turn_and_clears_the_input() {
+        let mut state = TuiState::new("model".into());
+        state.session().running = true;
+        state.session().input = "steer me".into();
+
+        assert_eq!(
+            handle_key(&mut state, &TermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
+            KeyAction::Steer("steer me".into())
+        );
+        assert_eq!(state.session().input, "");
+    }
+
+    #[test]
+    fn empty_enter_while_running_is_a_noop() {
+        let mut state = TuiState::new("model".into());
+        state.session().running = true;
+
+        assert_eq!(
+            handle_key(&mut state, &TermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
+            KeyAction::None
+        );
     }
 
     #[test]
@@ -4759,20 +4918,10 @@ mod test {
     }
 
     #[test]
-    fn typing_is_ignored_while_running() {
+    fn ctrl_c_quits_while_running() {
         let mut state = TuiState::new("model".into());
         state.session().running = true;
-        state.session().input = "keep".into();
 
-        assert_eq!(
-            handle_key(&mut state, &key(KeyCode::Char('a'))),
-            KeyAction::None
-        );
-        assert_eq!(state.session().input, "keep");
-        assert_eq!(
-            handle_key(&mut state, &key(KeyCode::Enter)),
-            KeyAction::None
-        );
         assert_eq!(
             handle_key(
                 &mut state,

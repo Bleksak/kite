@@ -47,6 +47,13 @@
   whole file (rendered under the file name; x on the file name removes it), r toggle the file as reviewed (✓ in the title), x remove the
   comment whose line range contains the cursor line, PgUp/PgDn/wheel scroll,
   g/q/esc close it
+- C-esc: cancel the running turn — stops streaming, kills in-flight tools
+  (recorded as "cancelled"), keeps the session for the next prompt
+- While a turn is running, typing goes into the input box and Enter steers
+  the turn: the message is queued and the model picks it up at the next
+  block boundary (end of a tool call round, or right after the model
+  finishes a message — a queued message at turn end starts an extra round
+  instead of ending the turn)
 - C-c: quit
 - Picker: C-j/↓ down, C-k/↑ up, enter select, esc cancel, C-n new session,
   C-x close the session under the cursor, C-r rename it, typing searches

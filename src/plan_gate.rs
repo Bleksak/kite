@@ -168,6 +168,8 @@ async fn handle_outcome(
     stage_index: &mut usize,
     from_gate: Option<GatePhase>,
     mut outcome: crate::agent::ChatOutcome,
+    cancel: &std::sync::Arc<tokio::sync::watch::Receiver<u64>>,
+    steering: &crate::agent::Steering,
 ) {
     loop {
         match &outcome {
@@ -226,7 +228,10 @@ async fn handle_outcome(
             crate::agent::ChatOutcome::Terminated {
                 tool: crate::tool::Tool::Escalate(findings),
             } => {
-                *agent = new_agent().with_pinned_mode(Mode::Plan);
+                *agent = new_agent()
+                    .with_pinned_mode(Mode::Plan)
+                    .with_cancel(cancel.clone())
+                    .with_steering(steering.clone());
                 let _ = event_tx.send(TuiEvent::StageChanged {
                     session: id,
                     mode: Some(Mode::Plan),
@@ -250,6 +255,14 @@ async fn handle_outcome(
                     })
                     .await
                 {
+                    Ok(crate::agent::ChatOutcome::Cancelled) => {
+                        let context = agent.context.clone();
+                        let _ = event_tx.send(TuiEvent::TurnDone {
+                            session: id,
+                            context,
+                        });
+                        return;
+                    }
                     Ok(next) => {
                         outcome = next;
                         continue;
@@ -294,7 +307,7 @@ async fn handle_outcome(
                     return;
                 }
                 if agent.stage_mode() == Some(Mode::Implement) {
-                    *agent = new_agent();
+                    *agent = new_agent().with_cancel(cancel.clone()).with_steering(steering.clone());
                     let _ = event_tx.send(TuiEvent::StageChanged {
                         session: id,
                         mode: None,
@@ -327,10 +340,18 @@ pub fn spawn_agent(
 ) -> (
     tokio::sync::mpsc::UnboundedSender<String>,
     tokio::task::AbortHandle,
+    tokio::sync::watch::Sender<u64>,
+    crate::agent::Steering,
 ) {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0u64);
+    let cancel_rx = std::sync::Arc::new(cancel_rx);
+    let steering = crate::agent::Steering::new();
+    let steering_task = steering.clone();
     let task = tokio::spawn(async move {
-        let mut agent = new_agent();
+        let mut agent = new_agent()
+            .with_cancel(cancel_rx.clone())
+            .with_steering(steering_task.clone());
         if let Some(context) = restored {
             agent.context = context;
         }
@@ -354,7 +375,7 @@ pub fn spawn_agent(
                                     "📋 review Step {}: {title} — Enter to implement, type feedback to re-plan",
                                     stage_index + 1
                                 );
-                                agent = new_agent().with_pinned_mode(Mode::Plan);
+                                agent = new_agent().with_pinned_mode(Mode::Plan).with_cancel(cancel_rx.clone()).with_steering(steering_task.clone());
                                 gate = Some((message.clone(), GatePhase::ReviewStep));
                                 let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
                                 let _ = event_tx.send(TuiEvent::GatePending { session: id, message });
@@ -377,7 +398,7 @@ pub fn spawn_agent(
                                 let message = format!(
                                     "📋 review Step 1: {title} — Enter to implement, type feedback to re-plan"
                                 );
-                                agent = new_agent().with_pinned_mode(Mode::Plan);
+                                agent = new_agent().with_pinned_mode(Mode::Plan).with_cancel(cancel_rx.clone()).with_steering(steering_task.clone());
                                 gate = Some((message.clone(), GatePhase::ReviewStep));
                                 let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Plan) });
                                 let _ = event_tx.send(TuiEvent::GatePending { session: id, message });
@@ -392,7 +413,7 @@ pub fn spawn_agent(
                                     session: id,
                                     baseline,
                                 });
-                                agent = new_agent().with_pinned_mode(Mode::Implement);
+                                agent = new_agent().with_pinned_mode(Mode::Implement).with_cancel(cancel_rx.clone()).with_steering(steering_task.clone());
                                 let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: Some(Mode::Implement) });
                                 input = stage_implement_message(&stages, stage_index);
                             }
@@ -412,6 +433,13 @@ pub fn spawn_agent(
                         .await
                         .map_err(|error| error.to_string());
                     match result {
+                        Ok(crate::agent::ChatOutcome::Cancelled) => {
+                            let context = agent.context.clone();
+                            let _ = event_tx.send(TuiEvent::TurnDone {
+                                session: id,
+                                context,
+                            });
+                        }
                         Ok(outcome) => {
                             handle_outcome(
                                 &mut agent,
@@ -423,6 +451,8 @@ pub fn spawn_agent(
                                 &mut stage_index,
                                 from_gate,
                                 outcome,
+                                &cancel_rx,
+                                &steering_task,
                             )
                             .await;
                         }
@@ -447,6 +477,13 @@ pub fn spawn_agent(
                             .await
                             .map_err(|error| error.to_string());
                         match result {
+                            Ok(crate::agent::ChatOutcome::Cancelled) => {
+                                let context = agent.context.clone();
+                                let _ = tx.send(TuiEvent::TurnDone {
+                                    session: id,
+                                    context,
+                                });
+                            }
                             Ok(outcome) => {
                                 handle_outcome(
                                     &mut agent,
@@ -458,6 +495,8 @@ pub fn spawn_agent(
                                     &mut stage_index,
                                     None,
                                     outcome,
+                                    &cancel_rx,
+                                    &steering_task,
                                 )
                                 .await;
                             }
@@ -473,7 +512,7 @@ pub fn spawn_agent(
             }
         }
     });
-    (input_tx, task.abort_handle())
+    (input_tx, task.abort_handle(), cancel_tx, steering)
 }
 
 #[cfg(test)]
@@ -580,7 +619,7 @@ mod test {
             .with_pinned_mode(Mode::Plan)
         });
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (input_tx, handle) = spawn_agent(1, factory, None, event_tx);
+        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx);
 
         input_tx.send("plan me a feature".to_string()).unwrap();
         let mut events = vec![];
@@ -701,7 +740,7 @@ mod test {
             .with_pinned_mode(Mode::Plan)
         });
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (input_tx, handle) = spawn_agent(1, factory, None, event_tx);
+        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx);
         let mut events = vec![];
 
         input_tx.send("plan me".to_string()).unwrap();
@@ -791,7 +830,7 @@ mod test {
             .with_pinned_mode(Mode::Plan)
         });
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (input_tx, handle) = spawn_agent(1, factory, None, event_tx);
+        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx);
         let mut events = vec![];
 
         input_tx.send("plan me".to_string()).unwrap();
@@ -866,7 +905,7 @@ mod test {
             .with_pinned_mode(Mode::Plan)
         });
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (input_tx, handle) = spawn_agent(1, factory, None, event_tx);
+        let (input_tx, handle, _cancel_tx, _steer) = spawn_agent(1, factory, None, event_tx);
         let mut events = vec![];
 
         input_tx.send("plan me".to_string()).unwrap();

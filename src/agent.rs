@@ -4,7 +4,6 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use openai_oxide::client::OpenAI;
-use openai_oxide::error::OpenAIError;
 use openai_oxide::types::chat::{ChatCompletionRequest, StreamOptions, ToolCall};
 
 use crate::context::Context;
@@ -19,12 +18,52 @@ use crate::tool::{Tool, ToolError, ToolOutput, tool_definitions};
 pub enum ChatOutcome {
     Answer(String),
     Terminated { tool: crate::tool::Tool },
+    Cancelled,
 }
+
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 #[derive(Debug, PartialEq)]
 enum Step {
     Continue,
     Done(String),
+    Cancelled,
+}
+
+#[derive(Clone)]
+pub struct Steering {
+    queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl Steering {
+    pub fn new() -> Steering {
+        Steering {
+            queue: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        }
+    }
+
+    pub fn push(&self, text: String) {
+        self.queue.lock().unwrap().push_back(text);
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        self.queue.lock().unwrap().drain(..).collect()
+    }
+}
+
+impl Default for Steering {
+    fn default() -> Steering {
+        Steering::new()
+    }
 }
 
 pub struct Agent {
@@ -34,6 +73,8 @@ pub struct Agent {
     pub mode: Arc<Mutex<Mode>>,
     pub thinking: Option<(Arc<Mutex<ThinkingLevel>>, Option<bool>)>,
     pub bash_timeout: Duration,
+    cancel: Option<std::sync::Arc<tokio::sync::watch::Receiver<u64>>>,
+    steering: Option<Steering>,
     bg_seen: std::collections::HashSet<String>,
     bg_mine: std::collections::HashSet<String>,
 }
@@ -56,6 +97,8 @@ impl Agent {
             mode,
             thinking: None,
             bash_timeout,
+            cancel: None,
+            steering: None,
             bg_seen: std::collections::HashSet::new(),
             bg_mine: std::collections::HashSet::new(),
         }
@@ -63,6 +106,19 @@ impl Agent {
 
     pub fn with_thinking(mut self, cell: Arc<Mutex<ThinkingLevel>>, base: Option<bool>) -> Agent {
         self.thinking = Some((cell, base));
+        self
+    }
+
+    pub fn with_cancel(
+        mut self,
+        rx: std::sync::Arc<tokio::sync::watch::Receiver<u64>>,
+    ) -> Agent {
+        self.cancel = Some(rx);
+        self
+    }
+
+    pub fn with_steering(mut self, steering: Steering) -> Agent {
+        self.steering = Some(steering);
         self
     }
 
@@ -113,11 +169,18 @@ impl Agent {
         on_event: &mut impl FnMut(AgentEvent),
     ) -> Result<ChatOutcome, Box<dyn std::error::Error>> {
         self.context.system_prompt = self.mode.lock().unwrap().system_prompt().to_string();
+        let base = self.cancel.as_ref().map(|rx| *rx.borrow());
         let mut round = 0;
         loop {
             round += 1;
             if round > MAX_TOOL_ROUNDS {
                 return Err(format!("tool loop exceeded {MAX_TOOL_ROUNDS} rounds").into());
+            }
+            if self.is_cancelled(base) {
+                return Ok(ChatOutcome::Cancelled);
+            }
+            for text in self.drain_steering() {
+                self.context.messages.push(Message::User { content: text });
             }
             if self.context.needs_compaction() {
                 self.context.compact();
@@ -125,11 +188,18 @@ impl Agent {
             self.report_bg_tasks(on_event);
             on_event(AgentEvent::CompletionStarted);
 
-            let (message, usage) = self
-                .stream_completion(self.build_request(), &mut |tokens| {
+            let (message, usage) = match self
+                .stream_completion(self.build_request(), base, &mut |tokens| {
                     on_event(AgentEvent::Tokens(tokens))
                 })
-                .await?;
+                .await
+            {
+                Ok(value) => value,
+                Err(error) if error.downcast_ref::<Cancelled>().is_some() => {
+                    return Ok(ChatOutcome::Cancelled)
+                }
+                Err(error) => return Err(error),
+            };
             self.context.record_usage(usage.0, usage.1);
 
             if let Some(terminator) = self.mode.lock().unwrap().terminator()
@@ -149,9 +219,40 @@ impl Agent {
                 return Ok(ChatOutcome::Terminated { tool });
             }
 
-            if let Step::Done(text) = self.handle_response(message, on_event).await {
-                return Ok(ChatOutcome::Answer(text));
+            match self.handle_response(message, on_event).await {
+                Step::Done(text) => {
+                    let queued = self.drain_steering();
+                    if queued.is_empty() {
+                        return Ok(ChatOutcome::Answer(text));
+                    }
+                    for item in queued {
+                        self.context.messages.push(Message::User { content: item });
+                    }
+                }
+                Step::Cancelled => return Ok(ChatOutcome::Cancelled),
+                Step::Continue => {}
             }
+        }
+    }
+
+    fn is_cancelled(&self, base: Option<u64>) -> bool {
+        match (base, self.cancel.as_ref()) {
+            (Some(base), Some(rx)) => *rx.borrow() != base,
+            _ => false,
+        }
+    }
+
+    fn drain_steering(&self) -> Vec<String> {
+        self.steering.as_ref().map(|steering| steering.drain()).unwrap_or_default()
+    }
+
+    async fn cancel_wait(&self, base: Option<u64>) {
+        match (base, self.cancel.as_ref()) {
+            (Some(base), Some(rx)) => {
+                let mut rx = (**rx).clone();
+                let _ = rx.wait_for(|value| *value != base).await;
+            }
+            _ => std::future::pending::<()>().await,
         }
     }
 
@@ -202,6 +303,8 @@ impl Agent {
             tool_calls: tool_calls.clone(),
         });
 
+        let base = self.cancel.as_ref().map(|rx| *rx.borrow());
+
         let mut index = 0;
         while index < tool_calls.len() {
             let mut end = index;
@@ -211,14 +314,21 @@ impl Agent {
             if end == index {
                 end = index + 1;
             }
-            self.run_tools(&tool_calls[index..end], on_event).await;
+            if self.run_tools(&tool_calls[index..end], on_event, base).await {
+                return Step::Cancelled;
+            }
             index = end;
         }
 
         Step::Continue
     }
 
-    async fn run_tools(&mut self, calls: &[ToolCall], on_event: &mut impl FnMut(AgentEvent)) {
+    async fn run_tools(
+        &mut self,
+        calls: &[ToolCall],
+        on_event: &mut impl FnMut(AgentEvent),
+        base: Option<u64>,
+    ) -> bool {
         let mut slots: Vec<
             Result<(Tool, String, Option<tokio::sync::watch::Receiver<Option<Vec<String>>>>), String>,
         > = Vec::new();
@@ -267,7 +377,38 @@ impl Agent {
                     .map(|(tool, _, rx)| self.invoke_tool(tool, rx.as_ref()))
             })
             .collect();
-        let outputs = join_all(futures).await;
+        let join = join_all(futures);
+        let (outputs, cancelled) = match base {
+            Some(base) => {
+                let mut join = Some(join);
+                let result = tokio::select! {
+                    result = async { join.as_mut().unwrap().await } => Some(result),
+                    _ = self.cancel_wait(Some(base)) => None,
+                };
+                match result {
+                    Some(outputs) => (outputs, false),
+                    None => (Vec::new(), true),
+                }
+            }
+            None => (join.await, false),
+        };
+        if cancelled {
+            for (call, slot) in calls.iter().zip(slots) {
+                let header = match &slot {
+                    Ok((_, header, _)) => header.clone(),
+                    Err(_) => String::new(),
+                };
+                on_event(AgentEvent::ToolResult {
+                    header,
+                    body: "cancelled".into(),
+                });
+                self.context.messages.push(Message::Tool {
+                    tool_call_id: call.id.clone(),
+                    content: "cancelled".into(),
+                });
+            }
+            return true;
+        }
 
         let mut outputs = outputs.into_iter();
         for (call, slot) in calls.iter().zip(slots) {
@@ -296,6 +437,7 @@ impl Agent {
                 content,
             });
         }
+        false
     }
 
     fn invoke_tool<'a>(
@@ -334,8 +476,12 @@ impl Agent {
     async fn stream_completion(
         &self,
         request: ChatCompletionRequest,
+        base: Option<u64>,
         on_token: &mut impl FnMut(ChunkTokens),
-    ) -> Result<(Message, (Option<u64>, Option<u64>)), OpenAIError> {
+    ) -> Result<
+        (Message, (Option<u64>, Option<u64>)),
+        Box<dyn std::error::Error>,
+    > {
         let mut request = request;
         request.stream = Some(true);
         request.stream_options = Some(StreamOptions {
@@ -367,11 +513,20 @@ impl Agent {
         };
         let mut accumulator = StreamAccumulator::new();
 
-        while let Some(value) = stream.next().await {
-            let value = value?;
-            let chunk: StreamChunk = serde_json::from_value(value)?;
-            for tokens in accumulator.feed(chunk) {
-                on_token(tokens);
+        loop {
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = self.cancel_wait(base) => return Err(Cancelled.into()),
+            };
+            match next {
+                Some(Ok(value)) => {
+                    let chunk: StreamChunk = serde_json::from_value(value)?;
+                    for tokens in accumulator.feed(chunk) {
+                        on_token(tokens);
+                    }
+                }
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
             }
         }
 
@@ -1232,6 +1387,192 @@ mod test {
                 .iter()
                 .any(|event| { matches!(event, AgentEvent::ToolResult { .. }) })
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_streaming_stops_the_turn() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                data.extend_from_slice(&buf[..n]);
+                                if let Some(body) = complete_request(&data) {
+                                    let _ = tx.send(body);
+                                    let partial = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n";
+                                    let _ = socket.write_all(partial.as_bytes()).await;
+                                    tokio::time::sleep(Duration::from_secs(30)).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(format!("http://{addr}")),
+        );
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0u64);
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        )
+        .with_cancel(std::sync::Arc::new(cancel_rx));
+        let cancel_tx2 = cancel_tx.clone();
+        let waiter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel_tx2.send(1).unwrap();
+        });
+
+        let outcome = agent.chat("hi", &mut |_| {}).await.unwrap();
+
+        assert_eq!(outcome, ChatOutcome::Cancelled);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_during_tool_execution_cancels_the_turn() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"sleep 30\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, _requests) = mock_server(vec![sse.to_string()]).await;
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(0u64);
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        )
+        .with_cancel(std::sync::Arc::new(cancel_rx));
+        let events = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+        let events2 = events.clone();
+        let cancel_tx2 = cancel_tx.clone();
+        let waiter = tokio::spawn(async move {
+            loop {
+                if events2
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+                {
+                    cancel_tx2.send(1).unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let outcome = agent
+            .chat("hi", &mut |event| events.lock().unwrap().push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ChatOutcome::Cancelled);
+        waiter.await.unwrap();
+        assert_eq!(
+            agent.history().last().unwrap(),
+            &Message::Tool {
+                tool_call_id: "call_1".into(),
+                content: "cancelled".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_queued_during_a_tool_loop_is_picked_up_on_the_next_round() {
+        let tool_call = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, _requests) =
+            mock_server(vec![tool_call.to_string(), answer.to_string()]).await;
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        let steering = Steering::new();
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        )
+        .with_steering(steering.clone());
+
+        let outcome = agent
+            .chat("go", &mut |event| {
+                if matches!(event, AgentEvent::ToolResult { .. }) {
+                    steering.push("steer me".into());
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ChatOutcome::Answer("done".into()));
+        let history = agent.history();
+        let steer = history
+            .iter()
+            .position(|m| matches!(m, Message::User { content } if content == "steer me"))
+            .unwrap();
+        assert!(matches!(history[steer - 1], Message::Tool { .. }));
+        assert!(matches!(history[steer + 1], Message::Assistant { .. }));
+    }
+
+    #[tokio::test]
+    async fn steering_at_turn_end_triggers_an_extra_round() {
+        let first = "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\ndata: [DONE]\n\n";
+        let second = "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, mut requests) =
+            mock_server(vec![first.to_string(), second.to_string()]).await;
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        let steering = Steering::new();
+        let pushed = std::sync::atomic::AtomicBool::new(false);
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        )
+        .with_steering(steering.clone());
+
+        let outcome = agent
+            .chat("go", &mut |event| {
+                if matches!(event, AgentEvent::CompletionStarted)
+                    && !pushed.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    steering.push("steer me".into());
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ChatOutcome::Answer("second".into()));
+        let mut count = 0;
+        while requests.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+        let history = agent.history();
+        let position_of = |predicate: fn(&Message) -> bool| {
+            history.iter().position(predicate).unwrap()
+        };
+        let first = position_of(|m| matches!(m, Message::Assistant { content, .. } if content.as_deref() == Some("first")));
+        let steer = position_of(|m| matches!(m, Message::User { content } if content == "steer me"));
+        let second = position_of(|m| matches!(m, Message::Assistant { content, .. } if content.as_deref() == Some("second")));
+        assert!(first < steer);
+        assert!(steer < second);
     }
 
     #[tokio::test]
