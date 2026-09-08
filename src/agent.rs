@@ -74,7 +74,7 @@ pub struct Agent {
     pub thinking: Option<(Arc<Mutex<ThinkingLevel>>, Option<bool>)>,
     pub bash_timeout: Duration,
     cancel: Option<std::sync::Arc<tokio::sync::watch::Receiver<u64>>>,
-    steering: Option<Steering>,
+    steering: Steering,
     bg_seen: std::collections::HashSet<String>,
     bg_mine: std::collections::HashSet<String>,
 }
@@ -98,7 +98,7 @@ impl Agent {
             thinking: None,
             bash_timeout,
             cancel: None,
-            steering: None,
+            steering: Steering::default(),
             bg_seen: std::collections::HashSet::new(),
             bg_mine: std::collections::HashSet::new(),
         }
@@ -118,7 +118,7 @@ impl Agent {
     }
 
     pub fn with_steering(mut self, steering: Steering) -> Agent {
-        self.steering = Some(steering);
+        self.steering = steering;
         self
     }
 
@@ -252,7 +252,7 @@ impl Agent {
     }
 
     fn drain_steering(&self) -> Vec<String> {
-        self.steering.as_ref().map(|steering| steering.drain()).unwrap_or_default()
+        self.steering.drain()
     }
 
     async fn cancel_wait(&self, base: Option<u64>) {
