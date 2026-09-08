@@ -7,7 +7,7 @@ edition = "2024"
 bitflags = "2"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
-gix = { version = "0.85", default-features = false, features = ["sha1"] }
+gix = { version = "0.85", default-features = false, features = ["sha1", "excludes"] }
 openai-oxide = "0.17"
 ratatui = { version = "0.30", default-features = false, features = ["termwiz"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2"] }

@@ -1,39 +1,161 @@
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+type EntryKind = gix::objs::tree::EntryKind;
+type ObjectId = gix::hash::ObjectId;
 
 pub fn snapshot_tree(cwd: Option<&Path>) -> Option<String> {
-    let index = std::env::temp_dir().join(format!(
-        "kite-index-{}-{}",
-        std::process::id(),
-        SNAPSHOT_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut add = std::process::Command::new("git");
-    if let Some(cwd) = cwd {
-        add.current_dir(cwd);
+    let base = match cwd {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    let repo = gix::open(&base).ok()?;
+    let work_dir = repo.workdir()?.to_path_buf();
+    let index = repo.index_or_empty().ok()?;
+    let source = gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped;
+    let mut excludes = repo.excludes(&***index, None, source).ok()?;
+    let mut files: Vec<(String, EntryKind, ObjectId)> = Vec::new();
+    walk(&work_dir, &work_dir, &repo, &mut excludes, &mut files);
+    build_tree(&repo, &files).map(|id| id.to_string())
+}
+
+fn walk(
+    root: &Path,
+    dir: &Path,
+    repo: &gix::Repository,
+    excludes: &mut gix::AttributeStack,
+    out: &mut Vec<(String, EntryKind, ObjectId)>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let rel = match path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            if is_ignored(excludes, &rel, false) {
+                continue;
+            }
+            let target = std::fs::read_link(&path).unwrap_or_default();
+            let data = target.to_string_lossy().into_owned().into_bytes();
+            let oid = match blob(repo, &data) {
+                Some(o) => o,
+                None => continue,
+            };
+            out.push((rel, EntryKind::Link, oid));
+        } else if meta.is_dir() {
+            if is_ignored(excludes, &rel, true) {
+                continue;
+            }
+            if path.join(".git").is_file() {
+                if let Some(oid) = submodule_head(&path) {
+                    out.push((rel, EntryKind::Commit, oid));
+                }
+            } else {
+                walk(root, &path, repo, excludes, out);
+            }
+        } else if meta.is_file() {
+            if is_ignored(excludes, &rel, false) {
+                continue;
+            }
+            let data = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let oid = match blob(repo, &data) {
+                Some(o) => o,
+                None => continue,
+            };
+            let kind = if is_executable(&meta) {
+                EntryKind::BlobExecutable
+            } else {
+                EntryKind::Blob
+            };
+            out.push((rel, kind, oid));
+        }
     }
-    let add = add.env("GIT_INDEX_FILE", &index).arg("add").arg("-A").output().ok()?;
-    if !add.status.success() {
-        std::fs::remove_file(&index).ok();
-        return None;
+}
+
+fn is_ignored(excludes: &mut gix::AttributeStack, rel: &str, is_dir: bool) -> bool {
+    let mode = if is_dir { Some(gix::index::entry::Mode::DIR) } else { None };
+    match excludes.at_path(rel, mode) {
+        Ok(p) => p.is_excluded(),
+        Err(_) => false,
     }
-    let mut write = std::process::Command::new("git");
-    if let Some(cwd) = cwd {
-        write.current_dir(cwd);
+}
+
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o100 != 0
     }
-    let write = write.env("GIT_INDEX_FILE", &index).arg("write-tree").output().ok()?;
-    std::fs::remove_file(&index).ok();
-    if !write.status.success() {
-        return None;
+    #[cfg(not(unix))]
+    {
+        false
     }
-    let stdout = String::from_utf8_lossy(&write.stdout);
-    let sha = stdout.trim();
-    if sha.is_empty() {
-        None
-    } else {
-        Some(sha.to_string())
+}
+
+fn submodule_head(path: &Path) -> Option<ObjectId> {
+    let repo = gix::open(path).ok()?;
+    let id = repo.head_id().ok()?;
+    Some((*id).to_owned())
+}
+
+fn blob(repo: &gix::Repository, data: &[u8]) -> Option<ObjectId> {
+    let blob = gix::objs::Blob {
+        data: data.to_vec(),
+    };
+    let id = repo.write_object(blob).ok()?;
+    Some((*id).to_owned())
+}
+
+fn build_tree(repo: &gix::Repository, files: &[(String, EntryKind, ObjectId)]) -> Option<ObjectId> {
+    let mut groups: BTreeMap<String, Vec<&(String, EntryKind, ObjectId)>> = BTreeMap::new();
+    for f in files {
+        let name = f.0.split('/').next().unwrap_or(&f.0).to_string();
+        groups.entry(name).or_default().push(f);
     }
+    let mut entries: Vec<gix::objs::tree::Entry> = Vec::new();
+    for (name, group) in groups {
+        if group.iter().any(|f| f.0.contains('/')) {
+            let sub: Vec<(String, EntryKind, ObjectId)> = group
+                .iter()
+                .map(|f| {
+                    let rest = f
+                        .0
+                        .split_once('/')
+                        .map(|(_, r)| r.to_string())
+                        .unwrap_or_default();
+                    (rest, f.1, f.2)
+                })
+                .collect();
+            let oid = build_tree(repo, &sub)?;
+            entries.push(gix::objs::tree::Entry {
+                mode: EntryKind::Tree.into(),
+                filename: name.into(),
+                oid,
+            });
+        } else {
+            let f = &group[0];
+            entries.push(gix::objs::tree::Entry {
+                mode: f.1.into(),
+                filename: name.into(),
+                oid: f.2,
+            });
+        }
+    }
+    entries.sort();
+    let id = repo.write_object(gix::objs::Tree { entries }).ok()?;
+    Some((*id).to_owned())
 }
 
 pub fn head_tree() -> String {
@@ -139,6 +261,24 @@ mod test {
         let got = head_tree();
         std::env::set_current_dir(before).unwrap();
         assert_eq!(got, expected);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_respects_gitignore() {
+        let dir = temp_repo("snapshot-ignore");
+        std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(dir.join("keep.txt"), "keep\n").unwrap();
+        std::fs::write(dir.join("skip.log"), "skip\n").unwrap();
+        let tree = snapshot_tree(Some(&dir)).expect("snapshot");
+        let out = std::process::Command::new("git")
+            .args(["ls-tree", "-r", &tree])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let ls = String::from_utf8_lossy(&out.stdout);
+        assert!(ls.contains("keep.txt"));
+        assert!(!ls.contains("skip.log"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
