@@ -114,16 +114,7 @@ pub struct TuiState {
     pub plan_open: bool,
     pub plan_view: usize,
     pub plan_scroll: Scroller,
-    pub diff_open: bool,
-    pub diff_start: usize,
-    pub diff_text: String,
-    pub diff_file_index: usize,
-    pub diff_cursor: usize,
-    pub diff_anchor: Option<usize>,
-    pub diff_commenting: bool,
-    pub diff_comment_draft: String,
-    pub diff_comment_cursor: usize,
-    pub diff_comment_whole_file: bool,
+    pub code_review: crate::components::code_review::State,
     pub next_id: u64,
 }
 
@@ -146,16 +137,7 @@ impl TuiState {
             plan_open: false,
             plan_view: 0,
             plan_scroll: Scroller::default(),
-            diff_open: false,
-            diff_start: 0,
-            diff_text: String::new(),
-            diff_file_index: 0,
-            diff_cursor: 0,
-            diff_anchor: None,
-            diff_commenting: false,
-            diff_comment_draft: String::new(),
-            diff_comment_cursor: 0,
-            diff_comment_whole_file: false,
+            code_review: crate::components::code_review::State::default(),
             next_id: 1,
         }
     }
@@ -452,10 +434,10 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             return KeyAction::None;
         }
         if key.code == KeyCode::Char('g') {
-            if !state.diff_open {
+            if !state.code_review.open {
                 crate::components::code_review::open(state);
             }
-            state.diff_open = !state.diff_open;
+            state.code_review.open = !state.code_review.open;
             state.picker_open = false;
             state.task_list.open = false;
             return KeyAction::None;
@@ -1556,7 +1538,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let suggest = if state.picker_open
         || state.task_list.open
         || state.plan_open
-        || state.diff_open
+        || state.code_review.open
         || session.question.is_some()
     {
         None
@@ -1670,7 +1652,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         crate::components::plan_detail::draw(frame, state, chunks[1]);
     }
 
-    if state.diff_open {
+    if state.code_review.open {
         crate::components::code_review::draw(frame, state, chunks[1]);
     }
 
@@ -2620,20 +2602,20 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        assert!(state.diff_open);
+        assert!(state.code_review.open);
 
         handle_key(&mut state, &ctrl('g'));
-        assert!(!state.diff_open);
+        assert!(!state.code_review.open);
 
         handle_key(&mut state, &ctrl('g'));
-        assert!(state.diff_open);
+        assert!(state.code_review.open);
         handle_key(&mut state, &key(KeyCode::Char('q')));
-        assert!(!state.diff_open);
+        assert!(!state.code_review.open);
 
         handle_key(&mut state, &ctrl('g'));
-        assert!(state.diff_open);
+        assert!(state.code_review.open);
         handle_key(&mut state, &key(KeyCode::Esc));
-        assert!(!state.diff_open);
+        assert!(!state.code_review.open);
     }
 
     #[test]
@@ -2641,18 +2623,18 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = format!(
+        state.code_review.text = format!(
             "diff --git a/a.txt b/a.txt\n@@ -0,0 +1,100 @@\n{}",
             (0..100).map(|i| format!("+line {i}")).collect::<Vec<_>>().join("\n")
         );
-        assert_eq!(state.diff_cursor, 0);
+        assert_eq!(state.code_review.cursor, 0);
 
         handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert_eq!(state.diff_cursor, 1);
+        assert_eq!(state.code_review.cursor, 1);
         handle_key(&mut state, &key(KeyCode::Char('j')));
-        assert_eq!(state.diff_cursor, 2);
+        assert_eq!(state.code_review.cursor, 2);
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert_eq!(state.diff_cursor, 1);
+        assert_eq!(state.code_review.cursor, 1);
     }
 
     #[test]
@@ -2660,17 +2642,17 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b.txt b/b.txt\n@@ -1 +1 @@\n-a\n+b".into();
-        assert_eq!(state.diff_file_index, 0);
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b.txt b/b.txt\n@@ -1 +1 @@\n-a\n+b".into();
+        assert_eq!(state.code_review.file_index, 0);
 
         handle_key(&mut state, &key(KeyCode::Right));
-        assert_eq!(state.diff_file_index, 1);
+        assert_eq!(state.code_review.file_index, 1);
         handle_key(&mut state, &key(KeyCode::Char('l')));
-        assert_eq!(state.diff_file_index, 1);
+        assert_eq!(state.code_review.file_index, 1);
         handle_key(&mut state, &key(KeyCode::Char('h')));
-        assert_eq!(state.diff_file_index, 0);
+        assert_eq!(state.code_review.file_index, 0);
         handle_key(&mut state, &key(KeyCode::Char('h')));
-        assert_eq!(state.diff_file_index, 0);
+        assert_eq!(state.code_review.file_index, 0);
     }
 
     #[test]
@@ -2678,21 +2660,21 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('v')));
         handle_key(&mut state, &key(KeyCode::Char('k')));
-        assert!(state.diff_anchor.is_some());
+        assert!(state.code_review.anchor.is_some());
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert!(state.diff_commenting);
+        assert!(state.code_review.commenting);
         for c in "wrong".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
         handle_key(&mut state, &key(KeyCode::Enter));
-        assert!(!state.diff_commenting);
-        assert!(state.diff_anchor.is_none());
+        assert!(!state.code_review.commenting);
+        assert!(state.code_review.anchor.is_none());
 
         let comment = &state.session().review_comments[0];
         assert_eq!(comment.file, "a.txt");
@@ -2705,11 +2687,11 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert!(state.diff_commenting);
+        assert!(state.code_review.commenting);
         for c in "bad".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
@@ -2726,7 +2708,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &key(KeyCode::Char('r')));
         assert_eq!(state.session().review_reviewed, vec!["a.txt".to_string()]);
         handle_key(&mut state, &key(KeyCode::Char('r')));
@@ -2738,7 +2720,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
@@ -2749,7 +2731,7 @@ mod test {
         assert_eq!(state.session().review_comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert_eq!(state.diff_comment_draft, "bad");
+        assert_eq!(state.code_review.comment_draft, "bad");
         for _ in 0..3 {
             handle_key(&mut state, &key(KeyCode::Backspace));
         }
@@ -2768,7 +2750,7 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert_eq!(state.diff_comment_draft, "worse");
+        assert_eq!(state.code_review.comment_draft, "worse");
         for _ in 0..5 {
             handle_key(&mut state, &key(KeyCode::Backspace));
         }
@@ -2841,7 +2823,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
         state.session().review_comments.push(ReviewComment {
             file: "a.txt".into(),
             range: Some(1..2),
@@ -2864,7 +2846,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         state.session().review_comments.push(ReviewComment {
             file: "a.txt".into(),
             range: Some(9..10),
@@ -2881,7 +2863,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
         for c in "old".chars() {
@@ -2891,10 +2873,10 @@ mod test {
         assert_eq!(state.session().review_comments.len(), 1);
 
         handle_key(&mut state, &key(KeyCode::Char('c')));
-        assert_eq!(state.diff_comment_draft, "old");
+        assert_eq!(state.code_review.comment_draft, "old");
         handle_key(&mut state, &key(KeyCode::Backspace));
         handle_key(&mut state, &key(KeyCode::Backspace));
-        assert_eq!(state.diff_comment_draft, "o");
+        assert_eq!(state.code_review.comment_draft, "o");
         handle_key(&mut state, &key(KeyCode::Enter));
         assert_eq!(state.session().review_comments.len(), 1);
         assert_eq!(state.session().review_comments[0].text, "o");
@@ -2943,29 +2925,29 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
         for c in "hello world".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
-        assert_eq!(state.diff_comment_cursor, 11);
+        assert_eq!(state.code_review.comment_cursor, 11);
 
         handle_key(&mut state, &key(KeyCode::Left));
-        assert_eq!(state.diff_comment_cursor, 10);
+        assert_eq!(state.code_review.comment_cursor, 10);
         handle_key(&mut state, &key(KeyCode::Right));
-        assert_eq!(state.diff_comment_cursor, 11);
+        assert_eq!(state.code_review.comment_cursor, 11);
         handle_key(&mut state, &ctrl_key(KeyCode::Left));
-        assert_eq!(state.diff_comment_cursor, 6);
+        assert_eq!(state.code_review.comment_cursor, 6);
 
         handle_key(&mut state, &key(KeyCode::Char('X')));
-        assert_eq!(state.diff_comment_draft, "hello Xworld");
-        assert_eq!(state.diff_comment_cursor, 7);
+        assert_eq!(state.code_review.comment_draft, "hello Xworld");
+        assert_eq!(state.code_review.comment_cursor, 7);
         handle_key(&mut state, &key(KeyCode::Backspace));
-        assert_eq!(state.diff_comment_draft, "hello world");
-        assert_eq!(state.diff_comment_cursor, 6);
+        assert_eq!(state.code_review.comment_draft, "hello world");
+        assert_eq!(state.code_review.comment_cursor, 6);
         handle_key(&mut state, &ctrl_key(KeyCode::Right));
-        assert_eq!(state.diff_comment_cursor, 11);
+        assert_eq!(state.code_review.comment_cursor, 11);
     }
 
     #[test]
@@ -2973,10 +2955,10 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &shift('c'));
-        assert!(state.diff_commenting);
-        assert!(state.diff_comment_whole_file);
+        assert!(state.code_review.commenting);
+        assert!(state.code_review.comment_whole_file);
         for c in "flaky".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
         }
@@ -2992,13 +2974,13 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(
             &mut state,
             &TermEvent::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
         );
-        assert!(state.diff_commenting);
-        assert!(state.diff_comment_whole_file);
+        assert!(state.code_review.commenting);
+        assert!(state.code_review.comment_whole_file);
     }
 
     #[test]
@@ -3006,7 +2988,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &shift('c'));
         for c in "flaky".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
@@ -3014,7 +2996,7 @@ mod test {
         handle_key(&mut state, &key(KeyCode::Enter));
 
         handle_key(&mut state, &shift('c'));
-        assert_eq!(state.diff_comment_draft, "flaky");
+        assert_eq!(state.code_review.comment_draft, "flaky");
         for _ in 0..5 {
             handle_key(&mut state, &key(KeyCode::Backspace));
         }
@@ -3032,7 +3014,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         handle_key(&mut state, &shift('c'));
         for c in "flaky".chars() {
             handle_key(&mut state, &key(KeyCode::Char(c)));
@@ -3053,7 +3035,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-x\n+y".into();
         state.session().review_comments.push(ReviewComment {
             file: "a.txt".into(),
             range: None,
@@ -3087,7 +3069,7 @@ mod test {
         let mut state = TuiState::new("model".into());
 
         handle_key(&mut state, &ctrl('g'));
-        state.diff_text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
+        state.code_review.text = "diff --git a/a.txt b/a.txt\n@@ -1,2 +1,2 @@\n-x\n+y\n z".into();
         handle_key(&mut state, &key(KeyCode::Char('j')));
         handle_key(&mut state, &key(KeyCode::Char('c')));
         for c in "bad".chars() {

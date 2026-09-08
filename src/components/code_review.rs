@@ -6,6 +6,36 @@ use ratatui::text::{Line, Span};
 use crate::session::ReviewComment;
 use crate::tui::{word_left, word_right, KeyAction, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, TuiState};
 
+pub struct State {
+    pub open: bool,
+    pub start: usize,
+    pub text: String,
+    pub file_index: usize,
+    pub cursor: usize,
+    pub anchor: Option<usize>,
+    pub commenting: bool,
+    pub comment_draft: String,
+    pub comment_cursor: usize,
+    pub comment_whole_file: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            open: false,
+            start: 0,
+            text: String::new(),
+            file_index: 0,
+            cursor: 0,
+            anchor: None,
+            commenting: false,
+            comment_draft: String::new(),
+            comment_cursor: 0,
+            comment_whole_file: false,
+        }
+    }
+}
+
 fn git_head_tree() -> String {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--verify", "HEAD^{tree}"])
@@ -50,17 +80,17 @@ fn review_diff_text(baseline: Option<&str>) -> String {
 }
 
 pub fn open(state: &mut TuiState) {
-    state.diff_text = review_diff_text(
+    state.code_review.text = review_diff_text(
         state.session().review_baseline.as_deref(),
     );
-    state.diff_start = 0;
-    state.diff_file_index = 0;
-    state.diff_cursor = 0;
-    state.diff_anchor = None;
-    state.diff_commenting = false;
-    state.diff_comment_draft.clear();
-    state.diff_comment_cursor = 0;
-    state.diff_comment_whole_file = false;
+    state.code_review.start = 0;
+    state.code_review.file_index = 0;
+    state.code_review.cursor = 0;
+    state.code_review.anchor = None;
+    state.code_review.commenting = false;
+    state.code_review.comment_draft.clear();
+    state.code_review.comment_cursor = 0;
+    state.code_review.comment_whole_file = false;
 }
 
 fn diff_file_sections(text: &str) -> Vec<(String, String)> {
@@ -107,14 +137,14 @@ fn review_comment_line(comment: &ReviewComment) -> Line<'static> {
 }
 
 pub(crate) fn review_file_view(state: &TuiState) -> (Vec<Line<'static>>, usize) {
-    let sections = diff_file_sections(&state.diff_text);
-    let Some((path, section)) = sections.get(state.diff_file_index) else {
+    let sections = diff_file_sections(&state.code_review.text);
+    let Some((path, section)) = sections.get(state.code_review.file_index) else {
         return (Vec::new(), 0);
     };
     let numbered = crate::transcript::diff_lines_numbered(section);
     let diff_count = numbered.len();
-    let sel_range = state.diff_anchor.map(|anchor| {
-        (anchor.min(state.diff_cursor), anchor.max(state.diff_cursor))
+    let sel_range = state.code_review.anchor.map(|anchor| {
+        (anchor.min(state.code_review.cursor), anchor.max(state.code_review.cursor))
     });
     let comments: Vec<&ReviewComment> = state
         .sessions
@@ -126,7 +156,7 @@ pub(crate) fn review_file_view(state: &TuiState) -> (Vec<Line<'static>>, usize) 
     for (index, d) in numbered.iter().enumerate() {
         let selected = sel_range
             .is_some_and(|(lo, hi)| index >= lo && index <= hi);
-        let is_cursor = index == state.diff_cursor;
+        let is_cursor = index == state.code_review.cursor;
         let mut line = d.line.clone();
         if selected || is_cursor {
             let bg = if is_cursor {
@@ -170,21 +200,21 @@ pub(crate) fn review_file_view(state: &TuiState) -> (Vec<Line<'static>>, usize) 
 }
 
 fn review_comment_range(state: &TuiState) -> (usize, usize) {
-    match state.diff_anchor {
-        Some(anchor) => (anchor.min(state.diff_cursor), anchor.max(state.diff_cursor)),
-        None => (state.diff_cursor, state.diff_cursor),
+    match state.code_review.anchor {
+        Some(anchor) => (anchor.min(state.code_review.cursor), anchor.max(state.code_review.cursor)),
+        None => (state.code_review.cursor, state.code_review.cursor),
     }
 }
 
 fn commit_review_comment(state: &mut TuiState) {
-    let text = state.diff_comment_draft.trim().to_string();
-    let whole_file = state.diff_comment_whole_file;
-    state.diff_commenting = false;
-    state.diff_comment_draft.clear();
-    state.diff_comment_cursor = 0;
-    state.diff_comment_whole_file = false;
-    let sections = diff_file_sections(&state.diff_text);
-    let Some((path, section)) = sections.get(state.diff_file_index) else {
+    let text = state.code_review.comment_draft.trim().to_string();
+    let whole_file = state.code_review.comment_whole_file;
+    state.code_review.commenting = false;
+    state.code_review.comment_draft.clear();
+    state.code_review.comment_cursor = 0;
+    state.code_review.comment_whole_file = false;
+    let sections = diff_file_sections(&state.code_review.text);
+    let Some((path, section)) = sections.get(state.code_review.file_index) else {
         return;
     };
     let text = text.trim();
@@ -210,7 +240,7 @@ fn commit_review_comment(state: &mut TuiState) {
     }
     let numbered = crate::transcript::diff_lines_numbered(section);
     let (lo, hi) = review_comment_range(state);
-    state.diff_anchor = None;
+    state.code_review.anchor = None;
     let numbers: Vec<usize> = (lo..=hi)
         .filter_map(|i| numbered.get(i).and_then(|d| d.new.or(d.old)))
         .collect();
@@ -249,30 +279,30 @@ fn diff_scroll_max(state: &TuiState) -> usize {
 }
 
 pub fn mouse(state: &mut TuiState, mouse: &MouseEvent) -> Option<KeyAction> {
-    if !state.diff_open {
+    if !state.code_review.open {
         return None;
     }
     let max = diff_scroll_max(state);
     Some(match mouse.kind {
         MouseEventKind::ScrollUp => {
-            state.diff_start = state.diff_start.saturating_sub(3);
+            state.code_review.start = state.code_review.start.saturating_sub(3);
             KeyAction::None
         }
         MouseEventKind::ScrollDown => {
-            state.diff_start = (state.diff_start + 3).min(max);
+            state.code_review.start = (state.code_review.start + 3).min(max);
             KeyAction::None
         }
     })
 }
 
 pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
-    if !state.diff_open {
+    if !state.code_review.open {
         return None;
     }
     let scroll_max = diff_scroll_max(state);
     let visible = state.viewport.saturating_sub(4);
-    let file_count = diff_file_sections(&state.diff_text).len();
-    if state.diff_commenting {
+    let file_count = diff_file_sections(&state.code_review.text).len();
+    if state.code_review.commenting {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         return Some(match key.code {
             KeyCode::Enter => {
@@ -280,50 +310,50 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
                 KeyAction::None
             }
             KeyCode::Esc => {
-                state.diff_commenting = false;
-                state.diff_comment_draft.clear();
-                state.diff_comment_cursor = 0;
+                state.code_review.commenting = false;
+                state.code_review.comment_draft.clear();
+                state.code_review.comment_cursor = 0;
                 KeyAction::None
             }
             KeyCode::Backspace => {
-                if state.diff_comment_cursor > 0 {
-                    state.diff_comment_cursor -= 1;
+                if state.code_review.comment_cursor > 0 {
+                    state.code_review.comment_cursor -= 1;
                     let mut chars: Vec<char> =
-                        state.diff_comment_draft.chars().collect();
-                    chars.remove(state.diff_comment_cursor);
-                    state.diff_comment_draft = chars.into_iter().collect();
+                        state.code_review.comment_draft.chars().collect();
+                    chars.remove(state.code_review.comment_cursor);
+                    state.code_review.comment_draft = chars.into_iter().collect();
                 }
                 KeyAction::None
             }
             KeyCode::Left => {
                 if ctrl {
-                    state.diff_comment_cursor = word_left(
-                        &state.diff_comment_draft,
-                        state.diff_comment_cursor,
+                    state.code_review.comment_cursor = word_left(
+                        &state.code_review.comment_draft,
+                        state.code_review.comment_cursor,
                     );
                 } else {
-                    state.diff_comment_cursor = state.diff_comment_cursor.saturating_sub(1);
+                    state.code_review.comment_cursor = state.code_review.comment_cursor.saturating_sub(1);
                 }
                 KeyAction::None
             }
             KeyCode::Right => {
                 if ctrl {
-                    state.diff_comment_cursor = word_right(
-                        &state.diff_comment_draft,
-                        state.diff_comment_cursor,
+                    state.code_review.comment_cursor = word_right(
+                        &state.code_review.comment_draft,
+                        state.code_review.comment_cursor,
                     );
                 } else {
-                    state.diff_comment_cursor =
-                        (state.diff_comment_cursor + 1)
-                            .min(state.diff_comment_draft.chars().count());
+                    state.code_review.comment_cursor =
+                        (state.code_review.comment_cursor + 1)
+                            .min(state.code_review.comment_draft.chars().count());
                 }
                 KeyAction::None
             }
             KeyCode::Char(c) => {
-                let mut chars: Vec<char> = state.diff_comment_draft.chars().collect();
-                chars.insert(state.diff_comment_cursor.min(chars.len()), c);
-                state.diff_comment_draft = chars.into_iter().collect();
-                state.diff_comment_cursor += 1;
+                let mut chars: Vec<char> = state.code_review.comment_draft.chars().collect();
+                chars.insert(state.code_review.comment_cursor.min(chars.len()), c);
+                state.code_review.comment_draft = chars.into_iter().collect();
+                state.code_review.comment_cursor += 1;
                 KeyAction::None
             }
             _ => KeyAction::None,
@@ -331,64 +361,64 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
     }
     Some(match key.code {
         KeyCode::Char('g') | KeyCode::Char('q') | KeyCode::Esc => {
-            state.diff_open = false;
+            state.code_review.open = false;
             KeyAction::None
         }
         KeyCode::Left | KeyCode::Char('h') => {
-            state.diff_file_index = state.diff_file_index.saturating_sub(1);
-            state.diff_cursor = 0;
-            state.diff_anchor = None;
-            state.diff_start = 0;
+            state.code_review.file_index = state.code_review.file_index.saturating_sub(1);
+            state.code_review.cursor = 0;
+            state.code_review.anchor = None;
+            state.code_review.start = 0;
             KeyAction::None
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            if state.diff_file_index + 1 < file_count {
-                state.diff_file_index += 1;
-                state.diff_cursor = 0;
-                state.diff_anchor = None;
-                state.diff_start = 0;
+            if state.code_review.file_index + 1 < file_count {
+                state.code_review.file_index += 1;
+                state.code_review.cursor = 0;
+                state.code_review.anchor = None;
+                state.code_review.start = 0;
             }
             KeyAction::None
         }
         KeyCode::Char('j') | KeyCode::Down => {
             let (_, diff_count) = review_file_view(state);
-            state.diff_cursor =
-                (state.diff_cursor + 1).min(diff_count.saturating_sub(1));
-            if state.diff_cursor < state.diff_start {
-                state.diff_start = state.diff_cursor;
-            } else if state.diff_cursor >= state.diff_start + visible {
-                state.diff_start = state.diff_cursor - visible + 1;
+            state.code_review.cursor =
+                (state.code_review.cursor + 1).min(diff_count.saturating_sub(1));
+            if state.code_review.cursor < state.code_review.start {
+                state.code_review.start = state.code_review.cursor;
+            } else if state.code_review.cursor >= state.code_review.start + visible {
+                state.code_review.start = state.code_review.cursor - visible + 1;
             }
             KeyAction::None
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            state.diff_cursor = state.diff_cursor.saturating_sub(1);
-            if state.diff_cursor < state.diff_start {
-                state.diff_start = state.diff_cursor;
+            state.code_review.cursor = state.code_review.cursor.saturating_sub(1);
+            if state.code_review.cursor < state.code_review.start {
+                state.code_review.start = state.code_review.cursor;
             }
             KeyAction::None
         }
         KeyCode::PageDown => {
-            state.diff_start = (state.diff_start + 8).min(scroll_max);
+            state.code_review.start = (state.code_review.start + 8).min(scroll_max);
             KeyAction::None
         }
         KeyCode::PageUp => {
-            state.diff_start = state.diff_start.saturating_sub(8);
+            state.code_review.start = state.code_review.start.saturating_sub(8);
             KeyAction::None
         }
         KeyCode::Home => {
-            state.diff_start = 0;
+            state.code_review.start = 0;
             KeyAction::None
         }
         KeyCode::End => {
-            state.diff_start = scroll_max;
+            state.code_review.start = scroll_max;
             KeyAction::None
         }
         KeyCode::Char('v') => {
-            state.diff_anchor = if state.diff_anchor.is_some() {
+            state.code_review.anchor = if state.code_review.anchor.is_some() {
                 None
             } else {
-                Some(state.diff_cursor)
+                Some(state.code_review.cursor)
             };
             KeyAction::None
         }
@@ -396,9 +426,9 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
             let whole_file = key.code == KeyCode::Char('C')
                 || key.modifiers.contains(KeyModifiers::SHIFT);
             let (lo, hi) = review_comment_range(state);
-            let sections = diff_file_sections(&state.diff_text);
+            let sections = diff_file_sections(&state.code_review.text);
             let mut draft = String::new();
-            if let Some((path, _)) = sections.get(state.diff_file_index) {
+            if let Some((path, _)) = sections.get(state.code_review.file_index) {
                 let session = state.session();
                 let existing = if whole_file {
                     session
@@ -417,15 +447,15 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
                     draft = existing.text.clone();
                 }
             }
-            state.diff_comment_draft = draft;
-            state.diff_comment_cursor = state.diff_comment_draft.chars().count();
-            state.diff_comment_whole_file = whole_file;
-            state.diff_commenting = true;
+            state.code_review.comment_draft = draft;
+            state.code_review.comment_cursor = state.code_review.comment_draft.chars().count();
+            state.code_review.comment_whole_file = whole_file;
+            state.code_review.commenting = true;
             KeyAction::None
         }
         KeyCode::Char('r') => {
-            let sections = diff_file_sections(&state.diff_text);
-            if let Some((path, _)) = sections.get(state.diff_file_index) {
+            let sections = diff_file_sections(&state.code_review.text);
+            if let Some((path, _)) = sections.get(state.code_review.file_index) {
                 let session = state.session();
                 if let Some(pos) = session.review_reviewed.iter().position(|p| p == path) {
                     session.review_reviewed.remove(pos);
@@ -436,13 +466,13 @@ pub fn handle_key(state: &mut TuiState, key: &KeyEvent) -> Option<KeyAction> {
             KeyAction::None
         }
         KeyCode::Char('x') => {
-            let sections = diff_file_sections(&state.diff_text);
-            if let Some((path, section)) = sections.get(state.diff_file_index) {
+            let sections = diff_file_sections(&state.code_review.text);
+            if let Some((path, section)) = sections.get(state.code_review.file_index) {
                 let numbered = crate::transcript::diff_lines_numbered(section);
                 let cursor_number = numbered
-                    .get(state.diff_cursor)
+                    .get(state.code_review.cursor)
                     .and_then(|d| d.new.or(d.old));
-                let on_title = state.diff_cursor == 0;
+                let on_title = state.code_review.cursor == 0;
                 let session = state.session();
                 let pos = match cursor_number {
                     Some(number) => session.review_comments.iter().position(|c| {
@@ -477,11 +507,11 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
         ))];
     }
     let title = {
-        let sections = diff_file_sections(&state.diff_text);
+        let sections = diff_file_sections(&state.code_review.text);
         if sections.is_empty() {
             " review ".to_string()
         } else {
-            let (path, _) = &sections[state.diff_file_index];
+            let (path, _) = &sections[state.code_review.file_index];
             let reviewed = state
                 .sessions
                 .get(state.active)
@@ -489,17 +519,18 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
                 .unwrap_or(false);
             format!(
                 " review {} / {} {}{}",
-                state.diff_file_index + 1,
+                state.code_review.file_index + 1,
                 sections.len(),
                 path,
                 if reviewed { " · ✓" } else { "" }
             )
         }
     };
-    if state.diff_commenting {
+    if state.code_review.commenting {
         let cursor = state
-            .diff_comment_cursor
-            .min(state.diff_comment_draft.chars().count());
+            .code_review
+            .comment_cursor
+            .min(state.code_review.comment_draft.chars().count());
         let cursor_style = Style::default()
             .bg(Color::Rgb(0xd4, 0xd4, 0xd4))
             .fg(Color::Rgb(0x28, 0x28, 0x32));
@@ -507,7 +538,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
             " 💬 ".to_string(),
             Style::default().fg(Color::Rgb(0xd2, 0xa2, 0x6c)),
         )];
-        let chars: Vec<char> = state.diff_comment_draft.chars().collect();
+        let chars: Vec<char> = state.code_review.comment_draft.chars().collect();
         for (i, c) in chars.iter().enumerate() {
             if i == cursor {
                 spans.push(Span::styled(c.to_string(), cursor_style));
@@ -520,7 +551,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
         }
         lines.push(Line::from(spans));
     }
-    let hint = if state.diff_commenting {
+    let hint = if state.code_review.commenting {
         Line::from(Span::styled(
             " enter submit · esc cancel · backspace delete",
             Style::default().fg(Color::Rgb(102, 102, 102)),
@@ -533,7 +564,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
     };
     lines.push(hint);
     let visible = state.viewport.saturating_sub(4);
-    let start = state.diff_start.min(scroll_max);
+    let start = state.code_review.start.min(scroll_max);
     crate::tui::render_panel(
         frame,
         area,
