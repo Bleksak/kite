@@ -3,6 +3,10 @@ pub enum Command {
     Help,
 }
 
+pub fn command_list() -> Vec<(&'static str, &'static str)> {
+    vec![("help", "show this message")]
+}
+
 impl Command {
     pub fn parse(input: &str) -> Option<Command> {
         let token = input.split_whitespace().next()?;
@@ -21,18 +25,28 @@ impl Command {
 }
 
 fn help_text() -> String {
-    "**keybindings**\n\n\
-     - C-s — open/close the session picker\n\
-     - C-q — open/close the background tasks overlay\n\
-     - C-t — cycle the thinking level\n\
-     - Tab — switch the mode (yolo ↔ plan)\n\
-     - C-p — open/close the plan popup\n\
-     - C-g — open/close the review popup\n\
-     - C-esc — cancel the running turn\n\
-     - C-c — quit\n\n\
-     **commands**\n\n\
-     - /help — show this message"
-        .to_string()
+    let commands: String = command_list()
+        .into_iter()
+        .map(|(name, description)| format!("- /{name} — {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "**keybindings**\n\n\
+         - C-s — open/close the session picker\n\
+         - C-q — open/close the background tasks overlay\n\
+         - C-t — cycle the thinking level\n\
+         - Tab — switch the mode (yolo ↔ plan)\n\
+         - C-p — open/close the plan popup\n\
+         - C-g — open/close the review popup\n\
+         - C-esc — cancel the running turn\n\
+         - C-c — quit\n\
+         - C-j/C-k — move the autocomplete selection, enter accepts it\n\n\
+         **autocomplete**\n\n\
+         - / — complete a command\n\
+         - @ — complete a file path (the file's content is included in the prompt)\n\n\
+         **commands**\n\n\
+         {commands}"
+    )
 }
 
 #[cfg(test)]
@@ -63,5 +77,6 @@ mod test {
         assert!(out.contains("C-s"));
         assert!(out.contains("C-esc"));
         assert!(out.contains("/help"));
+        assert!(out.contains("C-j"));
     }
 }

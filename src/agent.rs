@@ -202,7 +202,8 @@ impl Agent {
             };
             self.context.record_usage(usage.0, usage.1);
 
-            if let Some(terminator) = self.mode.lock().unwrap().terminator()
+            let terminator = self.mode.lock().unwrap().terminator();
+            if let Some(terminator) = terminator
                 && let Message::Assistant { tool_calls, .. } = &message
                 && let Some(call) = tool_calls.iter().find(|c| c.function.name == terminator)
             {
@@ -216,6 +217,7 @@ impl Agent {
                     header: terminator.to_string(),
                     body,
                 });
+                self.prune_file_refs();
                 return Ok(ChatOutcome::Terminated { tool });
             }
 
@@ -223,6 +225,7 @@ impl Agent {
                 Step::Done(text) => {
                     let queued = self.drain_steering();
                     if queued.is_empty() {
+                        self.prune_file_refs();
                         return Ok(ChatOutcome::Answer(text));
                     }
                     for item in queued {
@@ -231,6 +234,17 @@ impl Agent {
                 }
                 Step::Cancelled => return Ok(ChatOutcome::Cancelled),
                 Step::Continue => {}
+            }
+        }
+    }
+
+    fn prune_file_refs(&mut self) {
+        for message in self.context.messages.iter_mut() {
+            if let Message::User { content } = message {
+                let pruned = crate::auto_complete::prune_file_refs_text(content);
+                if pruned != *content {
+                    *content = pruned;
+                }
             }
         }
     }
@@ -1573,6 +1587,39 @@ mod test {
         let second = position_of(|m| matches!(m, Message::Assistant { content, .. } if content.as_deref() == Some("second")));
         assert!(first < steer);
         assert!(steer < second);
+    }
+
+    #[tokio::test]
+    async fn file_ref_content_is_pruned_when_the_turn_ends() {
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, _requests) = mock_server(vec![answer.to_string()]).await;
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        );
+        agent.context.messages.push(Message::User {
+            content: "read @a.rs\n<file path=\"a.rs\">\nfn main() {}\n</file>".into(),
+        });
+
+        let outcome = agent.chat("go", &mut |event| {}).await.unwrap();
+        assert!(matches!(outcome, ChatOutcome::Answer(_)));
+        let user = agent
+            .context
+            .messages
+            .iter()
+            .find(|m| matches!(m, Message::User { .. }))
+            .unwrap();
+        if let Message::User { content } = user {
+            assert!(content.contains("[content pruned — re-read with read_file]"));
+            assert!(!content.contains("fn main() {}"));
+        } else {
+            panic!("expected a user message");
+        }
     }
 
     #[tokio::test]

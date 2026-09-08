@@ -563,6 +563,15 @@ fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent> {
             let code = match key_event.key {
                 TermwizKeyCode::Char('\x1b') => KeyCode::Esc,
                 TermwizKeyCode::Char('\r') => KeyCode::Enter,
+                TermwizKeyCode::Char(c @ '\x01'..='\x1a') => {
+                    KeyCode::Char((c as u8 - 0x01 + b'a') as char)
+                }
+                TermwizKeyCode::Char(c)
+                    if c.is_ascii_uppercase()
+                        && key_event.modifiers.contains(Modifiers::CTRL) =>
+                {
+                    KeyCode::Char(c.to_ascii_lowercase())
+                }
                 TermwizKeyCode::Char(c) => KeyCode::Char(c),
                 TermwizKeyCode::Enter => KeyCode::Enter,
                 TermwizKeyCode::Escape => KeyCode::Esc,
@@ -687,6 +696,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 session.input = chars.into_iter().collect();
                 session.history_index = None;
                 session.error = None;
+                refresh_suggestions(session);
             }
             return KeyAction::None;
         }
@@ -1200,6 +1210,11 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             return KeyAction::None;
         }
         let session = state.session();
+        if matches!(key.code, KeyCode::Char('j') | KeyCode::Char('k'))
+            && let Some(action) = handle_suggestion_key(session, key)
+        {
+            return action;
+        }
         return match key.code {
             KeyCode::Char('s') => {
                 state.picker_open = true;
@@ -1250,6 +1265,9 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
     }
     let session = state.session();
     if session.running {
+        if let Some(action) = handle_suggestion_key(session, &key) {
+            return action;
+        }
         return match key.code {
             KeyCode::PageUp => {
                 page_up(session);
@@ -1278,11 +1296,13 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                     let text = mem::take(&mut session.input);
                     session.input_cursor = 0;
                     session.error = None;
+                    refresh_suggestions(session);
                     KeyAction::Steer(text)
                 }
             }
             KeyCode::Enter => {
                 insert_newline(session);
+                refresh_suggestions(session);
                 KeyAction::None
             }
             KeyCode::Backspace => {
@@ -1292,15 +1312,18 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                     chars.remove(session.input_cursor);
                     session.input = chars.into_iter().collect();
                     session.error = None;
+                    refresh_suggestions(session);
                 }
                 KeyAction::None
             }
             KeyCode::Left => {
                 session.input_cursor = session.input_cursor.saturating_sub(1);
+                refresh_suggestions(session);
                 KeyAction::None
             }
             KeyCode::Right => {
                 session.input_cursor = (session.input_cursor + 1).min(session.input.chars().count());
+                refresh_suggestions(session);
                 KeyAction::None
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1309,10 +1332,15 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 session.input_cursor += 1;
                 session.input = chars.into_iter().collect();
                 session.error = None;
+                refresh_suggestions(session);
                 KeyAction::None
             }
             _ => KeyAction::None,
         };
+    }
+
+    if let Some(action) = handle_suggestion_key(session, &key) {
+        return action;
     }
 
     match key.code {
@@ -1322,6 +1350,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
             {
                 insert_newline(session);
+                refresh_suggestions(session);
                 KeyAction::None
             } else {
                 let mode = *state.mode.lock().unwrap();
@@ -1334,6 +1363,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 } else {
                     let task = mem::take(&mut session.input);
                     session.input_cursor = 0;
+                    refresh_suggestions(session);
                 if !task.is_empty() {
                     session.history.push(task.clone());
                     if session.label.is_empty() {
@@ -1358,15 +1388,18 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 session.input = chars.into_iter().collect();
                 session.history_index = None;
                 session.error = None;
+                refresh_suggestions(session);
             }
             KeyAction::None
         }
         KeyCode::Left => {
             session.input_cursor = session.input_cursor.saturating_sub(1);
+            refresh_suggestions(session);
             KeyAction::None
         }
         KeyCode::Right => {
             session.input_cursor = (session.input_cursor + 1).min(session.input.chars().count());
+            refresh_suggestions(session);
             KeyAction::None
         }
         KeyCode::Up | KeyCode::Down => {
@@ -1416,6 +1449,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                     None => {}
                 }
             }
+            refresh_suggestions(session);
             KeyAction::None
         }
         KeyCode::PageUp => {
@@ -1441,6 +1475,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
             session.input_cursor += 1;
             session.history_index = None;
             session.error = None;
+            refresh_suggestions(session);
             KeyAction::None
         }
         _ => KeyAction::None,
@@ -1470,6 +1505,68 @@ fn word_right(input: &str, cursor: usize) -> usize {
         pos += 1;
     }
     pos
+}
+
+fn refresh_suggestions(session: &mut Session) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    session.suggest = crate::auto_complete::candidates(
+        &session.input,
+        session.input_cursor,
+        &cwd,
+    );
+    session.suggest_sel = 0;
+}
+
+fn handle_suggestion_key(session: &mut Session, key: &KeyEvent) -> Option<KeyAction> {
+    let len = session
+        .suggest
+        .as_ref()
+        .map(|v| v.len())
+        .filter(|n| *n > 0)
+        .unwrap_or(0);
+    if len == 0 {
+        return None;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('j') if ctrl => {
+            session.suggest_sel = (session.suggest_sel + 1) % len;
+            Some(KeyAction::None)
+        }
+        KeyCode::Char('k') if ctrl => {
+            session.suggest_sel = if session.suggest_sel == 0 {
+                len - 1
+            } else {
+                session.suggest_sel - 1
+            };
+            Some(KeyAction::None)
+        }
+        KeyCode::Enter
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            let suggestion = session.suggest.as_ref().unwrap()
+                [session.suggest_sel.min(len - 1)]
+                .clone();
+            let (input, cursor) = crate::auto_complete::apply(
+                &session.input,
+                session.input_cursor,
+                &suggestion,
+            );
+            session.input = input;
+            session.input_cursor = cursor;
+            session.suggest = None;
+            session.suggest_sel = 0;
+            Some(KeyAction::None)
+        }
+        KeyCode::Esc => {
+            session.suggest = None;
+            session.suggest_sel = 0;
+            Some(KeyAction::None)
+        }
+        _ => None,
+    }
 }
 
 fn insert_newline(session: &mut Session) {
@@ -2204,16 +2301,42 @@ impl Widget for Fill {
 pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let input_lines = active_box_lines(&state.sessions[state.active], state.pane_width);
-    let chunks = Layout::new(
-        Direction::Vertical,
-        [
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(2 + input_lines as u16),
-        ],
-    )
-    .split(area);
     let session = &state.sessions[state.active];
+    let suggest = if state.picker_open
+        || state.tasks_open
+        || state.plan_open
+        || state.diff_open
+        || session.question.is_some()
+    {
+        None
+    } else {
+        session.suggest.as_ref().filter(|v| !v.is_empty())
+    };
+    let chunks: Vec<Rect> = if let Some(suggestions) = &suggest {
+        Layout::new(
+            Direction::Vertical,
+            [
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(suggestions.len() as u16 + 2),
+                Constraint::Length(2 + input_lines as u16),
+            ],
+        )
+        .split(area)
+        .to_vec()
+    } else {
+        Layout::new(
+            Direction::Vertical,
+            [
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(2 + input_lines as u16),
+            ],
+        )
+        .split(area)
+        .to_vec()
+    };
+    let input_area = if suggest.is_some() { chunks[3] } else { chunks[2] };
 
     let mut status_spans: Vec<Span> = vec![
         Span::styled(state.model.clone(), Style::default().bold()),
@@ -2261,6 +2384,28 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     );
     frame.render_widget(Fill(Style::default()), chunks[1]);
     frame.render_widget(main, chunks[1]);
+
+    if let Some(suggestions) = &suggest {
+        let lines: Vec<Line> = suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let style = if i == session.suggest_sel {
+                    Style::default().bold().fg(Color::Rgb(0xf0, 0xc6, 0x74))
+                } else {
+                    Style::default().fg(Color::Rgb(0x81, 0xa2, 0xbe))
+                };
+                Line::from(Span::styled(format!(" {} ", s.display), style))
+            })
+            .collect();
+        render_panel(
+            frame,
+            chunks[2],
+            " complete ".to_string(),
+            lines,
+            false,
+        );
+    }
 
     if state.picker_open {
         let filtered = state.filtered();
@@ -2675,7 +2820,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         input
             .wrap(Wrap { trim: false })
             .block(input_block),
-        chunks[2],
+        input_area,
     );
 }
 
@@ -2910,6 +3055,8 @@ pub async fn run(
                             if !task.is_empty() {
                                 session.renderer.push_user(&task);
                             }
+                            let cwd = std::env::current_dir().unwrap_or_default();
+                            let task = crate::auto_complete::expand_file_refs(&task, &cwd);
                             let max = session.max_scroll(state.pane_width, state.viewport);
                             session.scroller.end(max);
                             inputs[&id].send(task)?;
@@ -2928,6 +3075,8 @@ pub async fn run(
                         } else {
                             let max = session.max_scroll(state.pane_width, state.viewport);
                             session.scroller.end(max);
+                            let cwd = std::env::current_dir().unwrap_or_default();
+                            let text = crate::auto_complete::expand_file_refs(&text, &cwd);
                             if let Some(steer) = steers.get(&id) {
                                 steer.push(text);
                             }
@@ -3134,6 +3283,42 @@ mod test {
             panic!("expected a key event");
         };
         assert_eq!(key.code, KeyCode::Esc);
+        assert!(key.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn ctrl_s_csi_u_sequence_maps_to_s_with_control() {
+        let mut parser = termwiz::input::InputParser::new();
+        let mut events = Vec::new();
+        parser.parse(
+            b"\x1b[19;5u",
+            |event| {
+                if let Some(mapped) = map_termwiz_event(event) {
+                    events.push(mapped);
+                }
+            },
+            false,
+        );
+        assert_eq!(events.len(), 1);
+        let TermEvent::Key(key) = &events[0] else {
+            panic!("expected a key event");
+        };
+        assert_eq!(key.code, KeyCode::Char('s'));
+        assert!(key.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn uppercase_c_with_control_maps_to_lowercase() {
+        let mapped = map_termwiz_event(termwiz::input::InputEvent::Key(
+            termwiz::input::KeyEvent {
+                key: termwiz::input::KeyCode::Char('S'),
+                modifiers: termwiz::input::Modifiers::CTRL,
+            },
+        ));
+        let TermEvent::Key(key) = mapped.unwrap() else {
+            panic!("expected a key event");
+        };
+        assert_eq!(key.code, KeyCode::Char('s'));
         assert!(key.modifiers.contains(KeyModifiers::CONTROL));
     }
 
@@ -6237,4 +6422,79 @@ mod test {
         let mapped = map_termwiz_event(events[0].clone()).unwrap();
         assert_eq!(key_parts(&mapped), (KeyCode::Enter, KeyModifiers::SHIFT));
     }
+
+    #[test]
+    fn typing_a_slash_prefix_opens_the_suggestion_popup() {
+        let mut state = TuiState::new("model".into());
+        handle_key(&mut state, &key(KeyCode::Char('/')));
+        handle_key(&mut state, &key(KeyCode::Char('h')));
+
+        assert_eq!(state.session().suggest.as_ref().map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn typing_at_opens_file_suggestions() {
+        let mut state = TuiState::new("model".into());
+        handle_key(&mut state, &key(KeyCode::Char('@')));
+
+        let suggestions = state.session().suggest.clone().unwrap();
+        assert!(!suggestions.is_empty());
+        assert!(suggestions.iter().all(|s| s.insert.starts_with('@')));
+    }
+
+    #[test]
+    fn c_j_and_c_k_move_the_suggestion_selection_with_wraparound() {
+        let mut state = TuiState::new("model".into());
+        handle_key(&mut state, &key(KeyCode::Char('@')));
+        let len = state.session().suggest.as_ref().unwrap().len();
+        assert!(len > 1);
+
+        handle_key(&mut state, &ctrl_key(KeyCode::Char('j')));
+        assert_eq!(state.session().suggest_sel, 1);
+        for _ in 0..len - 1 {
+            handle_key(&mut state, &ctrl_key(KeyCode::Char('j')));
+        }
+        assert_eq!(state.session().suggest_sel, 0);
+        handle_key(&mut state, &ctrl_key(KeyCode::Char('k')));
+        assert_eq!(state.session().suggest_sel, len - 1);
+    }
+
+    #[test]
+    fn enter_with_the_popup_open_accepts_and_never_submits() {
+        let mut state = TuiState::new("model".into());
+        handle_key(&mut state, &key(KeyCode::Char('/')));
+        handle_key(&mut state, &key(KeyCode::Char('h')));
+
+        assert_eq!(handle_key(&mut state, &key(KeyCode::Enter)), KeyAction::None);
+        assert_eq!(state.session().input, "/help");
+        assert_eq!(state.session().suggest, None);
+    }
+
+    #[test]
+    fn enter_with_the_popup_open_while_running_accepts_and_never_steers() {
+        let mut state = TuiState::new("model".into());
+        state.session().running = true;
+        handle_key(&mut state, &key(KeyCode::Char('/')));
+        handle_key(&mut state, &key(KeyCode::Char('h')));
+
+        assert_eq!(handle_key(&mut state, &key(KeyCode::Enter)), KeyAction::None);
+        assert_eq!(state.session().input, "/help");
+        assert_eq!(state.session().suggest, None);
+    }
+
+    #[test]
+    fn esc_dismisses_the_suggestion_popup() {
+        let mut state = TuiState::new("model".into());
+        handle_key(&mut state, &key(KeyCode::Char('/')));
+        handle_key(&mut state, &key(KeyCode::Char('h')));
+        assert!(state.session().suggest.is_some());
+
+        assert_eq!(handle_key(&mut state, &key(KeyCode::Esc)), KeyAction::None);
+        assert_eq!(state.session().suggest, None);
+        assert_eq!(state.session().input, "/h");
+    }
 }
+
+
+
+

@@ -73,6 +73,8 @@ pub struct Session {
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub question: Option<QuestionState>,
+    pub suggest: Option<Vec<crate::auto_complete::Suggestion>>,
+    pub suggest_sel: usize,
     pub plan: Option<(Vec<crate::tool::PlanStage>, usize)>,
     tail_cache: (usize, usize, usize, usize),
 }
@@ -101,6 +103,8 @@ impl Session {
             history: Vec::new(),
             history_index: None,
             question: None,
+            suggest: None,
+            suggest_sel: 0,
             plan: None,
             tail_cache: (0, 0, 0, 0),
         }

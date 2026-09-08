@@ -59,6 +59,12 @@
   chat — in-app commands are rendered in the chat and are never sent to
   the model; anything else that starts with / (unknown commands, file
   paths) is sent to the model as a normal prompt
+- Autocomplete: / completes commands, @ completes file paths (a popup
+  above the input box); C-j/C-k move the selection, enter accepts it
+  (never sends the prompt while the popup is open), esc dismisses it;
+  an @-referenced file is expanded into its content in the sent prompt
+  (500 lines / 100KB cap, binary files flagged) and the content is
+  pruned from the context when the turn ends
 - Picker: C-j/↓ down, C-k/↑ up, enter select, esc cancel, C-n new session,
   C-x close the session under the cursor, C-r rename it, typing searches
   (backspace clears)
