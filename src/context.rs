@@ -103,6 +103,7 @@ impl Context {
             .take(KEEP_RECENT_ROUNDS)
             .copied()
             .collect();
+        let superseded = self.superseded_tool_results(keep_from);
         let mut verbatim = Vec::new();
         let mut current_boundary: Option<usize> = None;
         for (index, message) in self.messages.iter().enumerate() {
@@ -114,7 +115,10 @@ impl Context {
                     current_boundary = Some(index);
                 }
                 Message::Tool { .. } => {
-                    if let Some(boundary) = current_boundary && keep_rounds.contains(&boundary) {
+                    if let Some(boundary) = current_boundary
+                        && keep_rounds.contains(&boundary)
+                        && !superseded.contains(&index)
+                    {
                         verbatim.push(index);
                     }
                 }
@@ -122,6 +126,35 @@ impl Context {
             }
         }
         verbatim
+    }
+
+    fn superseded_tool_results(&self, keep_from: usize) -> std::collections::HashSet<usize> {
+        let mut reads: Vec<(usize, Option<String>)> = Vec::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            if index < keep_from {
+                continue;
+            }
+            if let Message::Tool { tool_call_id, .. } = message {
+                let key = self
+                    .tool_call_for(tool_call_id)
+                    .filter(|call| call.function.name == "read_file")
+                    .and_then(|call| Self::tool_path(&call.function.name, &call.function.arguments));
+                reads.push((index, key));
+            }
+        }
+        let mut last_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (index, key) in &reads {
+            if let Some(path) = key {
+                last_seen.insert(path.clone(), *index);
+            }
+        }
+        reads
+            .into_iter()
+            .filter(|(index, key)| {
+                matches!(key, Some(path) if last_seen.get(path) != Some(index))
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     fn tool_call_for(&self, tool_call_id: &str) -> Option<&ToolCall> {
@@ -609,6 +642,95 @@ mod test {
             amplification < 3.0,
             "amplification {amplification:.2} should be bounded (total {total_sent} vs unique {unique})"
         );
+    }
+
+    #[test]
+    fn dedup_stubs_the_earlier_read_of_the_same_path_even_in_the_recent_rounds() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "plan it".into(),
+        });
+        context.messages.push(read_call("c1", "b.rs"));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "BBB\n".repeat(10).into(),
+        });
+        context.messages.push(read_call("c2", "a.rs"));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c2".into(),
+            content: "OLD\n".repeat(10).into(),
+        });
+        context.messages.push(read_call("c3", "a.rs"));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c3".into(),
+            content: "NEW\n".repeat(10).into(),
+        });
+
+        let json: Vec<String> = context
+            .build_messages()
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+        assert!(!json.iter().any(|j| j.contains("BBB")), "b.rs (round 1) should be stubbed: {json:?}");
+        assert!(
+            !json.iter().any(|j| j.contains("OLD")),
+            "earlier a.rs read should be stubbed by dedup: {json:?}"
+        );
+        assert!(json.iter().any(|j| j.contains("NEW")), "most recent a.rs read should be verbatim: {json:?}");
+    }
+
+    #[test]
+    fn dedup_only_applies_to_read_file_not_bash() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "plan it".into(),
+        });
+        context.messages.push(bash_call("c1", "cmd1"));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "OUT1\n".repeat(10).into(),
+        });
+        context.messages.push(bash_call("c2", "cmd2"));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c2".into(),
+            content: "OUT2\n".repeat(10).into(),
+        });
+
+        let json: Vec<String> = context
+            .build_messages()
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+        assert!(json.iter().any(|j| j.contains("OUT1")), "first bash result should be kept: {json:?}");
+        assert!(json.iter().any(|j| j.contains("OUT2")), "second bash result should be kept: {json:?}");
+    }
+
+    fn read_call(id: &str, path: &str) -> Message {
+        Message::Assistant {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                type_: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: format!("{{\"path\":\"{path}\"}}"),
+                },
+            }],
+        }
+    }
+
+    fn bash_call(id: &str, command: &str) -> Message {
+        Message::Assistant {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                type_: "function".into(),
+                function: FunctionCall {
+                    name: "bash".into(),
+                    arguments: format!("{{\"command\":\"{command}\"}}"),
+                },
+            }],
+        }
     }
 
     #[test]
