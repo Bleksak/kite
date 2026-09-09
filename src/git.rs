@@ -180,6 +180,80 @@ pub fn head_tree(cwd: Option<&Path>) -> String {
     }
 }
 
+pub fn commit(cwd: Option<&Path>, message: &str) -> Result<(), String> {
+    let base = match cwd {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    };
+    let repo = gix::open(&base).map_err(|e| e.to_string())?;
+    let work_dir = repo.workdir().ok_or("no workdir")?.to_path_buf();
+    let index = repo.index_or_empty().map_err(|e| e.to_string())?;
+    let source = gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped;
+    let mut excludes = repo.excludes(&***index, None, source).map_err(|e| e.to_string())?;
+    let mut files: Vec<(String, EntryKind, ObjectId)> = Vec::new();
+    walk(&work_dir, &work_dir, &repo, &mut excludes, &mut files);
+    let tree_id = build_tree(&repo, &files).ok_or("could not build the worktree tree")?;
+
+    let head_tree = repo.head_tree_id_or_empty().map_err(|e| e.to_string())?;
+    if tree_id == head_tree {
+        return Ok(());
+    }
+
+    let parent = repo.head_id().ok().map(|id| (*id).to_owned());
+    let identity = identity(&repo);
+    let commit = gix::objs::Commit {
+        tree: tree_id,
+        parents: parent.into_iter().collect(),
+        author: identity.clone(),
+        committer: identity,
+        encoding: None,
+        message: message.into(),
+        extra_headers: Vec::new(),
+    };
+    let oid = repo.write_object(commit).map_err(|e| e.to_string())?;
+
+    let name = gix::refs::FullName::try_from("HEAD").map_err(|e| e.to_string())?;
+    let edit = gix::refs::transaction::RefEdit {
+        name,
+        deref: true,
+        change: gix::refs::transaction::Change::Update {
+            log: gix::refs::transaction::LogChange::default(),
+            expected: gix::refs::transaction::PreviousValue::Any,
+            new: gix::refs::Target::Object((*oid).to_owned()),
+        },
+    };
+    repo.edit_references([edit]).map_err(|e| e.to_string())?;
+
+    let state = gix::index::State::from_tree(
+        &tree_id,
+        &repo,
+        gix::validate::path::component::Options::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut file = gix::index::File::from_state(state, repo.index_path());
+    file.write(gix::index::write::Options::default()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn identity(repo: &gix::Repository) -> gix::actor::Signature {
+    let snapshot = repo.config_snapshot();
+    let name = snapshot
+        .string("user.name")
+        .map(|value| value.to_string())
+        .or_else(|| std::env::var("GIT_AUTHOR_NAME").ok())
+        .unwrap_or_else(|| "kite".to_string());
+    let email = snapshot
+        .string("user.email")
+        .map(|value| value.to_string())
+        .or_else(|| std::env::var("GIT_AUTHOR_EMAIL").ok())
+        .unwrap_or_else(|| "kite@localhost".to_string());
+    gix::actor::Signature {
+        name: name.into(),
+        email: email.into(),
+        time: gix::date::Time::now_local_or_utc(),
+    }
+}
+
 pub fn diff(cwd: Option<&Path>, from: &str, to: &str) -> String {
     let base = match cwd {
         Some(p) => p.to_path_buf(),
@@ -270,7 +344,7 @@ fn read_blob(repo: &gix::Repository, oid: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod test {
-    use super::{diff, head_tree, is_ignored, snapshot_tree};
+    use super::{commit, diff, head_tree, is_ignored, snapshot_tree};
 
     fn temp_repo() -> test_files::TestFiles {
         let dir = test_files::TestFiles::new();
@@ -428,6 +502,97 @@ mod test {
                 .collect()
         };
         assert_eq!(norm(&got), norm(&expected), "\n--- got ---\n{got}\n--- expected ---\n{expected}");
+    }
+
+    #[test]
+    fn commit_stages_all_changes_with_the_message() {
+        let dir = temp_repo();
+        dir.file("a.txt", "one\n");
+        dir.file("gone.txt", "bye\n");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        dir.file("a.txt", "one\nTWO\n");
+        dir.file("b.txt", "new\n");
+        std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        assert!(commit(Some(dir.path()), "stage one").is_ok());
+
+        assert_eq!(git(&["log", "--format=%s"]).lines().next().unwrap(), "stage one");
+        let ls = git(&["ls-tree", "--name-only", "-r", "HEAD"]);
+        assert!(ls.contains("b.txt"), "new file missing: {ls}");
+        assert!(!ls.contains("gone.txt"), "deleted file still present: {ls}");
+        assert_eq!(git(&["show", "HEAD:a.txt"]), "one\nTWO\n");
+        assert_eq!(git(&["status", "--porcelain"]), "", "worktree should be clean");
+    }
+
+    #[test]
+    fn commit_with_no_changes_is_a_no_op() {
+        let dir = temp_repo();
+        dir.file("a.txt", "one\n");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let head_before = git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        assert!(commit(Some(dir.path()), "nothing").is_ok());
+
+        let head_after = git(&["rev-parse", "HEAD"]).trim().to_string();
+        assert_eq!(head_before, head_after);
+    }
+
+    #[test]
+    fn commit_in_a_fresh_repo_creates_a_root_commit() {
+        let dir = temp_repo();
+        dir.file("a.txt", "one\n");
+
+        assert!(commit(Some(dir.path()), "root").is_ok());
+
+        let log = git(dir.path(), &["log", "--format=%s %P"]);
+        assert_eq!(log.trim(), "root");
+    }
+
+    #[test]
+    fn commit_excludes_gitignored_files() {
+        let dir = temp_repo();
+        dir.file(".gitignore", "*.log\n");
+        dir.file("keep.txt", "keep\n");
+        dir.file("skip.log", "skip\n");
+
+        assert!(commit(Some(dir.path()), "c").is_ok());
+
+        let ls = git(dir.path(), &["ls-tree", "--name-only", "-r", "HEAD"]);
+        assert!(ls.contains("keep.txt"));
+        assert!(!ls.contains("skip.log"));
+    }
+
+    #[test]
+    fn commit_outside_a_repo_fails() {
+        let dir = test_files::TestFiles::new();
+        dir.file("a.txt", "one\n");
+        assert!(commit(Some(dir.path()), "c").is_err());
     }
 
     #[test]

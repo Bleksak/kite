@@ -314,6 +314,14 @@ pub fn spawn_agent(
                     if let Some(phase) = from_gate {
                         match (phase, input.is_empty()) {
                             (GatePhase::ReviewImplementation, true) => {
+                                let done_title = stages
+                                    .as_ref()
+                                    .and_then(|s| s.get(stage_index.saturating_sub(1)))
+                                    .map(|stage| stage.title.clone())
+                                    .unwrap_or_default();
+                                if !done_title.is_empty() {
+                                    crate::git::commit(cwd.as_deref(), &done_title);
+                                }
                                 if stages
                                     .as_ref()
                                     .is_some_and(|s| stage_index >= s.len())
@@ -760,6 +768,7 @@ mod test {
                 .take(3)
                 .any(|e| matches!(e, TuiEvent::StageChanged { mode: Some(Mode::Plan), .. }))
         );
+        std::fs::write(repo.path().join("entity.rs"), "entity\n").unwrap();
 
         input_tx.send(String::new()).unwrap();
         assert!(
@@ -779,6 +788,7 @@ mod test {
             ))
             .await
         );
+        std::fs::write(repo.path().join("controller.rs"), "controller\n").unwrap();
         input_tx.send(String::new()).unwrap();
         assert!(
             wait_for_event(&mut event_rx, &mut events, |e| matches!(
@@ -788,6 +798,15 @@ mod test {
             .await
         );
         handle.abort();
+
+        let log = std::process::Command::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(log.lines().any(|l| l == "data"), "missing the stage one commit: {log}");
+        assert!(log.lines().any(|l| l == "api"), "missing the stage two commit: {log}");
 
         let mut requests = vec![];
         while let Ok(body) = rx_req.try_recv() {

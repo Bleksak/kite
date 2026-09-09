@@ -31,7 +31,9 @@
   gate opens ("Step N implemented — review the implementation"; still in
   implement mode): Enter moves to the next step's review (fresh context), typing
   feedback re-implements the stage (keeping the implementation's context);
-  on the last stage Enter completes the plan and returns to yolo.
+  on the last stage Enter completes the plan and returns to yolo. Approving a
+  stage's review commits the stage's changes with the stage title as the
+  commit message
   Escalating re-plans the remaining stages automatically in a fresh plan context
   and the step review gate opens again
 - C-p: open/close the plan popup — shows the viewed stage's title and tasks
