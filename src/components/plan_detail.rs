@@ -27,7 +27,7 @@ fn scroll_max(stages: &[crate::tool::PlanStage], view: usize, viewport: usize) -
         return 0;
     };
     let total =
-        1 + 1 + if stage.tasks.is_empty() { 1 } else { stage.tasks.len() } + 1;
+        1 + 1 + stage.description.lines().count().max(1) + 1;
     let visible = viewport.saturating_sub(4);
     total.saturating_sub(visible)
 }
@@ -140,15 +140,10 @@ pub fn draw(frame: &mut Frame, state: &TuiState, area: Rect) {
         let mut md = String::new();
         md.push_str(&stage.title);
         md.push_str("\n\n");
-        if stage.tasks.is_empty() {
-            md.push_str("_no tasks_");
+        if stage.description.trim().is_empty() {
+            md.push_str("_no description_");
         } else {
-            for (i, task) in stage.tasks.iter().enumerate() {
-                md.push_str(&format!("{}. {}\n", i + 1, task));
-            }
-            if md.ends_with('\n') {
-                md.pop();
-            }
+            md.push_str(&stage.description);
         }
         lines = crate::transcript::render_markdown_lines(&md);
     }

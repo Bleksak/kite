@@ -82,7 +82,7 @@ pub enum Tool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanStage {
     pub title: String,
-    pub tasks: Vec<String>,
+    pub description: String,
 }
 
 pub fn plan_text(stages: &[PlanStage]) -> String {
@@ -90,13 +90,13 @@ pub fn plan_text(stages: &[PlanStage]) -> String {
         .iter()
         .enumerate()
         .map(|(i, stage)| {
-            let tasks = stage
-                .tasks
-                .iter()
-                .map(|task| format!("- {task}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("Step {} of {}: {}\n{}", i + 1, stages.len(), stage.title, tasks)
+            format!(
+                "Step {} of {}: {}\n{}",
+                i + 1,
+                stages.len(),
+                stage.title,
+                stage.description
+            )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -132,7 +132,7 @@ pub fn parse_stages(arguments: &str) -> Result<Vec<PlanStage>, String> {
                 if let Some(title) = item.as_str() {
                     return Some(PlanStage {
                         title: title.to_string(),
-                        tasks: vec![title.to_string()],
+                        description: title.to_string(),
                     });
                 }
                 let obj = item.as_object()?;
@@ -143,37 +143,41 @@ pub fn parse_stages(arguments: &str) -> Result<Vec<PlanStage>, String> {
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .unwrap_or_else(|| "Step".to_string());
-                let tasks = match obj.get("tasks").or_else(|| obj.get("items")) {
-                    Some(serde_json::Value::String(s)) => vec![s.clone()],
-                    Some(serde_json::Value::Array(items)) => items
-                        .iter()
-                        .filter_map(|t| t.as_str().map(str::to_string))
-                        .collect(),
-                    _ => vec![obj
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .unwrap_or_default()],
+                let description = match obj.get("description") {
+                    Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.clone(),
+                    _ => obj
+                        .get("tasks")
+                        .or_else(|| obj.get("items"))
+                        .map(|value| match value {
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Array(items) => items
+                                .iter()
+                                .filter_map(|t| t.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            _ => String::new(),
+                        })
+                        .unwrap_or_default(),
                 };
-                if tasks.is_empty() {
+                if description.trim().is_empty() {
                     return None;
                 }
                 Some(PlanStage {
                     title,
-                    tasks,
+                    description,
                 })
             })
             .collect();
         if !parsed.is_empty() {
             return Ok(parsed);
         }
-        return Err("no stage had a title and at least one task".to_string());
+        return Err("no stage had a title and a description".to_string());
     }
 
     if let Some(plan) = value.get("plan").and_then(|p| p.as_str()) {
         return Ok(vec![PlanStage {
             title: "Plan".to_string(),
-            tasks: vec![plan.to_string()],
+            description: plan.to_string(),
         }]);
     }
 
@@ -661,13 +665,13 @@ impl TryFrom<OpenAIToolCall> for Tool {
                 })?;
                 if stages
                     .iter()
-                    .any(|s| s.title.trim().is_empty() || s.tasks.is_empty())
+                    .any(|s| s.title.trim().is_empty() || s.description.trim().is_empty())
                 {
                     Err(ToolError::InvalidArguments {
                         name: function.name.clone(),
                         raw: function.arguments.clone(),
                         source: serde::de::Error::custom(
-                            "each stage needs a title and at least one task",
+                            "each stage needs a title and a description",
                         ),
                     })
                 } else {
@@ -791,19 +795,17 @@ fn parameters(tool: &Tool) -> serde_json::Value {
                 "stages": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "the implementation plan split into stages; each stage is a self-contained set of tasks the user reviews before it is implemented",
+                    "description": "the implementation plan split into stages; each stage is a self-contained unit the user reviews before it is implemented",
                     "items": {
                         "type": "object",
                         "properties": {
                             "title": { "type": "string", "description": "a short stage name" },
-                            "tasks": {
-                                "type": "array",
-                                "minItems": 1,
-                                "items": { "type": "string" },
-                                "description": "the concrete tasks of this stage"
+                            "description": {
+                                "type": "string",
+                                "description": "a markdown description of the stage: the concrete changes, the files to touch, and how to verify"
                             }
                         },
-                        "required": ["title", "tasks"]
+                        "required": ["title", "description"]
                     }
                 }
             },
@@ -1622,7 +1624,7 @@ version: 3"#,
     fn try_from_submit_plan_stages() {
         let tool = Tool::try_from(call(
             "submit_plan",
-            r#"{"stages":[{"title":"data","tasks":["entity","migration"]},{"title":"api","tasks":["controller"]}]}"#,
+            r#"{"stages":[{"title":"data","description":"add the entity and migration"},{"title":"api","description":"add the controller"}]}"#,
         ))
         .unwrap();
         assert_eq!(
@@ -1630,11 +1632,11 @@ version: 3"#,
             Tool::SubmitPlan(vec![
                 PlanStage {
                     title: "data".into(),
-                    tasks: vec!["entity".into(), "migration".into()],
+                    description: "add the entity and migration".into(),
                 },
                 PlanStage {
                     title: "api".into(),
-                    tasks: vec!["controller".into()],
+                    description: "add the controller".into(),
                 },
             ])
         );
@@ -1647,10 +1649,10 @@ version: 3"#,
     }
 
     #[test]
-    fn try_from_submit_plan_stage_without_tasks_is_an_error() {
+    fn try_from_submit_plan_stage_without_description_is_an_error() {
         let error = Tool::try_from(call(
             "submit_plan",
-            r#"{"stages":[{"title":"data","tasks":[]}]}"#,
+            r#"{"stages":[{"title":"data"}]}"#,
         ))
         .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArguments { .. }));
@@ -1661,16 +1663,16 @@ version: 3"#,
         let stages = vec![
             PlanStage {
                 title: "data".into(),
-                tasks: vec!["entity".into(), "migration".into()],
+                description: "add the entity\nadd the migration".into(),
             },
             PlanStage {
                 title: "api".into(),
-                tasks: vec!["controller".into()],
+                description: "add the controller".into(),
             },
         ];
         assert_eq!(
             plan_text(&stages),
-            "Step 1 of 2: data\n- entity\n- migration\n\nStep 2 of 2: api\n- controller"
+            "Step 1 of 2: data\nadd the entity\nadd the migration\n\nStep 2 of 2: api\nadd the controller"
         );
     }
 
@@ -1800,21 +1802,32 @@ version: 3"#,
     #[test]
     fn parse_stages_reads_the_stages_array() {
         let stages = parse_stages(
-            r#"{"stages":[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]}"#,
+            r#"{"stages":[{"title":"One","description":"a and b"},{"title":"Two","description":"c"}]}"#,
         )
         .unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "One");
-        assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(stages[0].description, "a and b");
         assert_eq!(stages[1].title, "Two");
     }
 
     #[test]
-    fn parse_stages_accepts_a_task_string_not_just_an_array() {
+    fn parse_stages_falls_back_to_a_tasks_list() {
+        let stages = parse_stages(
+            r#"{"stages":[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].description, "a\nb");
+        assert_eq!(stages[1].description, "c");
+    }
+
+    #[test]
+    fn parse_stages_accepts_a_bare_tasks_string() {
         let stages =
             parse_stages(r#"{"stages":[{"title":"One","tasks":"just a string"}]}"#).unwrap();
         assert_eq!(stages.len(), 1);
-        assert_eq!(stages[0].tasks, vec!["just a string".to_string()]);
+        assert_eq!(stages[0].description, "just a string");
     }
 
     #[test]
@@ -1822,7 +1835,7 @@ version: 3"#,
         let stages = parse_stages(r#"{"stages":["first step","second step"]}"#).unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "first step");
-        assert_eq!(stages[0].tasks, vec!["first step".to_string()]);
+        assert_eq!(stages[0].description, "first step");
     }
 
     #[test]
@@ -1830,29 +1843,31 @@ version: 3"#,
         let stages = parse_stages(r#"{"plan":"the whole plan as text"}"#).unwrap();
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].title, "Plan");
-        assert_eq!(stages[0].tasks, vec!["the whole plan as text".to_string()]);
+        assert_eq!(stages[0].description, "the whole plan as text");
     }
 
     #[test]
     fn parse_stages_accepts_a_double_encoded_stages_string() {
-        let inner = r#"[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]"#;
+        let inner =
+            r#"[{"title":"One","description":"a and b"},{"title":"Two","description":"c"}]"#;
         let args = format!("{{\"stages\":{}}}", serde_json::to_string(inner).unwrap());
         let stages = parse_stages(&args).unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "One");
-        assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(stages[0].description, "a and b");
         assert_eq!(stages[1].title, "Two");
     }
 
     #[test]
     fn parse_stages_accepts_a_stages_string_with_trailing_garbage() {
-        let inner = r#"[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]"#;
+        let inner =
+            r#"[{"title":"One","description":"a and b"},{"title":"Two","description":"c"}]"#;
         let with_garbage = format!("{inner}}}");
         let args = format!("{{\"stages\":{}}}", serde_json::to_string(&with_garbage).unwrap());
         let stages = parse_stages(&args).unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "One");
-        assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(stages[0].description, "a and b");
         assert_eq!(stages[1].title, "Two");
     }
 

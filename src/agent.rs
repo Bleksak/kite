@@ -1554,7 +1554,7 @@ mod test {
 
     #[tokio::test]
     async fn the_terminator_ends_the_turn_and_captures_the_payload() {
-        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"tasks\\\":[\\\"do it\\\"]}]}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"description\\\":\\\"do it\\\"}]}\"}}]}}]}\n\ndata: [DONE]\n\n";
         let (base_url, _requests) = mock_server(vec![sse.to_string()]).await;
         let mut agent = plan_agent(base_url);
         let mut events = Vec::new();
@@ -1568,7 +1568,7 @@ mod test {
             ChatOutcome::Terminated {
                 tool: Tool::SubmitPlan(vec![crate::tool::PlanStage {
                     title: "step one".into(),
-                    tasks: vec!["do it".into()],
+                    description: "do it".into(),
                 }]),
             }
         );
@@ -1581,7 +1581,7 @@ mod test {
     async fn sibling_calls_are_dropped_when_the_terminator_is_called() {
         let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n"
             .to_string()
-            + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"tasks\\\":[\\\"do it\\\"]}]}\"}}]}}]}\n\n"
+            + "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"description\\\":\\\"do it\\\"}]}\"}}]}}]}\n\n"
             + "data: [DONE]\n\n";
         let (base_url, _requests) = mock_server(vec![sse]).await;
         let mut agent = plan_agent(base_url);

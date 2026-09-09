@@ -2506,11 +2506,11 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
         vec![
             crate::tool::PlanStage {
                 title: "data".into(),
-                tasks: vec!["entity".into(), "migration".into()],
+                description: "add the entity\nadd the migration".into(),
             },
             crate::tool::PlanStage {
                 title: "api".into(),
-                tasks: vec!["controller".into()],
+                description: "add the controller".into(),
             },
         ]
     }

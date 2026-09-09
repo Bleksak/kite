@@ -23,17 +23,12 @@ fn stage_implement_message(
     } else {
         String::new()
     };
-    let tasks = stage
-        .tasks
-        .iter()
-        .map(|task| format!("- {task}"))
-        .collect::<Vec<_>>()
-        .join("\n");
     format!(
-        "Execute Step {} of {}: {}\nTasks:\n{tasks}\n{}Do not start later stages.",
+        "Execute Step {} of {}: {}\n{}\n{}Do not start later stages.",
         index + 1,
         stages.len(),
         stage.title,
+        stage.description,
         done
     )
 }
@@ -49,17 +44,12 @@ fn stage_reimplement_message(
         );
     };
     let stage = &stages[index];
-    let tasks = stage
-        .tasks
-        .iter()
-        .map(|task| format!("- {task}"))
-        .collect::<Vec<_>>()
-        .join("\n");
     format!(
-        "Re-implement Step {} of {}: {}\nTasks:\n{tasks}\n\nThe previous implementation was rejected. Feedback: {feedback}\n\nAddress the feedback, keeping what is already done, and re-implement this stage. Do not start later stages.",
+        "Re-implement Step {} of {}: {}\n{}\n\nThe previous implementation was rejected. Feedback: {feedback}\n\nAddress the feedback, keeping what is already done, and re-implement this stage. Do not start later stages.",
         index + 1,
         stages.len(),
-        stage.title
+        stage.title,
+        stage.description
     )
 }
 
@@ -89,29 +79,24 @@ fn stage_step_replan_message(
         );
     };
     let stage = &stages[index];
-    let tasks = stage
-        .tasks
-        .iter()
-        .map(|task| format!("- {task}"))
-        .collect::<Vec<_>>()
-        .join("\n");
     let others = stages
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != index)
-        .map(|(i, s)| format!("Step {}: {} ({})", i + 1, s.title, s.tasks.join(", ")))
+        .map(|(i, s)| format!("Step {}: {}\n{}", i + 1, s.title, s.description))
         .collect::<Vec<_>>()
-        .join("; ");
+        .join("\n");
     let others_note = if others.is_empty() {
         String::new()
     } else {
-        format!("Keep the other stages unchanged: {others}. ")
+        format!("Keep the other stages unchanged:\n{others}\n")
     };
     format!(
-        "Step {} of {}: {}\nTasks:\n{tasks}\n\nThe step was rejected. Feedback: {feedback}\n\nRe-plan only this step. {others_note}Call submit_plan with all stages, changing only this step.",
+        "Step {} of {}: {}\n{}\n\nThe step was rejected. Feedback: {feedback}\n\nRe-plan only this step. {others_note}Call submit_plan with all stages, changing only this step.",
         index + 1,
         stages.len(),
-        stage.title
+        stage.title,
+        stage.description
     )
 }
 
@@ -544,7 +529,7 @@ mod test {
         let repo = git_repo();
         let (tx_req, mut rx_req) = tokio::sync::mpsc::unbounded_channel::<String>();
         let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"tasks\\\":[\\\"do it\\\"]}]}\"}}]}}]}\n\ndata: [DONE]\n\n".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"description\\\":\\\"do it\\\"}]}\"}}]}}]}\n\ndata: [DONE]\n\n".to_string(),
             "data: {\"choices\":[{\"delta\":{\"content\":\"implemented\"}}]}\n\ndata: [DONE]\n\n".to_string(),
         ])));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -698,7 +683,7 @@ mod test {
     #[tokio::test]
     async fn staged_plan_walks_through_every_stage_with_a_review_gate() {
         let repo = git_repo();
-        let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
+        let stages = r#"{\"stages\":[{\"title\":\"data\",\"description\":\"entity\"},{\"title\":\"api\",\"description\":\"controller\"}]}"#;
         let (base_url, mut rx_req) = staged_mock_server(vec![
             plan_sse("c1", stages),
             "data: {\"choices\":[{\"delta\":{\"content\":\"stage one done\"}}]}\n\ndata: [DONE]\n\n".to_string(),
@@ -790,7 +775,7 @@ mod test {
     #[tokio::test]
     async fn review_gate_feedback_replans_only_the_rejected_step() {
         let repo = git_repo();
-        let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
+        let stages = r#"{\"stages\":[{\"title\":\"data\",\"description\":\"entity\"},{\"title\":\"api\",\"description\":\"controller\"}]}"#;
         let (base_url, mut rx_req) = staged_mock_server(vec![
             plan_sse("c1", stages),
             "data: {\"choices\":[{\"delta\":{\"content\":\"stage one done\"}}]}\n\ndata: [DONE]\n\n".to_string(),
@@ -865,7 +850,7 @@ mod test {
     #[tokio::test]
     async fn implementation_gate_feedback_reimplements_the_current_stage() {
         let repo = git_repo();
-        let stages = r#"{\"stages\":[{\"title\":\"data\",\"tasks\":[\"entity\"]},{\"title\":\"api\",\"tasks\":[\"controller\"]}]}"#;
+        let stages = r#"{\"stages\":[{\"title\":\"data\",\"description\":\"entity\"},{\"title\":\"api\",\"description\":\"controller\"}]}"#;
         let (base_url, mut rx_req) = staged_mock_server(vec![
             plan_sse("c1", stages),
             "data: {\"choices\":[{\"delta\":{\"content\":\"stage one done\"}}]}\n\ndata: [DONE]\n\n".to_string(),
