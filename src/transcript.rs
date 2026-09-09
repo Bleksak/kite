@@ -81,6 +81,8 @@ pub struct TuiRenderer {
     answer_start: Option<usize>,
 
     tool_blocks: std::collections::HashMap<String, (usize, usize)>,
+
+    expandable: std::collections::HashMap<usize, String>,
 }
 
 impl TuiRenderer {
@@ -101,6 +103,8 @@ impl TuiRenderer {
             answer_start: None,
 
             tool_blocks: std::collections::HashMap::new(),
+
+            expandable: std::collections::HashMap::new(),
         }
     }
 
@@ -492,6 +496,10 @@ impl TuiRenderer {
 
     const TOOL_BODY_LINE_CAP: usize = 3;
 
+    pub fn expandable_at(&self, line_index: usize) -> Option<&str> {
+        self.expandable.get(&line_index).map(|s| s.as_str())
+    }
+
     fn push_indented(&mut self, body: &str, block: BlockKind) {
         let lines: Vec<&str> = body.trim_end_matches('\n').split('\n').collect();
         for line in lines.iter().take(Self::TOOL_BODY_LINE_CAP) {
@@ -509,6 +517,7 @@ impl TuiRenderer {
         }
         if lines.len() > Self::TOOL_BODY_LINE_CAP {
             let more = lines.len() - Self::TOOL_BODY_LINE_CAP;
+            let note_index = self.scrollback.len();
             self.push_line(
                 Line::from(Span::styled(
                     format!("  … ({more} more lines)"),
@@ -516,6 +525,7 @@ impl TuiRenderer {
                 )),
                 block,
             );
+            self.expandable.insert(note_index, body.to_string());
         }
     }
 
@@ -1386,6 +1396,34 @@ mod test {
             text.iter().any(|l| l.contains("2 more lines")),
             "should have the note"
         );
+    }
+
+    #[test]
+    fn expandable_at_returns_the_full_body_for_the_note_line() {
+        let mut renderer = TuiRenderer::new();
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "bash".into(),
+            body: Some("echo out".into()),
+        });
+        renderer.on_event(AgentEvent::ToolResult {
+            header: "bash".into(),
+            body: "line1\nline2\nline3\nline4\nline5".into(),
+        });
+
+        let note_index = renderer
+            .scrollback()
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains("more lines"))
+            })
+            .map(|(i, _)| i)
+            .expect("should have a note line");
+        let full = renderer.expandable_at(note_index).expect("should be expandable");
+        assert_eq!(full, "line1\nline2\nline3\nline4\nline5");
+        assert!(renderer.expandable_at(0).is_none(), "non-note lines are not expandable");
     }
 
     #[test]

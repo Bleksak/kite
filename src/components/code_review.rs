@@ -343,6 +343,7 @@ pub fn mouse(state: &mut TuiState, mouse: &MouseEvent) -> Option<KeyAction> {
             cr.start = (cr.start + 3).min(max);
             KeyAction::None
         }
+        _ => KeyAction::None,
     })
 }
 

@@ -53,6 +53,7 @@ pub fn mouse(state: &mut TuiState, mouse: &MouseEvent) -> Option<KeyAction> {
             plan.scroll.toward_bottom(3, max);
             KeyAction::None
         }
+        _ => KeyAction::None,
     })
 }
 

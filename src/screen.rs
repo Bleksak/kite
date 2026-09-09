@@ -17,4 +17,8 @@ pub enum Screen {
         list: task_list::State,
     },
     PlanDetail(plan_detail::State),
+    ToolDetail {
+        body: String,
+        scroll: crate::session::Scroller,
+    },
 }

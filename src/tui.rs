@@ -229,6 +229,20 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         if let Some(action) = crate::components::task_detail::mouse(state, mouse) {
             return action;
         }
+        if let Some(action) = crate::components::tool_detail::mouse(state, mouse) {
+            return action;
+        }
+        if matches!(mouse.kind, MouseEventKind::LeftClick) {
+            let offset = state.session().scroller.offset();
+            let line_index = mouse.y.saturating_sub(4).saturating_sub(offset as u16) as usize;
+            if let Some(body) = state.session().renderer.expandable_at(line_index) {
+                state.screen = crate::screen::Screen::ToolDetail {
+                    body: body.to_string(),
+                    scroll: crate::session::Scroller::default(),
+                };
+            }
+            return KeyAction::None;
+        }
         let (pane_width, viewport) = (state.pane_width, state.viewport);
         let session = state.session();
         return match mouse.kind {
@@ -240,6 +254,7 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
                 mouse_down(session, pane_width, viewport);
                 KeyAction::None
             }
+            _ => KeyAction::None,
         };
     }
     let TermEvent::Key(key) = event else {
@@ -264,6 +279,9 @@ pub fn handle_key(state: &mut TuiState, event: &TermEvent) -> KeyAction {
         return KeyAction::Quit;
     }
     if let Some(action) = crate::components::task_detail::handle_key(state, key) {
+        return action;
+    }
+    if let Some(action) = crate::components::tool_detail::handle_key(state, key) {
         return action;
     }
     if let Some(action) = crate::components::session_picker::handle_key(state, key) {
@@ -1243,6 +1261,9 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         crate::screen::Screen::TaskDetail { .. } => {
             crate::components::task_detail::draw(frame, state, chunks[1])
         }
+        crate::screen::Screen::ToolDetail { .. } => {
+            crate::components::tool_detail::draw(frame, state, chunks[1])
+        }
         crate::screen::Screen::Chat => {}
     }
 
@@ -1929,7 +1950,7 @@ impl InputParser {
                     65 => MouseEventKind::ScrollDown,
                     _ => return None,
                 };
-                Some(TermEvent::Mouse(MouseEvent { kind }))
+                Some(TermEvent::Mouse(MouseEvent { kind, x: 0, y: 0 }))
             }
             _ => None,
         }
@@ -2022,7 +2043,48 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
     }
 
     fn mouse(kind: MouseEventKind) -> TermEvent {
-        TermEvent::Mouse(MouseEvent { kind })
+        TermEvent::Mouse(MouseEvent { kind, x: 0, y: 0 })
+    }
+
+    fn mouse_at(kind: MouseEventKind, x: u16, y: u16) -> TermEvent {
+        TermEvent::Mouse(MouseEvent { kind, x, y })
+    }
+
+    #[test]
+    fn clicking_a_capped_tool_result_opens_the_full_output() {
+        let mut state = TuiState::new("model".into());
+        state.session().renderer.on_event(AgentEvent::ToolStarted {
+            header: "bash".into(),
+            body: Some("echo out".into()),
+        });
+        state.session().renderer.on_event(AgentEvent::ToolResult {
+            header: "bash".into(),
+            body: "line1\nline2\nline3\nline4\nline5".into(),
+        });
+
+        let note_index = state
+            .session()
+            .renderer
+            .scrollback()
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                line.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains("more lines"))
+            })
+            .map(|(i, _)| i)
+            .expect("should have a note line");
+
+        handle_key(&mut state, &mouse_at(MouseEventKind::LeftClick, 0, 4 + note_index as u16));
+        let body = match &state.screen {
+            crate::screen::Screen::ToolDetail { body, .. } => body.clone(),
+            _ => panic!("should open the ToolDetail screen"),
+        };
+        assert_eq!(body, "line1\nline2\nline3\nline4\nline5");
+
+        handle_key(&mut state, &key(KeyCode::Esc));
+        assert!(matches!(state.screen, crate::screen::Screen::Chat));
     }
 
     #[test]
@@ -5355,7 +5417,7 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
-            TermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp })
+            TermEvent::Mouse(MouseEvent { kind: MouseEventKind::ScrollUp, .. })
         ));
     }
 

@@ -53,11 +53,14 @@ impl KeyEvent {
 pub enum MouseEventKind {
     ScrollUp,
     ScrollDown,
+    LeftClick,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MouseEvent {
     pub kind: MouseEventKind,
+    pub x: u16,
+    pub y: u16,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -118,6 +121,13 @@ pub fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent>
         }
         termwiz::input::InputEvent::Mouse(mouse) => {
             use termwiz::input::MouseButtons;
+            if mouse.mouse_buttons.contains(MouseButtons::LEFT) {
+                return Some(TermEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::LeftClick,
+                    x: mouse.x,
+                    y: mouse.y,
+                }));
+            }
             if !mouse.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
                 return None;
             }
@@ -126,7 +136,7 @@ pub fn map_termwiz_event(event: termwiz::input::InputEvent) -> Option<TermEvent>
             } else {
                 MouseEventKind::ScrollDown
             };
-            Some(TermEvent::Mouse(MouseEvent { kind }))
+            Some(TermEvent::Mouse(MouseEvent { kind, x: 0, y: 0 }))
         }
         termwiz::input::InputEvent::Paste(text) => Some(TermEvent::Paste(text)),
         _ => None,
