@@ -1312,6 +1312,80 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
 }
 
 
+fn apply_tui_event(state: &mut TuiState, event: TuiEvent) {
+    match event {
+        TuiEvent::Agent { session: id, event } => {
+            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                if let AgentEvent::AskUser { questions, reply } = &event {
+                    let mut q = QuestionState::new(questions.clone());
+                    q.reply = Some(reply.clone());
+                    session.question = Some(q);
+                }
+                session.renderer.on_event(event);
+                let max = session.max_scroll(state.pane_width, state.viewport);
+                session.scroller.follow_tail(max);
+            }
+        }
+        TuiEvent::TurnDone { session: id, context } => {
+            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                session.renderer.finish();
+                session.running = false;
+                session.prompt_tokens = context.total_prompt_tokens;
+                session.completion_tokens = context.total_completion_tokens;
+                session.context = Some(context.clone());
+                if let Some(saved) = &session.context {
+                    session_store::save_session(
+                        Path::new(CONTEXT_DIR),
+                        id,
+                        &session.label,
+                        saved,
+                        &session.history,
+                    );
+                }
+            }
+        }
+        TuiEvent::TurnError { session: id, message } => {
+            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                session.renderer.finish();
+                session.running = false;
+                session.error = Some(message);
+                if let Some(saved) = &session.context {
+                    session_store::save_session(
+                        Path::new(CONTEXT_DIR),
+                        id,
+                        &session.label,
+                        saved,
+                        &session.history,
+                    );
+                }
+            }
+        }
+        TuiEvent::GatePending { session: id, message } => {
+            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                session.gate = true;
+                session.gate_message = message;
+                session.running = false;
+            }
+        }
+        TuiEvent::StageChanged { session: id, mode } => {
+            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                session.stage = mode;
+                session.gate = false;
+            }
+        }
+        TuiEvent::PlanUpdated { session: id, plan } => {
+            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                session.plan = plan;
+            }
+        }
+        TuiEvent::ReviewBaseline { session: id, baseline } => {
+            if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
+                session.review_baseline = baseline;
+            }
+        }
+    }
+}
+
 pub async fn run(
     new_agent: impl Fn() -> Agent + Send + Sync + 'static,
     model: String,
@@ -1439,80 +1513,10 @@ pub async fn run(
                 }
             }
             event = agent_rx.recv() => {
-                match event {
-                    Some(TuiEvent::Agent { session: id, event }) => {
-                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                            if let AgentEvent::AskUser { questions, reply } = &event {
-                                let mut q = QuestionState::new(questions.clone());
-                                q.reply = Some(reply.clone());
-                                session.question = Some(q);
-                            }
-                            session.renderer.on_event(event);
-                            let max = session.max_scroll(state.pane_width, state.viewport);
-                            session.scroller.follow_tail(max);
-                        }
-                    }
-                    Some(TuiEvent::TurnDone {
-                        session: id,
-                        context,
-                    }) => {
-                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                            session.renderer.finish();
-                            session.running = false;
-                            session.prompt_tokens = context.total_prompt_tokens;
-                            session.completion_tokens = context.total_completion_tokens;
-                            session.context = Some(context.clone());
-                            if let Some(saved) = &session.context {
-                                session_store::save_session(
-                                    Path::new(CONTEXT_DIR),
-                                    id,
-                                    &session.label,
-                                    saved,
-                                    &session.history,
-                                );
-                            }
-                        }
-                    }
-                    Some(TuiEvent::TurnError { session: id, message }) => {
-                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                            session.renderer.finish();
-                            session.running = false;
-                            session.error = Some(message);
-                            if let Some(saved) = &session.context {
-                                session_store::save_session(
-                                    Path::new(CONTEXT_DIR),
-                                    id,
-                                    &session.label,
-                                    saved,
-                                    &session.history,
-                                );
-                            }
-                        }
-                    }
-                    Some(TuiEvent::GatePending { session: id, message }) => {
-                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                            session.gate = true;
-                            session.gate_message = message;
-                            session.running = false;
-                        }
-                    }
-                    Some(TuiEvent::StageChanged { session: id, mode }) => {
-                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                            session.stage = mode;
-                            session.gate = false;
-                        }
-                    }
-                    Some(TuiEvent::PlanUpdated { session: id, plan }) => {
-                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                            session.plan = plan;
-                        }
-                    }
-                    Some(TuiEvent::ReviewBaseline { session: id, baseline }) => {
-                        if let Some(session) = state.sessions.iter_mut().find(|s| s.id == id) {
-                            session.review_baseline = baseline;
-                        }
-                    }
-                    None => break,
+                if let Some(event) = event {
+                    apply_tui_event(&mut state, event);
+                } else {
+                    break;
                 }
             }
             key = key_rx.recv() => {
@@ -1611,6 +1615,9 @@ pub async fn run(
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(16)) => {}
+        }
+        while let Ok(event) = agent_rx.try_recv() {
+            apply_tui_event(&mut state, event);
         }
         let size = terminal.size();
         state.pane_width = size
