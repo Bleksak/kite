@@ -1038,11 +1038,11 @@ fn mouse_down(session: &mut Session, pane_width: usize, viewport: usize) {
     session.scroller.toward_bottom(MOUSE, max);
 }
 
-fn display_lines(
-    scrollback: &[Line<'static>],
+fn display_lines<'a>(
+    scrollback: &'a [Line<'static>],
     blocks: &[BlockKind],
     width: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<Line<'a>> {
     scrollback
         .iter()
         .zip(blocks.iter())
@@ -1062,7 +1062,7 @@ fn display_lines(
                         .spans
                         .iter()
                         .map(|span| Span {
-                            content: std::borrow::Cow::Owned(span.content.to_string()),
+                            content: std::borrow::Cow::Borrowed(span.content.as_ref()),
                             style: span.style,
                         })
                         .collect(),
@@ -1078,7 +1078,7 @@ fn display_lines(
                         None => span.style,
                     };
                     Span {
-                        content: std::borrow::Cow::Owned(span.content.to_string()),
+                        content: std::borrow::Cow::Borrowed(span.content.as_ref()),
                         style,
                     }
                 })
