@@ -168,6 +168,7 @@ impl Agent {
         on_event: &mut impl FnMut(AgentEvent),
     ) -> Result<ChatOutcome, Box<dyn std::error::Error>> {
         self.context.system_prompt = self.mode.lock().unwrap().system_prompt_with_cwd();
+        self.context.seal_dangling_tool_calls();
         let base = self.cancel.as_ref().map(|rx| *rx.borrow());
         let mut round = 0;
         loop {
@@ -181,7 +182,7 @@ impl Agent {
             for text in self.drain_steering() {
                 self.context.messages.push(Message::User { content: text });
             }
-            if self.context.needs_compaction() && !self.context.is_in_progress() {
+            if self.context.needs_compaction() {
                 self.compact_context().await;
             }
             self.report_bg_tasks(on_event);
@@ -262,7 +263,7 @@ impl Agent {
     }
 
     async fn compact_context(&mut self) {
-        let keep_recent = self.context.max_tokens / 2;
+        let keep_recent = self.context.keep_recent_tokens();
         let Some(cut_point) = self.context.compact_point(keep_recent) else {
             return;
         };
@@ -775,6 +776,116 @@ mod test {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Streams SSE for completions and returns JSON for the non-streaming
+    /// summarization call, so a single agent run can do both.
+    async fn hybrid_mock_server(
+        sse: Vec<String>,
+        json: String,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let sse = Arc::new(Mutex::new(sse.into_iter()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let tx = tx.clone();
+                let sse = sse.clone();
+                let json = json.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    let mut body = String::new();
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                data.extend_from_slice(&buf[..n]);
+                                if let Some(complete) = complete_request(&data) {
+                                    body = complete.clone();
+                                    let _ = tx.send(complete);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let response = if body.contains("\"stream\":true") {
+                        let sse = sse.lock().unwrap().next().unwrap_or_else(|| {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                                .to_string()
+                        });
+                        format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{sse}")
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{json}")
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn compaction_runs_while_a_turn_is_still_in_progress() {
+        let (base_url, mut requests) = hybrid_mock_server(
+            vec!["data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n".to_string()],
+            "{\"choices\":[{\"message\":{\"content\":\"Test goal summary\"}}]}".to_string(),
+        )
+        .await;
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            1000,
+            Duration::from_secs(30),
+        );
+        agent.context.messages.push(Message::User {
+            content: "old work ".repeat(1000).into(),
+        });
+        agent.context.messages.push(Message::Assistant {
+            content: None,
+            tool_calls: vec![tool_call("c1", "read_file", r#"{"path":"a.rs"}"#)],
+        });
+        agent.context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "old result ".repeat(1000).into(),
+        });
+        agent.context.messages.push(Message::Assistant {
+            content: None,
+            tool_calls: vec![tool_call("c2", "read_file", r#"{"path":"b.rs"}"#)],
+        });
+        agent.context.messages.push(Message::Tool {
+            tool_call_id: "c2".into(),
+            content: "recent result".into(),
+        });
+        agent.context.prompt_tokens = Some(5000);
+        assert!(
+            agent.context.is_in_progress(),
+            "the turn must be mid-tool-loop for this test to mean anything"
+        );
+
+        agent.bg_turn(&mut |_| {}).await.unwrap();
+
+        assert!(
+            matches!(&agent.context.messages[0], Message::User { content } if content.contains("Test goal summary")),
+            "compaction should have run mid-turn, messages: {:?}",
+            agent.context.messages.len()
+        );
+
+        let summarize = requests.try_recv().expect("a summarization request");
+        assert!(!summarize.contains("\"stream\":true"));
+        let completion = requests.try_recv().expect("a completion request");
+        assert!(
+            completion.contains("Test goal summary"),
+            "the compacted context should be what got sent"
+        );
+        assert!(
+            !completion.contains("old work"),
+            "the summarized prefix should be gone from the request"
+        );
     }
 
     #[tokio::test]
@@ -1565,6 +1676,31 @@ mod test {
         assert!(events.iter().any(|event| {
             matches!(event, AgentEvent::ToolStarted { header, .. } if header == "submit_plan")
         }));
+    }
+
+    #[tokio::test]
+    async fn a_terminated_turn_leaves_no_dangling_tool_call_in_the_next_request() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"submit_plan\",\"arguments\":\"{\\\"stages\\\":[{\\\"title\\\":\\\"step one\\\",\\\"description\\\":\\\"do it\\\"}]}\"}}]}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, mut requests) = mock_server(vec![sse.to_string()]).await;
+        let mut agent = plan_agent(base_url);
+
+        let outcome = agent.chat("plan this", &mut |_| {}).await.unwrap();
+        assert!(matches!(outcome, ChatOutcome::Terminated { .. }));
+        // The terminator path stores the assistant call and returns without a
+        // result; history is sent verbatim now, so the next turn must repair it.
+        agent.chat("carry on", &mut |_| {}).await.unwrap();
+
+        let _first = requests.try_recv().expect("the first request");
+        let second = requests.try_recv().expect("the second request");
+        assert!(
+            second.contains("call_1"),
+            "the terminator call is still in history: {second}"
+        );
+        assert!(
+            second.contains("\"role\":\"tool\""),
+            "an assistant tool_calls message with no matching result would be \
+             rejected by the API: {second}"
+        );
     }
 
     #[tokio::test]

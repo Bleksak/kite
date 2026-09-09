@@ -3,6 +3,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::message::Message;
 
+/// Compact once the last reported prompt size passes this share of the window,
+/// so the expensive request happens before the wall rather than at it.
+const COMPACT_AT_PERCENT: u64 = 70;
+/// How much of the window the post-compaction recent window may occupy. The gap
+/// between this and `COMPACT_AT_PERCENT` is the headroom each compaction buys.
+const KEEP_RECENT_PERCENT: u64 = 30;
+/// Stands in for a tool call whose turn ended before a result was recorded.
+const UNANSWERED_TOOL_CALL: &str = "[no result — the turn ended with this call]";
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Context {
     pub system_prompt: String,
@@ -44,9 +53,61 @@ impl Context {
         }
     }
 
+    pub fn compaction_threshold(&self) -> u64 {
+        self.max_tokens * COMPACT_AT_PERCENT / 100
+    }
+
+    pub fn keep_recent_tokens(&self) -> u64 {
+        self.max_tokens * KEEP_RECENT_PERCENT / 100
+    }
+
     pub fn needs_compaction(&self) -> bool {
         self.prompt_tokens
-            .is_some_and(|tokens| tokens > self.max_tokens)
+            .is_some_and(|tokens| tokens > self.compaction_threshold())
+    }
+
+    /// Append a stub result for any tool call left unanswered — the terminator
+    /// path and a mid-round cancellation both end a turn without one, and an
+    /// assistant `tool_calls` message with no matching result is rejected by the
+    /// API now that history is sent verbatim. Stubs are inserted directly after
+    /// the run of results that follows their call, so ordering stays valid
+    /// whenever this runs.
+    pub fn seal_dangling_tool_calls(&mut self) -> usize {
+        let mut sealed = 0;
+        let mut index = 0;
+        while index < self.messages.len() {
+            let ids: Vec<String> = match &self.messages[index] {
+                Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                    tool_calls.iter().map(|call| call.id.clone()).collect()
+                }
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            };
+            let mut end = index + 1;
+            let mut answered: Vec<&str> = Vec::new();
+            while let Some(Message::Tool { tool_call_id, .. }) = self.messages.get(end) {
+                answered.push(tool_call_id);
+                end += 1;
+            }
+            let missing: Vec<String> = ids
+                .into_iter()
+                .filter(|id| !answered.contains(&id.as_str()))
+                .collect();
+            for (offset, id) in missing.iter().enumerate() {
+                self.messages.insert(
+                    end + offset,
+                    Message::Tool {
+                        tool_call_id: id.clone(),
+                        content: UNANSWERED_TOOL_CALL.to_string(),
+                    },
+                );
+            }
+            sealed += missing.len();
+            index = end + missing.len();
+        }
+        sealed
     }
 
     pub fn is_in_progress(&self) -> bool {
@@ -92,9 +153,13 @@ impl Context {
             return None;
         }
         for candidate in cut_index..self.messages.len() {
-            if !matches!(self.messages[candidate], Message::Tool { .. }) {
-                return Some(candidate);
+            if matches!(self.messages[candidate], Message::Tool { .. }) {
+                continue;
             }
+            // Cutting at 0 would summarize nothing and prepend the summary to a
+            // context that is already too big — a compaction loop, one API call
+            // per round. Better to leave it alone and let the round proceed.
+            return (candidate > 0).then_some(candidate);
         }
         None
     }
@@ -105,6 +170,19 @@ impl Context {
             content: format!("[summary of earlier context]\n{summary}"),
         }];
         self.messages.extend(kept);
+        // `prompt_tokens` still holds the pre-compaction size reported by the
+        // last completion. Leaving it would re-trigger compaction on the very
+        // next round and summarize the summary. Estimate until real usage lands.
+        self.prompt_tokens = Some(self.estimated_prompt_tokens());
+    }
+
+    fn estimated_prompt_tokens(&self) -> u64 {
+        (self.system_prompt.len() as u64) / 4
+            + self
+                .messages
+                .iter()
+                .map(Self::estimate_tokens)
+                .sum::<u64>()
     }
 
     pub fn file_operations(&self) -> (Vec<String>, Vec<String>) {
@@ -204,14 +282,20 @@ mod test {
     }
 
     #[test]
-    fn needs_compaction_only_when_over_budget() {
+    fn needs_compaction_once_past_the_threshold_not_the_whole_window() {
         let mut context = context();
 
         assert!(!context.needs_compaction());
-        context.record_usage(Some(100), None);
-        assert!(!context.needs_compaction());
-        context.record_usage(Some(101), None);
-        assert!(context.needs_compaction());
+        context.record_usage(Some(70), None);
+        assert!(
+            !context.needs_compaction(),
+            "70% of the window is the threshold, not past it"
+        );
+        context.record_usage(Some(71), None);
+        assert!(
+            context.needs_compaction(),
+            "should compact well before the 100-token window is full"
+        );
     }
 
     #[test]
@@ -372,6 +456,123 @@ mod test {
         );
 
         assert_eq!(context.messages.len(), 7);
+    }
+
+    #[test]
+    fn seal_fills_in_only_the_unanswered_calls_and_is_idempotent() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "go".into(),
+        });
+        context.messages.push(Message::Assistant {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    type_: "function".into(),
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    type_: "function".into(),
+                    function: FunctionCall {
+                        name: "submit_plan".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            ],
+        });
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "answered".into(),
+        });
+
+        assert_eq!(context.seal_dangling_tool_calls(), 1);
+        assert_eq!(context.messages.len(), 4);
+        assert!(
+            matches!(&context.messages[2], Message::Tool { tool_call_id, content }
+                if tool_call_id == "c1" && content == "answered"),
+            "the real result keeps its place"
+        );
+        assert!(
+            matches!(&context.messages[3], Message::Tool { tool_call_id, .. } if tool_call_id == "c2"),
+            "the stub lands directly after it, still inside the same run of results"
+        );
+
+        assert_eq!(
+            context.seal_dangling_tool_calls(),
+            0,
+            "a sealed context must not grow on every turn"
+        );
+        assert_eq!(context.messages.len(), 4);
+    }
+
+    #[test]
+    fn seal_leaves_a_fully_answered_history_untouched() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "go".into(),
+        });
+        context.messages.push(assistant_call("c1", "bash", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "out".into(),
+        });
+        context.messages.push(Message::Assistant {
+            content: Some("done".into()),
+            tool_calls: vec![],
+        });
+        let before = context.messages.clone();
+
+        assert_eq!(context.seal_dangling_tool_calls(), 0);
+        assert_eq!(context.messages, before);
+    }
+
+    #[test]
+    fn compact_point_declines_when_the_cut_would_summarize_nothing() {
+        let mut context = context();
+        // Only the very first message is big enough to fill the recent window, so
+        // the cut lands at 0 and there is nothing ahead of it to summarize.
+        context.messages.push(Message::User {
+            content: "x".repeat(40_000).into(),
+        });
+        for _ in 0..3 {
+            context.messages.push(Message::User {
+                content: "y".into(),
+            });
+        }
+
+        assert_eq!(
+            context.compact_point(10_000),
+            None,
+            "cutting at 0 would summarize an empty prefix and prepend it to an \
+             already-too-big context — one summarization call per round, forever"
+        );
+    }
+
+    #[test]
+    fn apply_compaction_reestimates_prompt_tokens_so_it_does_not_retrigger() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "old".repeat(10_000).into(),
+        });
+        context.messages.push(Message::User {
+            content: "recent".into(),
+        });
+        context.record_usage(Some(9_000), None);
+        assert!(context.needs_compaction());
+
+        context.apply_compaction("the summary".into(), 1);
+
+        assert!(
+            !context.needs_compaction(),
+            "prompt_tokens still reported the pre-compaction size, so the next round \
+             would summarize the summary: {:?}",
+            context.prompt_tokens
+        );
     }
 
     #[test]
