@@ -13,6 +13,7 @@ mod plan_gate;
 mod screen;
 mod session;
 mod session_store;
+mod skill;
 mod stream;
 mod thinking;
 mod tool;

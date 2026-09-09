@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 bitflags = "2"
 clap = { version = "4", features = ["derive"] }
+dirs = "7"
+frontmatter = "0.4"
 futures-util = "0.3"
 gix = { version = "0.85", default-features = false, features = ["sha1", "excludes"] }
 openai-oxide = "0.17"
@@ -19,7 +21,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
 tui-markdown = "0.3.9"
 termwiz = "0.23"
-serde_yaml = "0.9.34"
 
 [dev-dependencies]
 tempfile = "3.27.0"
