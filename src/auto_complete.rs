@@ -175,27 +175,6 @@ fn file_block(path: &str, full: &Path) -> String {
     out
 }
 
-pub fn prune_file_refs_text(text: &str) -> String {
-    let open = "<file path=\"";
-    let close = "</file>";
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(pos) = rest.find(open) {
-        let Some(close_pos) = rest[pos..].find(close) else {
-            out.push_str(rest);
-            return out;
-        };
-        let header_end = rest[pos..].find('>').map(|offset| pos + offset).unwrap_or(pos);
-        out.push_str(&rest[..pos]);
-        out.push_str(&rest[pos..=header_end]);
-        out.push_str("[content pruned — re-read with read_file]");
-        out.push_str(close);
-        rest = &rest[pos + close_pos + close.len()..];
-    }
-    out.push_str(rest);
-    out
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -304,20 +283,4 @@ mod test {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn prune_replaces_block_content_with_a_stub() {
-        let text = "before <file path=\"a.rs\">\nfn main() {}\n</file> after";
-        let out = prune_file_refs_text(text);
-        assert_eq!(
-            out,
-            "before <file path=\"a.rs\">[content pruned — re-read with read_file]</file> after"
-        );
-        assert_eq!(prune_file_refs_text("no blocks here"), "no blocks here");
-        let two = "<file path=\"a.rs\">\nx\n</file><file path=\"b.rs\">\ny\n</file>";
-        let out = prune_file_refs_text(two);
-        assert_eq!(
-            out,
-            "<file path=\"a.rs\">[content pruned — re-read with read_file]</file><file path=\"b.rs\">[content pruned — re-read with read_file]</file>"
-        );
-    }
 }

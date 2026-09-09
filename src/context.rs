@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use openai_oxide::types::chat::ChatCompletionMessageParam;
 use serde::{Deserialize, Serialize};
 
@@ -28,48 +26,12 @@ impl Context {
     }
 
     pub fn build_messages(&self) -> Vec<ChatCompletionMessageParam> {
-        std::iter::once(Cow::Owned(Message::System {
+        std::iter::once(Message::System {
             content: self.system_prompt.clone(),
-        }))
-        .chain(self.pruned_messages())
+        })
+        .chain(self.messages.iter().cloned())
         .map(|message| message.to_request())
         .collect()
-    }
-
-    fn pruned_messages(&self) -> Vec<Cow<'_, Message>> {
-        let in_progress = match self.messages.last() {
-            Some(Message::Assistant { tool_calls, .. }) => !tool_calls.is_empty(),
-            Some(Message::Tool { .. }) => true,
-            _ => false,
-        };
-        let keep_from = if in_progress {
-            self.messages
-                .iter()
-                .rposition(|message| matches!(message, Message::User { .. }))
-                .map(|index| index + 1)
-                .unwrap_or(0)
-        } else {
-            self.messages.len()
-        };
-
-        self.messages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, message)| match message {
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                } if !tool_calls.is_empty() && index < keep_from => match content {
-                    Some(text) if !text.is_empty() => Some(Cow::Owned(Message::Assistant {
-                        content: Some(text.clone()),
-                        tool_calls: vec![],
-                    })),
-                    _ => None,
-                },
-                Message::Tool { .. } if index < keep_from => None,
-                _ => Some(Cow::Borrowed(message)),
-            })
-            .collect()
     }
 
     pub fn record_usage(&mut self, prompt: Option<u64>, completion: Option<u64>) {
@@ -312,7 +274,7 @@ mod test {
     }
 
     #[test]
-    fn completed_turns_drop_their_tool_exchanges() {
+    fn completed_turns_keep_their_tool_exchanges() {
         let mut context = context();
         context.messages.push(Message::User {
             content: "make it blue".into(),
@@ -352,9 +314,12 @@ mod test {
             vec![
                 r#"{"role":"system","content":"be concise"}"#,
                 r#"{"role":"user","content":"make it blue"}"#,
-                r#"{"role":"assistant","content":"let me check"}"#,
+                r#"{"role":"assistant","content":"let me check","tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}"#,
+                r#"{"role":"tool","content":"file contents","tool_call_id":"c1"}"#,
                 r#"{"role":"assistant","content":"made it blue"}"#,
                 r#"{"role":"user","content":"now green"}"#,
+                r#"{"role":"assistant","tool_calls":[{"id":"c2","type":"function","function":{"name":"bash","arguments":"{}"}}]}"#,
+                r#"{"role":"tool","content":"ok","tool_call_id":"c2"}"#,
                 r#"{"role":"assistant","content":"made it green"}"#,
             ]
         );
@@ -397,6 +362,8 @@ mod test {
             vec![
                 r#"{"role":"system","content":"be concise"}"#,
                 r#"{"role":"user","content":"t1"}"#,
+                r#"{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]}"#,
+                r#"{"role":"tool","content":"out","tool_call_id":"c1"}"#,
                 r#"{"role":"assistant","content":"done"}"#,
                 r#"{"role":"user","content":"t2"}"#,
                 r#"{"role":"assistant","tool_calls":[{"id":"c2","type":"function","function":{"name":"read_file","arguments":"{}"}}]}"#,
@@ -405,6 +372,54 @@ mod test {
         );
 
         assert_eq!(context.messages.len(), 7);
+    }
+
+    #[test]
+    fn every_request_prefix_is_a_prefix_of_the_next_one() {
+        let mut context = context();
+        let mut snapshots: Vec<Vec<String>> = Vec::new();
+        let mut snapshot = |context: &Context, snapshots: &mut Vec<Vec<String>>| {
+            snapshots.push(
+                context
+                    .build_messages()
+                    .iter()
+                    .map(|m| serde_json::to_string(m).unwrap())
+                    .collect(),
+            );
+        };
+
+        context.messages.push(Message::User {
+            content: "t1".into(),
+        });
+        snapshot(&context, &mut snapshots);
+        context.messages.push(assistant_call("c1", "read_file", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "file contents".into(),
+        });
+        snapshot(&context, &mut snapshots);
+        context.messages.push(Message::Assistant {
+            content: Some("done".into()),
+            tool_calls: vec![],
+        });
+        context.messages.push(Message::User {
+            content: "t2".into(),
+        });
+        snapshot(&context, &mut snapshots);
+        context.messages.push(assistant_call("c2", "bash", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c2".into(),
+            content: "out".into(),
+        });
+        snapshot(&context, &mut snapshots);
+
+        for pair in snapshots.windows(2) {
+            let (earlier, later) = (&pair[0], &pair[1]);
+            assert!(
+                later.len() >= earlier.len() && later[..earlier.len()] == earlier[..],
+                "a request rewrote an earlier message, invalidating the cached prefix\nearlier: {earlier:#?}\nlater: {later:#?}"
+            );
+        }
     }
 
     #[test]

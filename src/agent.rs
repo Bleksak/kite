@@ -220,7 +220,6 @@ impl Agent {
                             header: terminator.to_string(),
                             body,
                         });
-                        self.prune_file_refs();
                         return Ok(ChatOutcome::Terminated { tool });
                     }
                     Err(error) => {
@@ -250,7 +249,6 @@ impl Agent {
                 Step::Done(text) => {
                     let queued = self.drain_steering();
                     if queued.is_empty() {
-                        self.prune_file_refs();
                         return Ok(ChatOutcome::Answer(text));
                     }
                     for item in queued {
@@ -259,17 +257,6 @@ impl Agent {
                 }
                 Step::Cancelled => return Ok(ChatOutcome::Cancelled),
                 Step::Continue => {}
-            }
-        }
-    }
-
-    fn prune_file_refs(&mut self) {
-        for message in self.context.messages.iter_mut() {
-            if let Message::User { content } = message {
-                let pruned = crate::auto_complete::prune_file_refs_text(content);
-                if pruned != *content {
-                    *content = pruned;
-                }
             }
         }
     }
@@ -1795,7 +1782,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn file_ref_content_is_pruned_when_the_turn_ends() {
+    async fn file_ref_content_survives_the_turn_so_the_prefix_stays_cacheable() {
         let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
         let (base_url, _requests) = mock_server(vec![answer.to_string()]).await;
         let client =
@@ -1820,8 +1807,10 @@ mod test {
             .find(|m| matches!(m, Message::User { .. }))
             .unwrap();
         if let Message::User { content } = user {
-            assert!(content.contains("[content pruned — re-read with read_file]"));
-            assert!(!content.contains("fn main() {}"));
+            assert!(
+                content.contains("fn main() {}"),
+                "the turn must not rewrite an earlier user message: {content}"
+            );
         } else {
             panic!("expected a user message");
         }
