@@ -172,7 +172,100 @@ impl Context {
             .is_some_and(|tokens| tokens > self.max_tokens)
     }
 
-    pub fn compact(&mut self) {}
+    pub fn is_in_progress(&self) -> bool {
+        match self.messages.last() {
+            Some(Message::Assistant { tool_calls, .. }) => !tool_calls.is_empty(),
+            Some(Message::Tool { .. }) => true,
+            _ => false,
+        }
+    }
+
+    fn estimate_tokens(message: &Message) -> u64 {
+        let chars = match message {
+            Message::System { content } | Message::User { content } | Message::Tool { content, .. } => {
+                content.len()
+            }
+            Message::Assistant { content, tool_calls } => {
+                let mut chars = content.as_ref().map(|c| c.len()).unwrap_or(0);
+                for call in tool_calls {
+                    chars += call.function.name.len() + call.function.arguments.len();
+                }
+                chars
+            }
+        };
+        (chars as u64) / 4
+    }
+
+    pub fn compact_point(&self, keep_recent_tokens: u64) -> Option<usize> {
+        if self.messages.len() < 4 {
+            return None;
+        }
+        let mut accumulated = 0u64;
+        let mut cut_index = 0usize;
+        let mut reached = false;
+        for (index, message) in self.messages.iter().enumerate().rev() {
+            accumulated += Self::estimate_tokens(message);
+            if accumulated >= keep_recent_tokens {
+                cut_index = index;
+                reached = true;
+                break;
+            }
+        }
+        if !reached {
+            return None;
+        }
+        for candidate in cut_index..self.messages.len() {
+            if !matches!(self.messages[candidate], Message::Tool { .. }) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    pub fn apply_compaction(&mut self, summary: String, cut_point: usize) {
+        let kept = self.messages[cut_point..].to_vec();
+        self.messages = vec![Message::User {
+            content: format!("[summary of earlier context]\n{summary}"),
+        }];
+        self.messages.extend(kept);
+    }
+
+    pub fn file_operations(&self) -> (Vec<String>, Vec<String>) {
+        let mut read = Vec::new();
+        let mut modified = Vec::new();
+        for message in &self.messages {
+            if let Message::Assistant { tool_calls, .. } = message {
+                for call in tool_calls {
+                    let Some(path) = Self::tool_path(&call.function.name, &call.function.arguments)
+                    else {
+                        continue;
+                    };
+                    match call.function.name.as_str() {
+                        "read_file" => {
+                            if !read.contains(&path) {
+                                read.push(path);
+                            }
+                        }
+                        "write_file" | "edit_file" => {
+                            if !modified.contains(&path) {
+                                modified.push(path);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (read, modified)
+    }
+
+    fn tool_path(name: &str, arguments: &str) -> Option<String> {
+        if !matches!(name, "read_file" | "write_file" | "edit_file") {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        value.get("path")?.as_str().map(String::from)
+    }
 }
 
 #[cfg(test)]
@@ -245,15 +338,62 @@ mod test {
     }
 
     #[test]
-    fn compact_is_a_no_op_for_now() {
+    fn compact_point_keeps_the_recent_window_and_never_splits_a_tool_pair() {
         let mut context = context();
         context.messages.push(Message::User {
-            content: "hi".into(),
+            content: "a".repeat(20_000).into(),
+        });
+        context.messages.push(assistant_call("c1", "read_file", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "b".repeat(20_000).into(),
+        });
+        context.messages.push(assistant_call("c2", "read_file", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c2".into(),
+            content: "c".repeat(20_000).into(),
+        });
+        context.messages.push(Message::Assistant {
+            content: Some("done".into()),
+            tool_calls: vec![],
         });
 
-        context.compact();
+        let point = context.compact_point(10_000);
+        assert!(point.is_some(), "should find a cut point");
+        let point = point.unwrap();
+        assert!(
+            !matches!(context.messages[point], Message::Tool { .. }),
+            "cut point must not be a tool result"
+        );
+        assert!(point >= 2, "should cut before the recent window");
+    }
 
-        assert_eq!(context.messages.len(), 1);
+    #[test]
+    fn apply_compaction_replaces_old_messages_with_the_summary() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "old".into(),
+        });
+        context.messages.push(assistant_call("c1", "read_file", None));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "old result".into(),
+        });
+        context.messages.push(Message::User {
+            content: "recent".into(),
+        });
+
+        context.apply_compaction("the summary".into(), 3);
+
+        assert_eq!(context.messages.len(), 2);
+        assert!(
+            matches!(&context.messages[0], Message::User { content } if content.contains("the summary")),
+            "first message should be the summary"
+        );
+        assert!(
+            matches!(&context.messages[1], Message::User { content } if content == "recent"),
+            "recent message should be kept"
+        );
     }
 
     #[test]

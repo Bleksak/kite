@@ -4,7 +4,9 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use openai_oxide::client::OpenAI;
-use openai_oxide::types::chat::{ChatCompletionRequest, StreamOptions, ToolCall};
+use openai_oxide::types::chat::{
+    ChatCompletionMessageParam, ChatCompletionRequest, StreamOptions, ToolCall, UserContent,
+};
 
 use crate::context::Context;
 use crate::message::Message;
@@ -80,6 +82,8 @@ pub struct Agent {
 }
 
 const MAX_TOOL_ROUNDS: usize = 25;
+
+const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT format:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
 impl Agent {
     pub fn new(
@@ -177,8 +181,8 @@ impl Agent {
             for text in self.drain_steering() {
                 self.context.messages.push(Message::User { content: text });
             }
-            if self.context.needs_compaction() {
-                self.context.compact();
+            if self.context.needs_compaction() && !self.context.is_in_progress() {
+                self.compact_context().await;
             }
             self.report_bg_tasks(on_event);
             on_event(AgentEvent::CompletionStarted);
@@ -242,6 +246,85 @@ impl Agent {
                 }
             }
         }
+    }
+
+    async fn compact_context(&mut self) {
+        let keep_recent = self.context.max_tokens / 2;
+        let Some(cut_point) = self.context.compact_point(keep_recent) else {
+            return;
+        };
+        let to_summarize = self.context.messages[..cut_point].to_vec();
+        let (read, modified) = self.context.file_operations();
+        let Ok(summary) = self.summarize(&to_summarize).await else {
+            return;
+        };
+        if summary.trim().is_empty() {
+            return;
+        }
+        let mut full = summary;
+        if !read.is_empty() || !modified.is_empty() {
+            full.push_str("\n\n## Files");
+            if !read.is_empty() {
+                full.push_str(&format!("\nRead: {}", read.join(", ")));
+            }
+            if !modified.is_empty() {
+                full.push_str(&format!("\nModified: {}", modified.join(", ")));
+            }
+        }
+        self.context.apply_compaction(full, cut_point);
+    }
+
+    async fn summarize(
+        &self,
+        messages: &[Message],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let conversation = Self::serialize_messages(messages);
+        let request = ChatCompletionRequest::new(
+            self.model.clone(),
+            vec![
+                ChatCompletionMessageParam::System {
+                    content: SUMMARIZATION_PROMPT.to_string(),
+                    name: None,
+                },
+                ChatCompletionMessageParam::User {
+                    content: UserContent::Text(format!(
+                        "<conversation>\n{conversation}\n</conversation>"
+                    )),
+                    name: None,
+                },
+            ],
+        );
+        let response = self.client.chat().completions().create_raw(&request).await?;
+        Ok(response["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string())
+    }
+
+    fn serialize_messages(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .map(|message| match message {
+                Message::System { content } => format!("[system] {content}"),
+                Message::User { content } => format!("[user] {content}"),
+                Message::Assistant { content, tool_calls } => {
+                    let calls = tool_calls
+                        .iter()
+                        .map(|call| {
+                            format!(
+                                "[tool_call {} {}]",
+                                call.function.name, call.function.arguments
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let content = content.as_deref().unwrap_or("");
+                    format!("[assistant] {content} {calls}")
+                }
+                Message::Tool { content, .. } => format!("[tool] {content}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn is_cancelled(&self, base: Option<u64>) -> bool {
@@ -648,6 +731,107 @@ mod test {
             10000,
             Duration::from_secs(30),
         )
+    }
+
+    async fn json_mock_server(response: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = response.to_string();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                data.extend_from_slice(&buf[..n]);
+                                if complete_request(&data).is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{response}"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn compact_context_summarizes_old_messages_and_keeps_the_recent_window() {
+        let base_url = json_mock_server(
+            "{\"choices\":[{\"message\":{\"content\":\"Test goal summary: done item\"}}]}",
+        )
+        .await;
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            1000,
+            Duration::from_secs(30),
+        );
+        agent
+            .context
+            .messages
+            .push(Message::User { content: "old work ".repeat(1000).into() });
+        agent
+            .context
+            .messages
+            .push(Message::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("c1", "read_file", r#"{"path":"a.rs"}"#)],
+            });
+        agent
+            .context
+            .messages
+            .push(Message::Tool {
+                tool_call_id: "c1".into(),
+                content: "old result ".repeat(1000).into(),
+            });
+        agent
+            .context
+            .messages
+            .push(Message::User { content: "recent".into() });
+        agent.context.prompt_tokens = Some(5000);
+        assert!(agent.context.needs_compaction());
+        assert!(!agent.context.is_in_progress());
+
+        agent.compact_context().await;
+
+        assert!(
+            agent.context.messages.len() < 4,
+            "context should be compacted, was {}",
+            agent.context.messages.len()
+        );
+        assert!(
+            matches!(&agent.context.messages[0], Message::User { content } if content.contains("Test goal")),
+            "first message should be the summary"
+        );
+        assert!(
+            agent
+                .context
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::User { content } if content == "recent")),
+            "recent message should be kept"
+        );
+        assert!(
+            !agent
+                .context
+                .messages
+                .iter()
+                .any(|m| matches!(m, Message::Tool { .. })),
+            "old tool result should be summarized away"
+        );
     }
 
     #[test]
