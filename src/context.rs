@@ -129,7 +129,8 @@ impl Context {
     }
 
     fn superseded_tool_results(&self, keep_from: usize) -> std::collections::HashSet<usize> {
-        let mut reads: Vec<(usize, Option<String>)> = Vec::new();
+        type ReadKey = (String, Option<usize>, Option<usize>);
+        let mut reads: Vec<(usize, Option<ReadKey>)> = Vec::new();
         for (index, message) in self.messages.iter().enumerate() {
             if index < keep_from {
                 continue;
@@ -138,23 +139,31 @@ impl Context {
                 let key = self
                     .tool_call_for(tool_call_id)
                     .filter(|call| call.function.name == "read_file")
-                    .and_then(|call| Self::tool_path(&call.function.name, &call.function.arguments));
+                    .and_then(|call| Self::read_file_range(&call.function.arguments));
                 reads.push((index, key));
             }
         }
-        let mut last_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut last_seen: std::collections::HashMap<ReadKey, usize> = std::collections::HashMap::new();
         for (index, key) in &reads {
-            if let Some(path) = key {
-                last_seen.insert(path.clone(), *index);
+            if let Some(key) = key {
+                last_seen.insert(key.clone(), *index);
             }
         }
         reads
             .into_iter()
             .filter(|(index, key)| {
-                matches!(key, Some(path) if last_seen.get(path) != Some(index))
+                matches!(key, Some(k) if last_seen.get(k) != Some(index))
             })
             .map(|(index, _)| index)
             .collect()
+    }
+
+    fn read_file_range(arguments: &str) -> Option<(String, Option<usize>, Option<usize>)> {
+        let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        let path = value.get("path")?.as_str()?.to_string();
+        let start = value.get("start").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let end = value.get("end").and_then(|v| v.as_u64()).map(|v| v as usize);
+        Some((path, start, end))
     }
 
     fn tool_call_for(&self, tool_call_id: &str) -> Option<&ToolCall> {
@@ -703,6 +712,59 @@ mod test {
             .collect();
         assert!(json.iter().any(|j| j.contains("OUT1")), "first bash result should be kept: {json:?}");
         assert!(json.iter().any(|j| j.contains("OUT2")), "second bash result should be kept: {json:?}");
+    }
+
+    #[test]
+    fn dedup_keeps_different_ranges_of_the_same_file() {
+        let mut context = context();
+        context.messages.push(Message::User {
+            content: "plan it".into(),
+        });
+        context.messages.push(read_range_call("c1", "a.rs", Some(1), Some(250)));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c1".into(),
+            content: "RANGE1\n".repeat(10).into(),
+        });
+        context.messages.push(read_range_call("c2", "a.rs", Some(251), Some(500)));
+        context.messages.push(Message::Tool {
+            tool_call_id: "c2".into(),
+            content: "RANGE2\n".repeat(10).into(),
+        });
+
+        let json: Vec<String> = context
+            .build_messages()
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect();
+        assert!(json.iter().any(|j| j.contains("RANGE1")), "first range should be kept: {json:?}");
+        assert!(json.iter().any(|j| j.contains("RANGE2")), "second range should be kept: {json:?}");
+    }
+
+    fn read_range_call(
+        id: &str,
+        path: &str,
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Message {
+        let mut args = format!("{{\"path\":\"{path}\"");
+        if let Some(start) = start {
+            args.push_str(&format!(",\"start\":{start}"));
+        }
+        if let Some(end) = end {
+            args.push_str(&format!(",\"end\":{end}"));
+        }
+        args.push('}');
+        Message::Assistant {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                type_: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: args,
+                },
+            }],
+        }
     }
 
     fn read_call(id: &str, path: &str) -> Message {
