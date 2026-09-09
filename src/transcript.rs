@@ -323,6 +323,8 @@ impl TuiRenderer {
                 self.push_line(padding_line(), BlockKind::ToolDone);
             }
 
+            AgentEvent::Usage { .. } => {}
+
             AgentEvent::AskUser { .. } => {}
 
             AgentEvent::BgTaskDone { id, command, code } => {

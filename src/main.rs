@@ -34,7 +34,7 @@ struct Cli {
     #[arg(long, default_value = "llama3.2")]
     model: String,
 
-    #[arg(long, default_value_t = 24000)]
+    #[arg(long, default_value_t = 262144)]
     context_window: u64,
 
     #[arg(long, value_enum, default_value_t = ThinkingLevel::XHigh)]
@@ -95,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model,
         thinking_cell,
         mode_cell,
+        cli.context_window,
     )
     .await
 }

@@ -14,6 +14,9 @@ pub struct ChunkTokens {
 pub enum AgentEvent {
     CompletionStarted,
     Tokens(ChunkTokens),
+    Usage {
+        prompt: Option<u64>,
+    },
     ToolStarted {
         header: String,
         body: Option<String>,

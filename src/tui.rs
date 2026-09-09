@@ -49,6 +49,7 @@ pub struct TuiState {
     pub screen: crate::screen::Screen,
     pub next_id: u64,
     pub cwd: Option<std::path::PathBuf>,
+    pub context_window: u64,
 }
 
 impl TuiState {
@@ -64,11 +65,17 @@ impl TuiState {
             screen: crate::screen::Screen::Chat,
             next_id: 1,
             cwd: None,
+            context_window: 0,
         }
     }
 
     pub fn session(&mut self) -> &mut Session {
         &mut self.sessions[self.active]
+    }
+
+    pub fn with_context_window(mut self, window: u64) -> TuiState {
+        self.context_window = window;
+        self
     }
 
     pub fn with_thinking(mut self, cell: Arc<Mutex<ThinkingLevel>>) -> TuiState {
@@ -90,6 +97,7 @@ impl TuiState {
             session.label = file.label;
             session.prompt_tokens = file.context.total_prompt_tokens;
             session.completion_tokens = file.context.total_completion_tokens;
+            session.context_tokens = file.context.prompt_tokens;
             session.context = Some(file.context);
             session.history = file.history;
             state.sessions.push(session);
@@ -1138,6 +1146,41 @@ impl Widget for Fill {
     }
 }
 
+fn context_usage_span(used: Option<u64>, window: u64) -> Span<'static> {
+    let (pct, color) = match (used, window) {
+        (Some(used), window) if window > 0 => {
+            let pct = (used * 100) / window;
+            let color = if pct >= 85 {
+                Color::Rgb(0xf3, 0x8b, 0x8b)
+            } else if pct >= 60 {
+                Color::Rgb(0xe5, 0xc0, 0x7b)
+            } else {
+                Color::Rgb(0x8f, 0xc7, 0x9a)
+            };
+            (pct, color)
+        }
+        _ => (0, Color::Rgb(0x81, 0xa2, 0xbe)),
+    };
+    let segments = 10;
+    let filled = if pct == 0 {
+        0
+    } else {
+        ((pct as f64 * segments as f64 / 100.0).round() as usize).min(segments)
+    };
+    let bar = "█".repeat(filled) + &"░".repeat(segments - filled);
+    let text = match used {
+        Some(used) if window > 0 => {
+            format!(
+                "  ·  ctx [{bar}] {pct}% {:.1}k/{:.1}k",
+                used as f64 / 1000.0,
+                window as f64 / 1000.0
+            )
+        }
+        _ => format!("  ·  ctx [{bar}] —"),
+    };
+    Span::styled(text, Style::default().fg(color))
+}
+
 pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
     let area = frame.area();
     let input_lines = active_box_lines(&state.sessions[state.active], state.pane_width);
@@ -1177,10 +1220,7 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
 
     let mut status_spans: Vec<Span> = vec![
         Span::styled(state.model.clone(), Style::default().bold()),
-        Span::raw(format!(
-            "  ·  {} prompt / {} completion tok",
-            session.prompt_tokens, session.completion_tokens
-        )),
+        context_usage_span(session.context_tokens, state.context_window),
         Span::styled(
             format!("  ·  [{}/{}]", state.active + 1, state.sessions.len()),
             Style::default().fg(Color::Rgb(95, 135, 255)),
@@ -1349,6 +1389,9 @@ fn apply_tui_event(state: &mut TuiState, event: TuiEvent) {
                     q.reply = Some(reply.clone());
                     session.question = Some(q);
                 }
+                if let AgentEvent::Usage { prompt: Some(tokens) } = &event {
+                    session.context_tokens = Some(*tokens);
+                }
                 session.renderer.on_event(event);
                 let max = session.max_scroll(state.pane_width, state.viewport);
                 session.scroller.follow_tail(max);
@@ -1360,6 +1403,7 @@ fn apply_tui_event(state: &mut TuiState, event: TuiEvent) {
                 session.running = false;
                 session.prompt_tokens = context.total_prompt_tokens;
                 session.completion_tokens = context.total_completion_tokens;
+                session.context_tokens = context.prompt_tokens;
                 session.context = Some(context.clone());
                 if let Some(saved) = &session.context {
                     session_store::save_session(
@@ -1419,6 +1463,7 @@ pub async fn run(
     model: String,
     thinking: Arc<Mutex<ThinkingLevel>>,
     mode: Arc<Mutex<Mode>>,
+    context_window: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
     let new_agent = std::sync::Arc::new(new_agent);
@@ -1466,7 +1511,8 @@ pub async fn run(
     let mut state =
         TuiState::with_sessions(model, session_store::load_sessions(Path::new(CONTEXT_DIR)))
             .with_thinking(thinking)
-            .with_mode(mode);
+            .with_mode(mode)
+            .with_context_window(context_window);
     let size = terminal.size();
     state.pane_width = size
         .as_ref()
@@ -5288,23 +5334,44 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
     #[test]
     fn frame_renders_status_main_and_input() {
         let mut state = TuiState::new("llama".into());
+        state.context_window = 24000;
         state.session().renderer.on_event(text("hello"));
         state.session().renderer.finish();
-        state.session().prompt_tokens = 100;
-        state.session().completion_tokens = 5;
+        state.session().context_tokens = Some(10000);
 
-        let backend = TestBackend::new(60, 12);
+        let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &state, 0)).unwrap();
 
         let buffer = terminal.backend().buffer();
         let joined: String = (0..12)
-            .flat_map(|y| (0..60).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
+            .flat_map(|y| (0..100).map(move |x| buffer.cell((x, y)).unwrap().symbol().to_string()))
             .collect();
         assert!(joined.contains("llama"));
-        assert!(joined.contains("100 prompt / 5 completion tok"));
+        assert!(joined.contains("41%"));
+        assert!(joined.contains("10.0k/24.0k"));
         assert!(joined.contains("[1/1]"));
         assert!(joined.contains("hello"));
+    }
+
+    #[test]
+    fn context_usage_span_renders_bar_percentage_and_threshold_colors() {
+        for (used, window, expected, color) in [
+            (4000, 10000, "  ·  ctx [████░░░░░░] 40% 4.0k/10.0k", Color::Rgb(0x8f, 0xc7, 0x9a)),
+            (7000, 10000, "  ·  ctx [███████░░░] 70% 7.0k/10.0k", Color::Rgb(0xe5, 0xc0, 0x7b)),
+            (9000, 10000, "  ·  ctx [█████████░] 90% 9.0k/10.0k", Color::Rgb(0xf3, 0x8b, 0x8b)),
+        ] {
+            let span = context_usage_span(Some(used), window);
+            assert_eq!(span.content.as_ref(), expected);
+            assert_eq!(span.style.fg, Some(color));
+        }
+
+        let span = context_usage_span(None, 10000);
+        assert_eq!(span.content.as_ref(), "  ·  ctx [░░░░░░░░░░] —");
+
+        let span = context_usage_span(Some(12000), 10000);
+        assert!(span.content.as_ref().contains("120%"));
+        assert!(span.content.as_ref().contains("[██████████]"));
     }
 
     fn parse(bytes: &[u8]) -> Vec<TermEvent> {

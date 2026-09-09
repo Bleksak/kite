@@ -200,6 +200,9 @@ impl Agent {
                 Err(error) => return Err(error),
             };
             self.context.record_usage(usage.0, usage.1);
+            on_event(AgentEvent::Usage {
+                prompt: self.context.prompt_tokens,
+            });
 
             let terminator = self.mode.lock().unwrap().terminator();
             if let Some(terminator) = terminator
