@@ -490,8 +490,11 @@ impl TuiRenderer {
         }
     }
 
+    const TOOL_BODY_LINE_CAP: usize = 3;
+
     fn push_indented(&mut self, body: &str, block: BlockKind) {
-        for line in body.trim_end_matches('\n').split('\n') {
+        let lines: Vec<&str> = body.trim_end_matches('\n').split('\n').collect();
+        for line in lines.iter().take(Self::TOOL_BODY_LINE_CAP) {
             if line.is_empty() {
                 self.push_line(Line::default(), block);
             } else {
@@ -503,6 +506,16 @@ impl TuiRenderer {
                     block,
                 );
             }
+        }
+        if lines.len() > Self::TOOL_BODY_LINE_CAP {
+            let more = lines.len() - Self::TOOL_BODY_LINE_CAP;
+            self.push_line(
+                Line::from(Span::styled(
+                    format!("  … ({more} more lines)"),
+                    Style::default().fg(Color::Rgb(128, 128, 128)).dim(),
+                )),
+                block,
+            );
         }
     }
 
@@ -1341,6 +1354,38 @@ mod test {
 
         assert_eq!(renderer.scrollback().len(), 5);
         assert_eq!(renderer.scrollback()[3].spans[0].content.as_ref(), "  out");
+    }
+
+    #[test]
+    fn tool_result_body_is_capped_to_a_few_lines() {
+        let mut renderer = TuiRenderer::new();
+        renderer.on_event(AgentEvent::ToolStarted {
+            header: "bash".into(),
+            body: Some("echo out".into()),
+        });
+        renderer.on_event(AgentEvent::ToolResult {
+            header: "bash".into(),
+            body: "line1\nline2\nline3\nline4\nline5".into(),
+        });
+
+        let text: Vec<String> = renderer
+            .scrollback()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        assert!(text.iter().any(|l| l.contains("line1")), "should show the first line");
+        assert!(text.iter().any(|l| l.contains("line3")), "should show three lines");
+        assert!(!text.iter().any(|l| l.contains("line4")), "should not show line 4");
+        assert!(
+            text.iter().any(|l| l.contains("2 more lines")),
+            "should have the note"
+        );
     }
 
     #[test]
