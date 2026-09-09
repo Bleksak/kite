@@ -227,10 +227,7 @@ async fn handle_outcome(
             }
             _ => {
                 let review = agent.stage_mode() == Some(Mode::Implement)
-                    && stages
-                        .as_ref()
-                        .map(|s| *stage_index + 1 < s.len())
-                        .unwrap_or(false);
+                    && stages.is_some();
                 if review {
                     *stage_index += 1;
                     *gate = Some((
@@ -317,6 +314,18 @@ pub fn spawn_agent(
                     if let Some(phase) = from_gate {
                         match (phase, input.is_empty()) {
                             (GatePhase::ReviewImplementation, true) => {
+                                if stages
+                                    .as_ref()
+                                    .is_some_and(|s| stage_index >= s.len())
+                                {
+                                    agent = new_agent().with_cancel(cancel_rx.clone()).with_steering(steering_task.clone());
+                                    let _ = event_tx.send(TuiEvent::StageChanged { session: id, mode: None });
+                                    let _ = event_tx.send(TuiEvent::PlanUpdated { session: id, plan: None });
+                                    let _ = event_tx.send(TuiEvent::ReviewBaseline { session: id, baseline: None });
+                                    let context = agent.context.clone();
+                                    let _ = event_tx.send(TuiEvent::TurnDone { session: id, context });
+                                    continue;
+                                }
                                 let title = stages
                                     .as_ref()
                                     .map(|s| s[stage_index].title.clone())
@@ -605,6 +614,15 @@ mod test {
         assert!(
             wait_for_event(&mut event_rx, &mut events, |e| matches!(
                 e,
+                TuiEvent::GatePending { message, .. } if message.contains("Step 1 implemented")
+                    && message.contains("review the implementation")
+            ))
+            .await
+        );
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
                 TuiEvent::StageChanged { mode: None, .. }
             ))
             .await
@@ -752,6 +770,15 @@ mod test {
             .await
         );
 
+        input_tx.send(String::new()).unwrap();
+        assert!(
+            wait_for_event(&mut event_rx, &mut events, |e| matches!(
+                e,
+                TuiEvent::GatePending { message, .. } if message.contains("Step 2 implemented")
+                    && message.contains("review the implementation")
+            ))
+            .await
+        );
         input_tx.send(String::new()).unwrap();
         assert!(
             wait_for_event(&mut event_rx, &mut events, |e| matches!(
