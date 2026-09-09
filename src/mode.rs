@@ -81,6 +81,13 @@ impl Mode {
             }
         }
     }
+
+    pub fn system_prompt_with_cwd(&self) -> String {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        format!("Working directory: {cwd}\n\n{}", self.system_prompt())
+    }
 }
 
 pub fn tool_allowed(tools: &[Tool], tool: &Tool) -> bool {

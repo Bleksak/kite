@@ -93,7 +93,7 @@ impl Agent {
         max_tokens: u64,
         bash_timeout: Duration,
     ) -> Agent {
-        let system_prompt = mode.lock().unwrap().system_prompt().to_string();
+        let system_prompt = mode.lock().unwrap().system_prompt_with_cwd();
         Agent {
             client,
             model: model.into(),
@@ -128,7 +128,7 @@ impl Agent {
 
     pub fn with_pinned_mode(mut self, mode: Mode) -> Agent {
         self.mode = Arc::new(Mutex::new(mode));
-        self.context.system_prompt = mode.system_prompt().to_string();
+        self.context.system_prompt = mode.system_prompt_with_cwd();
         self
     }
 
@@ -167,7 +167,7 @@ impl Agent {
         &mut self,
         on_event: &mut impl FnMut(AgentEvent),
     ) -> Result<ChatOutcome, Box<dyn std::error::Error>> {
-        self.context.system_prompt = self.mode.lock().unwrap().system_prompt().to_string();
+        self.context.system_prompt = self.mode.lock().unwrap().system_prompt_with_cwd();
         let base = self.cancel.as_ref().map(|rx| *rx.borrow());
         let mut round = 0;
         loop {
@@ -847,7 +847,7 @@ mod test {
         agent = agent.with_pinned_mode(Mode::Implement);
         *shared.lock().unwrap() = Mode::Plan;
         assert_eq!(*agent.mode.lock().unwrap(), Mode::Implement);
-        assert_eq!(agent.context.system_prompt, Mode::Implement.system_prompt());
+        assert!(agent.context.system_prompt.contains(Mode::Implement.system_prompt()));
     }
 
     async fn run_tool_call(
@@ -1409,7 +1409,7 @@ mod test {
         else {
             panic!("expected system message first");
         };
-        assert_eq!(content, Mode::Yolo.system_prompt());
+        assert!(content.contains(Mode::Yolo.system_prompt()));
 
         let openai_oxide::types::chat::ChatCompletionMessageParam::User { content, .. } =
             &request.messages[1]
