@@ -176,6 +176,7 @@ pub enum ToolOutput {
 }
 
 const OUTPUT_LIMIT: usize = 10_000;
+const READ_FILE_LINE_CAP: usize = 250;
 
 fn cap_output(text: String) -> String {
     if text.len() <= OUTPUT_LIMIT {
@@ -273,7 +274,7 @@ impl Tool {
             Tool::Bash(_) => "Run a bash script",
             Tool::ReadOnlyBash(_) => "Run a bash script in a read-only mode",
             Tool::ReadFile(_, _, _) => {
-                "Read a file, optionally a line range (1-based start and end line, both inclusive)"
+                "Read a file, optionally a line range (1-based start and end line, both inclusive). For large files, prefer a line range — a full read is capped to the first 250 lines"
             }
             Tool::WriteFile(_, _) => "Write a file",
             Tool::EditFile(_, _, _) => "Edit a file",
@@ -332,10 +333,21 @@ impl Tool {
                     .await
                     .map_err(ToolError::Io)?;
                 let lines: Vec<&str> = contents.lines().collect();
-                let start = start.unwrap_or(1).saturating_sub(1).min(lines.len());
+                let total = lines.len();
+                let start = start.unwrap_or(1).saturating_sub(1).min(total);
                 let end = end
-                    .map_or(lines.len(), |end| end.min(lines.len()))
+                    .map_or(total, |end| end.min(total))
                     .max(start);
+                if end - start > READ_FILE_LINE_CAP {
+                    let capped_end = start + READ_FILE_LINE_CAP;
+                    let body = lines[start..capped_end].join("\n");
+                    return Ok(format!(
+                        "{body}\n[showing lines {}–{} of {}; call read_file with start/end for the rest]",
+                        start + 1,
+                        capped_end,
+                        total
+                    ));
+                }
                 Ok(lines[start..end].join("\n"))
             }
             Tool::WriteFile(file, content) => {
@@ -690,7 +702,7 @@ fn parameters(tool: &Tool) -> serde_json::Value {
         Tool::ReadFile(..) => json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "path of the file to read" },
+                "path": { "type": "string", "description": "path of the file to read; a full read is capped to the first 250 lines, so use start/end for large files" },
                 "start": { "type": "integer", "minimum": 1, "description": "1-based start line, inclusive" },
                 "end": { "type": "integer", "minimum": 1, "description": "1-based end line, inclusive" }
             },
@@ -945,6 +957,73 @@ mod test {
         let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(2), Some(3));
 
         assert_eq!(tool.invoke(timeout()).await.unwrap(), "two\nthree");
+    }
+
+    #[tokio::test]
+    async fn read_file_caps_a_full_read_to_the_head() {
+        let temp_dir = TestFiles::new();
+        let content = (0..300)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        temp_dir.file("big.txt", &content);
+        let file = temp_dir.path().join("big.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        assert!(result.starts_with("line0"), "should start at the head: {result}");
+        assert!(result.contains("line249"), "should include line 250 (index 249)");
+        assert!(!result.contains("line250"), "should not include line 251 (index 250)");
+        assert!(
+            result.contains("[showing lines 1–250 of 300"),
+            "should have the cap note: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_honors_an_explicit_range_under_the_cap() {
+        let temp_dir = TestFiles::new();
+        let content = (0..300)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        temp_dir.file("big.txt", &content);
+        let file = temp_dir.path().join("big.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(5), Some(104));
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        assert_eq!(
+            result,
+            (4..104)
+                .map(|i| format!("line{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(!result.contains("[showing"), "should not have the cap note: {result}");
+    }
+
+    #[tokio::test]
+    async fn read_file_caps_a_range_that_exceeds_the_cap() {
+        let temp_dir = TestFiles::new();
+        let content = (0..400)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        temp_dir.file("big.txt", &content);
+        let file = temp_dir.path().join("big.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(100), None);
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        assert!(result.starts_with("line99"), "should start at the requested start: {result}");
+        assert!(result.contains("line348"), "should include 250 lines from the start");
+        assert!(!result.contains("line349"), "should not exceed the cap");
+        assert!(
+            result.contains("[showing lines 100–349 of 400"),
+            "should have the cap note: {result}"
+        );
     }
 
     #[tokio::test]
