@@ -579,7 +579,7 @@ mod test {
     fn every_request_prefix_is_a_prefix_of_the_next_one() {
         let mut context = context();
         let mut snapshots: Vec<Vec<String>> = Vec::new();
-        let mut snapshot = |context: &Context, snapshots: &mut Vec<Vec<String>>| {
+        let snapshot = |context: &Context, snapshots: &mut Vec<Vec<String>>| {
             snapshots.push(
                 context
                     .build_messages()

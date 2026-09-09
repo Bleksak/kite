@@ -1622,6 +1622,7 @@ pub async fn run(
                             }
                             let cwd = std::env::current_dir().unwrap_or_default();
                             let task = crate::auto_complete::expand_file_refs(&task, &cwd);
+                            let task = crate::skill::expand_skill_command(&task, &crate::skill::load_skills());
                             let max = session.max_scroll(state.pane_width, state.viewport);
                             session.scroller.end(max);
                             inputs[&id].send(task)?;
@@ -1642,6 +1643,7 @@ pub async fn run(
                             session.scroller.end(max);
                             let cwd = std::env::current_dir().unwrap_or_default();
                             let text = crate::auto_complete::expand_file_refs(&text, &cwd);
+                            let text = crate::skill::expand_skill_command(&text, &crate::skill::load_skills());
                             if let Some(steer) = steers.get(&id) {
                                 steer.push(text);
                             }

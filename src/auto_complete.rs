@@ -23,9 +23,28 @@ pub fn token_at(input: &str, cursor: usize) -> Option<(usize, String)> {
     (!token.is_empty()).then_some((start, token))
 }
 
+pub fn skill_candidates(prefix: &str, skills: &[crate::skill::Skill]) -> Vec<Suggestion> {
+    let mut out = Vec::new();
+    for skill in skills {
+        if skill.name.starts_with(prefix) && skill.name.len() > prefix.len() {
+            out.push(Suggestion {
+                insert: format!("/skill:{}", skill.name),
+                display: format!("{} — {}", skill.name, skill.description),
+            });
+        }
+    }
+    out.truncate(MAX_POPUP_CANDIDATES);
+    out
+}
+
 pub fn candidates(input: &str, cursor: usize, cwd: &Path) -> Option<Vec<Suggestion>> {
     let (_start, token) = token_at(input, cursor)?;
-    if let Some(prefix) = token.strip_prefix('/') {
+    // The /skill: branch must be checked before the generic / branch: a
+    // /skill:gi token would otherwise fall into the command branch and
+    // return an empty list, never reaching the skill suggestions.
+    if let Some(prefix) = token.strip_prefix("/skill:") {
+        Some(skill_candidates(prefix, &crate::skill::load_skills()))
+    } else if let Some(prefix) = token.strip_prefix('/') {
         let mut out = Vec::new();
         for (name, description) in crate::commands::command_list() {
             if name.starts_with(prefix) && name.len() > prefix.len() {
@@ -199,6 +218,62 @@ mod test {
         assert_eq!(candidates("/help", 5, &cwd), Some(Vec::new()));
         assert_eq!(candidates("help", 4, &cwd), None);
         assert_eq!(candidates("/asdf", 5, &cwd), Some(Vec::new()));
+    }
+
+    #[test]
+    fn skill_candidates_filter_by_strict_prefix() {
+        let skills = vec![
+            crate::skill::Skill {
+                name: "git-commit".into(),
+                description: "write a commit message".into(),
+                path: std::path::PathBuf::from("/tmp/skills/git-commit/SKILL.md"),
+            },
+            crate::skill::Skill {
+                name: "git-push".into(),
+                description: "push to the remote".into(),
+                path: std::path::PathBuf::from("/tmp/skills/git-push/SKILL.md"),
+            },
+            crate::skill::Skill {
+                name: "deploy".into(),
+                description: "ship to prod".into(),
+                path: std::path::PathBuf::from("/tmp/skills/deploy/SKILL.md"),
+            },
+        ];
+        assert_eq!(
+            skill_candidates("gi", &skills),
+            vec![
+                Suggestion {
+                    insert: "/skill:git-commit".into(),
+                    display: "git-commit — write a commit message".into(),
+                },
+                Suggestion {
+                    insert: "/skill:git-push".into(),
+                    display: "git-push — push to the remote".into(),
+                },
+            ]
+        );
+        assert_eq!(skill_candidates("git-commit", &skills), Vec::new());
+        assert_eq!(skill_candidates("nope", &skills), Vec::new());
+    }
+
+    #[test]
+    fn skill_candidates_an_empty_prefix_lists_all_capped() {
+        let skills: Vec<crate::skill::Skill> = (0..8)
+            .map(|i| crate::skill::Skill {
+                name: format!("skill{i:02}"),
+                description: format!("d{i}"),
+                path: std::path::PathBuf::from(format!("/tmp/skills/skill{i:02}/SKILL.md")),
+            })
+            .collect();
+        let out = skill_candidates("", &skills);
+        assert_eq!(out.len(), MAX_POPUP_CANDIDATES);
+        assert_eq!(
+            out[0],
+            Suggestion {
+                insert: "/skill:skill00".into(),
+                display: "skill00 — d0".into(),
+            }
+        );
     }
 
     #[test]

@@ -43,7 +43,8 @@ fn help_text() -> String {
          - C-j/C-k — move the autocomplete selection, enter accepts it\n\n\
          **autocomplete**\n\n\
          - / — complete a command\n\
-         - @ — complete a file path (the file's content is included in the prompt)\n\n\
+         - @ — complete a file path (the file's content is included in the prompt)\n\
+         - /skill: — inline a skill's instructions into the prompt (skills live in .kite/skills/)\n\n\
          **commands**\n\n\
          {commands}"
     )
@@ -78,5 +79,8 @@ mod test {
         assert!(out.contains("C-esc"));
         assert!(out.contains("/help"));
         assert!(out.contains("C-j"));
+        assert!(out.contains(
+            "- /skill: — inline a skill's instructions into the prompt (skills live in .kite/skills/)"
+        ));
     }
 }

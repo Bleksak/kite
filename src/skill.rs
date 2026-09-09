@@ -109,6 +109,45 @@ fn load_skill_body_from(
     Err(SkillError::NotFound(name.to_string()))
 }
 
+// Mirrors pi's _expandSkillCommand: a leading /skill:name [args] expands to
+// the skill's full SKILL.md body inlined in a <skill> block. Unknown skills
+// and unreadable files pass through unchanged. No line/byte caps.
+pub fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
+    let Some(rest) = text.strip_prefix("/skill:") else {
+        return text.to_string();
+    };
+    let (name, args) = match rest.find(char::is_whitespace) {
+        Some(pos) => (rest[..pos].to_string(), rest[pos..].trim().to_string()),
+        None => (rest.to_string(), String::new()),
+    };
+    let Some(skill) = skills.iter().find(|skill| skill.name == name) else {
+        return text.to_string(); // Unknown skill, pass through
+    };
+    let content = match std::fs::read_to_string(&skill.path) {
+        Ok(content) => content,
+        Err(_) => return text.to_string(), // Read error, pass through
+    };
+    let body = frontmatter::parse_and_find_content(&content)
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_else(|_| content)
+        .trim()
+        .to_string();
+    let base_dir = skill
+        .path
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_default();
+    let block = format!(
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+        skill.name, skill.path.display(), base_dir, body
+    );
+    if args.is_empty() {
+        block
+    } else {
+        format!("{block}\n\n{args}")
+    }
+}
+
 fn scan_root(root: &Path) -> Vec<Skill> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -399,5 +438,108 @@ mod test {
         let (_tmp, project, user) = roots();
         let err = load_skill_body_from("missing", &project, Some(&user)).unwrap_err();
         assert!(matches!(err, SkillError::NotFound(name) if name == "missing"));
+    }
+
+    fn skill_for_test(tmp: &tempfile::TempDir, name: &str, content: &str) -> Skill {
+        let path = tmp.path().join("skills").join(name).join("SKILL.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        Skill {
+            name: name.into(),
+            description: "d".into(),
+            path,
+        }
+    }
+
+    #[test]
+    fn expand_inlines_a_leading_skill_command_with_args() {
+        let tmp = tempdir().unwrap();
+        let skill = skill_for_test(
+            &tmp,
+            "deploy",
+            "---\nname: deploy\ndescription: d\n---\n# deploy\nstep one\nstep two\n",
+        );
+        let out = expand_skill_command(
+            "/skill:deploy ship to prod",
+            &[skill.clone()],
+        );
+        assert_eq!(
+            out,
+            format!(
+                "<skill name=\"deploy\" location=\"{}\">\n\
+                 References are relative to {}.\n\n\
+                 # deploy\nstep one\nstep two\n\
+                 </skill>\n\n\
+                 ship to prod",
+                skill.path.display(),
+                skill.path.parent().unwrap().display()
+            )
+        );
+    }
+
+    #[test]
+    fn expand_passes_an_unknown_skill_through_unchanged() {
+        let tmp = tempdir().unwrap();
+        let skill = skill_for_test(&tmp, "deploy", "---\nname: deploy\ndescription: d\n---\nbody");
+        let out = expand_skill_command(
+            "/skill:nope do the thing",
+            &[skill],
+        );
+        assert_eq!(out, "/skill:nope do the thing");
+    }
+
+    #[test]
+    fn expand_ignores_a_non_leading_skill_token() {
+        let tmp = tempdir().unwrap();
+        let skill = skill_for_test(&tmp, "deploy", "---\nname: deploy\ndescription: d\n---\nbody");
+        let out = expand_skill_command(
+            "please use /skill:deploy now",
+            &[skill],
+        );
+        assert_eq!(out, "please use /skill:deploy now");
+    }
+
+    #[test]
+    fn expand_a_bare_skill_name_yields_just_the_block() {
+        let tmp = tempdir().unwrap();
+        let skill = skill_for_test(&tmp, "deploy", "---\nname: deploy\ndescription: d\n---\nbody");
+        let out = expand_skill_command("/skill:deploy", &[skill.clone()]);
+        assert_eq!(
+            out,
+            format!(
+                "<skill name=\"deploy\" location=\"{}\">\n\
+                 References are relative to {}.\n\n\
+                 body\n\
+                 </skill>",
+                skill.path.display(),
+                skill.path.parent().unwrap().display()
+            )
+        );
+    }
+
+    #[test]
+    fn expand_passes_through_when_the_file_is_unreadable() {
+        let skill = Skill {
+            name: "deploy".into(),
+            description: "d".into(),
+            path: PathBuf::from("/no/such/skill/SKILL.md"),
+        };
+        let out = expand_skill_command("/skill:deploy args", &[skill]);
+        assert_eq!(out, "/skill:deploy args");
+    }
+
+    #[test]
+    fn expand_inlines_the_full_body_without_caps() {
+        let tmp = tempdir().unwrap();
+        let body = "line\n".repeat(10_000);
+        let skill = skill_for_test(
+            &tmp,
+            "big",
+            &format!("---\nname: big\ndescription: d\n---\n{body}"),
+        );
+        let out = expand_skill_command("/skill:big go", &[skill]);
+        assert!(out.contains(&"line\n".repeat(10_000)));
+        assert_eq!(out.matches("line\n").count(), 10_000);
+        assert!(out.ends_with("go"));
     }
 }
