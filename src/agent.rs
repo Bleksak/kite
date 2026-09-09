@@ -11,6 +11,7 @@ use openai_oxide::types::chat::{
 use crate::context::Context;
 use crate::message::Message;
 use crate::mode::Mode;
+use crate::skill::{self, Skill};
 use crate::stream::{AgentEvent, ChunkTokens, StreamAccumulator, StreamChunk};
 use crate::thinking::ThinkingLevel;
 
@@ -75,6 +76,7 @@ pub struct Agent {
     pub mode: Arc<Mutex<Mode>>,
     pub thinking: Option<(Arc<Mutex<ThinkingLevel>>, Option<bool>)>,
     pub bash_timeout: Duration,
+    pub skills: Vec<Skill>,
     cancel: Option<std::sync::Arc<tokio::sync::watch::Receiver<u64>>>,
     steering: Steering,
     bg_seen: std::collections::HashSet<String>,
@@ -93,7 +95,9 @@ impl Agent {
         max_tokens: u64,
         bash_timeout: Duration,
     ) -> Agent {
-        let system_prompt = mode.lock().unwrap().system_prompt_with_cwd();
+        let skills = skill::load_skills();
+        let base = mode.lock().unwrap().system_prompt_with_cwd();
+        let system_prompt = Self::compose_system_prompt(&base, &skills);
         Agent {
             client,
             model: model.into(),
@@ -101,11 +105,28 @@ impl Agent {
             mode,
             thinking: None,
             bash_timeout,
+            skills,
             cancel: None,
             steering: Steering::default(),
             bg_seen: std::collections::HashSet::new(),
             bg_mine: std::collections::HashSet::new(),
         }
+    }
+
+    /// Composes the mode's prompt with the skill list.
+    fn compose_system_prompt(base: &str, skills: &[Skill]) -> String {
+        match skill::skill_section(skills) {
+            Some(section) => format!("{base}\n\n# Skills\n{section}"),
+            None => base.to_string(),
+        }
+    }
+
+    /// Re-composes the mode's prompt with the skill list and installs it in
+    /// the context. Called wherever `context.system_prompt` used to be set
+    /// directly, so the skill list survives mode switches and pinned stages.
+    fn refresh_system_prompt(&mut self) {
+        let base = self.mode.lock().unwrap().system_prompt_with_cwd();
+        self.context.system_prompt = Self::compose_system_prompt(&base, &self.skills);
     }
 
     pub fn with_thinking(mut self, cell: Arc<Mutex<ThinkingLevel>>, base: Option<bool>) -> Agent {
@@ -128,7 +149,7 @@ impl Agent {
 
     pub fn with_pinned_mode(mut self, mode: Mode) -> Agent {
         self.mode = Arc::new(Mutex::new(mode));
-        self.context.system_prompt = mode.system_prompt_with_cwd();
+        self.refresh_system_prompt();
         self
     }
 
@@ -167,7 +188,7 @@ impl Agent {
         &mut self,
         on_event: &mut impl FnMut(AgentEvent),
     ) -> Result<ChatOutcome, Box<dyn std::error::Error>> {
-        self.context.system_prompt = self.mode.lock().unwrap().system_prompt_with_cwd();
+        self.refresh_system_prompt();
         self.context.seal_dangling_tool_calls();
         let base = self.cancel.as_ref().map(|rx| *rx.borrow());
         let mut round = 0;
@@ -1546,7 +1567,7 @@ mod test {
         assert_eq!(text, "hello");
 
         let tools = request.tools.as_ref().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         assert_eq!(
             tools
                 .iter()
@@ -1560,9 +1581,86 @@ mod test {
                 "edit_file",
                 "webfetch",
                 "bg_run",
-                "ask_user"
+                "ask_user",
+                "use_skill"
             ]
         );
+    }
+
+    fn skill(name: &str, description: &str) -> crate::skill::Skill {
+        crate::skill::Skill {
+            name: name.into(),
+            description: description.into(),
+            path: std::path::PathBuf::from(format!("/tmp/skills/{name}/SKILL.md")),
+        }
+    }
+
+    #[test]
+    fn fresh_agent_system_prompt_is_the_mode_prompt() {
+        let agent = agent();
+        assert!(agent.context.system_prompt.contains(Mode::Yolo.system_prompt()));
+    }
+
+    #[test]
+    fn refresh_with_no_skills_yields_the_plain_prompt() {
+        let mut agent = agent();
+        agent.skills = Vec::new();
+        agent.refresh_system_prompt();
+        assert_eq!(
+            agent.context.system_prompt,
+            Mode::Yolo.system_prompt_with_cwd()
+        );
+        assert!(!agent.context.system_prompt.contains("# Skills"));
+    }
+
+    #[test]
+    fn refresh_with_skills_appends_the_skill_list() {
+        let mut agent = agent();
+        agent.skills = vec![skill("deploy", "deploys the app to prod")];
+        agent.refresh_system_prompt();
+        let prompt = &agent.context.system_prompt;
+        assert!(prompt.contains(Mode::Yolo.system_prompt()));
+        assert!(prompt.contains("# Skills"));
+        assert!(prompt.contains("deploy"));
+        assert!(prompt.contains("deploys the app to prod"));
+    }
+
+    #[test]
+    fn a_pinned_mode_refresh_keeps_the_skill_list() {
+        let mut agent = agent();
+        agent.skills = vec![skill("deploy", "deploys the app to prod")];
+        agent = agent.with_pinned_mode(Mode::Plan);
+        assert!(agent.context.system_prompt.contains(Mode::Plan.system_prompt()));
+        assert!(agent.context.system_prompt.contains("# Skills"));
+        assert!(agent.context.system_prompt.contains("deploy"));
+        assert!(agent.context.system_prompt.contains("deploys the app to prod"));
+    }
+
+    #[tokio::test]
+    async fn run_turns_refreshes_the_system_prompt_and_keeps_skills() {
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n";
+        let (base_url, _requests) = mock_server(vec![answer.to_string()]).await;
+        let client = OpenAI::with_config(
+            openai_oxide::ClientConfig::new("local").base_url(base_url),
+        );
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(Mode::Yolo)),
+            10000,
+            Duration::from_secs(30),
+        );
+        agent.skills = vec![skill("deploy", "deploys the app to prod")];
+        *agent.mode.lock().unwrap() = Mode::Plan;
+
+        let outcome = agent.chat("go", &mut |_| {}).await.unwrap();
+        assert_eq!(outcome, ChatOutcome::Answer("done".into()));
+        assert!(
+            agent.context.system_prompt.contains(Mode::Plan.system_prompt()),
+            "run_turns should refresh to the current mode"
+        );
+        assert!(agent.context.system_prompt.contains("# Skills"));
+        assert!(agent.context.system_prompt.contains("deploy"));
     }
 
     #[tokio::test]

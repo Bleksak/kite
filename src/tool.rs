@@ -37,6 +37,9 @@ pub enum ToolError {
     #[error("webfetch of {url} failed with status {status}")]
     WebFetchStatus { url: String, status: u16 },
 
+    #[error(transparent)]
+    Skill(#[from] crate::skill::SkillError),
+
     #[error("expected exactly one occurrence of old content in {path}, found {occurrences}")]
     AmbiguousEdit { path: String, occurrences: usize },
 
@@ -77,6 +80,7 @@ pub enum Tool {
     AskUser(Vec<Question>),
     SubmitPlan(Vec<PlanStage>),
     Escalate(String),
+    UseSkill(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +198,7 @@ fn extract_json_array(s: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum ToolOutput {
     Before(String),
     After,
@@ -216,6 +221,23 @@ fn cap_output(text: String) -> String {
         start += 1;
     }
     format!("[truncated {start} bytes]\n{}", &text[start..])
+}
+
+/// Caps a skill body at `READ_FILE_BYTE_CAP` bytes, cutting on a char boundary
+/// and appending a `[truncated ...]` note. Returns the body unchanged when it
+/// fits.
+fn cap_body(body: String) -> String {
+    if body.len() <= READ_FILE_BYTE_CAP {
+        return body;
+    }
+    let mut cut = READ_FILE_BYTE_CAP;
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n[truncated at {READ_FILE_BYTE_CAP} bytes; the rest of the skill body was cut]",
+        &body[..cut]
+    )
 }
 
 struct KillOnDrop(Option<tokio::process::Child>);
@@ -241,6 +263,7 @@ impl Tool {
             Tool::AskUser(_) => "ask_user",
             Tool::SubmitPlan(_) => "submit_plan",
             Tool::Escalate(_) => "escalate",
+            Tool::UseSkill(_) => "use_skill",
         }
     }
 
@@ -273,6 +296,7 @@ impl Tool {
             ),
             Tool::SubmitPlan(_) => "submit_plan".to_string(),
             Tool::Escalate(_) => "escalate".to_string(),
+            Tool::UseSkill(name) => format!("use_skill: {name}"),
         }
     }
 
@@ -295,6 +319,7 @@ impl Tool {
             ),
             Tool::SubmitPlan(stages) => ToolOutput::Before(plan_text(stages)),
             Tool::Escalate(findings) => ToolOutput::Before(findings.clone()),
+            Tool::UseSkill(name) => ToolOutput::Before(name.clone()),
         }
     }
 
@@ -319,6 +344,9 @@ impl Tool {
             }
             Tool::Escalate(_) => {
                 "Escalate a blocker you cannot resolve. Call this alone, without other tools."
+            }
+            Tool::UseSkill(_) => {
+                "Load the full instructions of a skill by name (skill names and one-line descriptions are listed in the system prompt). Call it before acting on a task a skill covers."
             }
         }
     }
@@ -516,6 +544,10 @@ impl Tool {
                     "task {id} started; its result will be reported when it finishes"
                 ))
             }
+            Tool::UseSkill(name) => {
+                let body = crate::skill::load_skill_body(name)?;
+                Ok(cap_body(body))
+            }
             Tool::SubmitPlan(_) => Err(ToolError::TerminatorNotExecutable),
             Tool::Escalate(_) => Err(ToolError::TerminatorNotExecutable),
             Tool::AskUser(_) => Err(ToolError::InteractiveNotExecutable),
@@ -625,6 +657,11 @@ struct WebFetchArgs {
 }
 
 #[derive(Deserialize)]
+struct UseSkillArgs {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct EscalateArgs {
     findings: String,
 }
@@ -692,6 +729,8 @@ impl TryFrom<OpenAIToolCall> for Tool {
                 .map(|a| Tool::EditFile(a.path, a.old_content, a.new_content)),
             "webfetch" => parse_args::<WebFetchArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::WebFetch(a.url)),
+            "use_skill" => parse_args::<UseSkillArgs>(&function.name, &function.arguments)
+                .map(|a| Tool::UseSkill(a.name)),
             "bg_run" => parse_args::<BashArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::BgRun(a.command)),
             "submit_plan" => {
@@ -801,6 +840,13 @@ fn parameters(tool: &Tool) -> serde_json::Value {
             },
             "required": ["url"]
         }),
+        Tool::UseSkill(_) => json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "the name of the skill to load" }
+            },
+            "required": ["name"]
+        }),
         Tool::AskUser(_) => json!({
             "type": "object",
             "properties": {
@@ -863,10 +909,11 @@ fn parameters(tool: &Tool) -> serde_json::Value {
 #[cfg(test)]
 mod test {
     use crate::tool::{
-        KillOnDrop, Tool, ToolError, Question, QuestionKind, PlanStage, plan_text, parse_stages,
-        tool_definitions,
+        cap_body, KillOnDrop, Tool, ToolError, Question, QuestionKind,
+        PlanStage, plan_text, parse_stages, tool_definitions, ToolOutput,
     };
     use openai_oxide::types::chat::{FunctionCall, ToolCall as OpenAIToolCall};
+    use serde_json::json;
     use std::io::{Read, Write};
     use std::process::Stdio;
     use std::time::Duration;
@@ -1847,6 +1894,98 @@ version: 3"#,
     }
 
     #[test]
+    fn use_skill_header_and_output() {
+        assert_eq!(Tool::UseSkill("deploy".into()).label(), "use_skill");
+        assert_eq!(Tool::UseSkill("deploy".into()).header(), "use_skill: deploy");
+        assert_eq!(
+            Tool::UseSkill("deploy".into()).output(),
+            ToolOutput::Before("deploy".into())
+        );
+    }
+
+    #[test]
+    fn try_from_use_skill() {
+        let tool = Tool::try_from(call("use_skill", r#"{"name":"deploy"}"#)).unwrap();
+        assert_eq!(tool, Tool::UseSkill("deploy".into()));
+    }
+
+    #[test]
+    fn try_from_use_skill_missing_name_is_error() {
+        let error = Tool::try_from(call("use_skill", r#"{}"#)).unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn use_skill_schema_requires_name() {
+        let definition = tool_definitions(&[Tool::UseSkill(String::new())])[0].clone();
+        let params = definition.function.parameters.as_ref().unwrap();
+        assert_eq!(params.get("required").unwrap(), &json!(["name"]));
+        assert_eq!(
+            params["properties"]["name"]["type"],
+            serde_json::Value::String("string".into())
+        );
+    }
+
+    #[test]
+    fn cap_body_returns_a_fitting_body_unchanged() {
+        let body = "# deploy\nrun the deploy script";
+        assert_eq!(cap_body(body.to_string()), body);
+    }
+
+    #[test]
+    fn cap_body_truncates_an_over_budget_body() {
+        // 50_000-byte body, over the 40_000-byte cap.
+        let body = "x".repeat(50_000);
+        let result = cap_body(body);
+
+        assert!(result.starts_with("x"), "should return the head: {result}");
+        assert!(
+            result.contains("[truncated at 40000 bytes"),
+            "should have the cap note: {result}"
+        );
+        assert!(
+            result.len() < 41_000,
+            "should be capped near the budget, was {}",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn cap_body_cuts_on_a_char_boundary() {
+        // 3-byte chars, so the 40_000-byte mark lands mid-character.
+        let body = "€".repeat(20_000);
+        let result = cap_body(body);
+
+        assert!(result.contains("[truncated at 40000 bytes"));
+        let head = result.lines().next().unwrap();
+        assert!(
+            head.chars().all(|c| c == '€'),
+            "should back off to the last whole char: {head}"
+        );
+    }
+
+    #[test]
+    fn skill_error_not_found_converts_to_tool_error() {
+        let error = ToolError::from(crate::skill::SkillError::NotFound("missing".to_string()));
+        assert!(matches!(
+            error,
+            ToolError::Skill(crate::skill::SkillError::NotFound(name)) if name == "missing"
+        ));
+    }
+
+    #[test]
+    fn skill_error_io_converts_to_tool_error() {
+        let error = ToolError::from(crate::skill::SkillError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "gone",
+        )));
+        assert!(matches!(
+            error,
+            ToolError::Skill(crate::skill::SkillError::Io(_))
+        ));
+    }
+
+    #[test]
     fn schemas_are_consistent_with_parser() {
         let all = [
             Tool::Bash(String::new()),
@@ -1856,6 +1995,7 @@ version: 3"#,
             Tool::EditFile(String::new(), String::new(), String::new()),
             Tool::WebFetch(String::new()),
             Tool::BgRun(String::new()),
+            Tool::UseSkill(String::new()),
         ];
         for definition in tool_definitions(&all) {
             let properties = definition

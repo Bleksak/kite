@@ -35,12 +35,14 @@ impl Mode {
                 Tool::WebFetch(String::new()),
                 Tool::BgRun(String::new()),
                 Tool::AskUser(Vec::new()),
+                Tool::UseSkill(String::new()),
             ],
             Self::Plan => vec![
                 Tool::ReadFile(String::new(), None, None),
                 Tool::ReadOnlyBash(String::new()),
                 Tool::AskUser(Vec::new()),
                 Tool::SubmitPlan(Vec::new()),
+                Tool::UseSkill(String::new()),
             ],
             Self::Implement => vec![
                 Tool::ReadFile(String::new(), None, None),
@@ -49,9 +51,9 @@ impl Mode {
                 Tool::WriteFile(String::new(), String::new()),
                 Tool::EditFile(String::new(), String::new(), String::new()),
                 Tool::WebFetch(String::new()),
-                Tool::BgRun(String::new()),
                 Tool::AskUser(Vec::new()),
                 Tool::Escalate(String::new()),
+                Tool::UseSkill(String::new()),
             ],
         }
     }
@@ -71,13 +73,13 @@ impl Mode {
     pub fn system_prompt(&self) -> &'static str {
         match self {
             Self::Yolo => {
-                "You are a coding agent. Do the minimum work the task requires: answer directly when you can, and only read files or run commands when the task needs them — do not explore the codebase on your own. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. When you need a decision, preference, or information only the user can provide, call ask_user and wait for the answer — do not guess. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. If you rely on file content you saw earlier in this session, re-read the file before quoting or summarizing it — files may have changed. When a user message contains @path/to/file, the file's content is included in the message; a pruned placeholder means the content was removed after use — re-read the file with read_file."
+                "You are a coding agent. Do the minimum work the task requires: answer directly when you can, and only read files or run commands when the task needs them — do not explore the codebase on your own. For long-running commands (tests, builds, dev servers), use bg_run instead of bash; its result is reported automatically when the task finishes. When you need a decision, preference, or information only the user can provide, call ask_user and wait for the answer — do not guess. Your configuration and session history live in .kite/: previous sessions are stored as JSON transcripts in .kite/sessions/ and background task logs in .kite/tasks/ — read them when the user refers to previous work. If you rely on file content you saw earlier in this session, re-read the file before quoting or summarizing it — files may have changed. When a user message contains @path/to/file, the file's content is included in the message; a pruned placeholder means the content was removed after use — re-read the file with read_file. When you need several independent tool calls, batch them in a single turn rather than one at a time. Skills are listed below; call use_skill with a skill name to load its full instructions before acting on a matching task."
             }
             Self::Plan => {
-                "You are a planning agent. Investigate only what the task requires: read the files you need to understand the change, not the whole codebase, and do not re-read a file you have already read. As soon as you have enough to plan, call submit_plan with a concrete implementation plan split into stages — do not keep investigating. Each stage has a title and a markdown description and is a self-contained unit that can be implemented and verified on its own; the user reviews each stage's implementation before the next stage starts, so order the stages from foundation to finish. Do not modify any files."
+                "You are a planning agent. Investigate only what the task requires: read the files you need to understand the change, not the whole codebase, and do not re-read a file you have already read. As soon as you have enough to plan, call submit_plan with a concrete implementation plan split into stages — do not keep investigating. Each stage has a title and a markdown description and is a self-contained unit that can be implemented and verified on its own; the user reviews each stage's implementation before the next stage starts, so order the stages from foundation to finish. Do not modify any files. When you need several independent tool calls, batch them in a single turn rather than one at a time. Skills are listed below; call use_skill to load the full instructions of a skill that covers the task."
             }
             Self::Implement => {
-                "You are an implementation agent. Execute the current stage step by step. Verify your work (build, tests) with bash or bg_run. Do not start later stages; the user reviews this stage before the next one begins. If you hit a blocker you cannot resolve, call escalate alone with a description of the blocker; do not guess around it."
+                "You are an implementation agent. Execute the current stage step by step. Verify your work (build, tests) with bash. Do not start later stages; the user reviews this stage before the next one begins. If you hit a blocker you cannot resolve, call escalate alone with a description of the blocker; do not guess around it. When you need several independent tool calls, batch them in a single turn rather than one at a time. Skills are listed below; call use_skill to load the full instructions of a skill that covers the task."
             }
         }
     }
@@ -116,7 +118,8 @@ mod test {
                 "edit_file",
                 "webfetch",
                 "bg_run",
-                "ask_user"
+                "ask_user",
+                "use_skill"
             ]
         );
     }
@@ -131,7 +134,13 @@ mod test {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["read_file", "readonly_bash", "ask_user", "submit_plan"]
+            vec![
+                "read_file",
+                "readonly_bash",
+                "ask_user",
+                "submit_plan",
+                "use_skill"
+            ]
         );
     }
 
@@ -169,9 +178,9 @@ mod test {
                 "write_file",
                 "edit_file",
                 "webfetch",
-                "bg_run",
                 "ask_user",
-                "escalate"
+                "escalate",
+                "use_skill"
             ]
         );
     }
@@ -182,6 +191,19 @@ mod test {
         assert!(!Mode::Implement.allows(&Tool::SubmitPlan(Vec::new())));
         assert!(Mode::Implement.allows(&Tool::Escalate("blocker".into())));
         assert!(Mode::Implement.allows(&Tool::WriteFile("a".into(), "x".into())));
+    }
+
+    #[test]
+    fn implement_rejects_bg_run_but_yolo_allows_it() {
+        assert!(!Mode::Implement.allows(&Tool::BgRun("sleep 1".into())));
+        assert!(Mode::Yolo.allows(&Tool::BgRun("sleep 1".into())));
+    }
+
+    #[test]
+    fn use_skill_is_allowed_in_every_mode() {
+        assert!(Mode::Yolo.allows(&Tool::UseSkill("deploy".into())));
+        assert!(Mode::Plan.allows(&Tool::UseSkill("deploy".into())));
+        assert!(Mode::Implement.allows(&Tool::UseSkill("deploy".into())));
     }
 
     #[test]
