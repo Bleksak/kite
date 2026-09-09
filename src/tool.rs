@@ -107,9 +107,17 @@ pub fn parse_stages(arguments: &str) -> Vec<PlanStage> {
         serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
 
     let stages_value = match value.get("stages") {
-        Some(serde_json::Value::String(encoded)) => serde_json::from_str::<serde_json::Value>(encoded)
-            .ok()
-            .or_else(|| Some(serde_json::Value::String(encoded.clone()))),
+        Some(serde_json::Value::String(encoded)) => {
+            let v = if let Ok(v) = serde_json::from_str::<serde_json::Value>(encoded) {
+                v
+            } else if let Some(array_part) = extract_json_array(encoded) {
+                serde_json::from_str::<serde_json::Value>(&array_part)
+                    .unwrap_or(serde_json::Value::String(encoded.clone()))
+            } else {
+                serde_json::Value::String(encoded.clone())
+            };
+            Some(v)
+        }
         other => other.cloned(),
     };
 
@@ -168,6 +176,16 @@ pub fn parse_stages(arguments: &str) -> Vec<PlanStage> {
         title: "Plan".to_string(),
         tasks: vec!["(the plan could not be parsed)".to_string()],
     }]
+}
+
+fn extract_json_array(s: &str) -> Option<String> {
+    let start = s.find('[')?;
+    let end = s.rfind(']')?;
+    if end > start {
+        Some(s[start..=end].to_string())
+    } else {
+        None
+    }
 }
 
 pub enum ToolOutput {
@@ -1809,6 +1827,18 @@ version: 3"#,
     fn parse_stages_accepts_a_double_encoded_stages_string() {
         let inner = r#"[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]"#;
         let args = format!("{{\"stages\":{}}}", serde_json::to_string(inner).unwrap());
+        let stages = parse_stages(&args);
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].title, "One");
+        assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(stages[1].title, "Two");
+    }
+
+    #[test]
+    fn parse_stages_accepts_a_stages_string_with_trailing_garbage() {
+        let inner = r#"[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]"#;
+        let with_garbage = format!("{inner}}}");
+        let args = format!("{{\"stages\":{}}}", serde_json::to_string(&with_garbage).unwrap());
         let stages = parse_stages(&args);
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "One");
