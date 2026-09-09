@@ -200,7 +200,12 @@ pub enum ToolOutput {
 }
 
 const OUTPUT_LIMIT: usize = 10_000;
-const READ_FILE_LINE_CAP: usize = 250;
+/// Byte budget for one read_file result. Bytes rather than lines: 250 lines of
+/// Rust and 250 lines of a lockfile differ by an order of magnitude in cost.
+/// Sized to return the large majority of source files in a single call — with a
+/// stable prefix a big read is paid once and cached on every later round, so
+/// fewer fat reads beat many thin ones.
+const READ_FILE_BYTE_CAP: usize = 40_000;
 
 fn cap_output(text: String) -> String {
     if text.len() <= OUTPUT_LIMIT {
@@ -362,17 +367,51 @@ impl Tool {
                 let end = end
                     .map_or(total, |end| end.min(total))
                     .max(start);
-                if end - start > READ_FILE_LINE_CAP {
-                    let capped_end = start + READ_FILE_LINE_CAP;
-                    let body = lines[start..capped_end].join("\n");
+                let mut body = String::new();
+                let mut taken = 0usize;
+                let mut truncated = false;
+                let mut partial_line = false;
+                for line in &lines[start..end] {
+                    let separator = usize::from(taken > 0);
+                    if taken > 0 && body.len() + separator + line.len() > READ_FILE_BYTE_CAP {
+                        truncated = true;
+                        break;
+                    }
+                    if taken > 0 {
+                        body.push('\n');
+                    }
+                    if line.len() > READ_FILE_BYTE_CAP {
+                        // Only reachable on the first line of the range: a single
+                        // line over budget. Cut it rather than return nothing.
+                        let mut cut = READ_FILE_BYTE_CAP;
+                        while !line.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        body.push_str(&line[..cut]);
+                        taken += 1;
+                        truncated = true;
+                        partial_line = true;
+                        break;
+                    }
+                    body.push_str(line);
+                    taken += 1;
+                }
+                if !truncated {
+                    return Ok(body);
+                }
+                let range = format!(
+                    "showing lines {}–{} of {}; call read_file with start/end for the rest",
+                    start + 1,
+                    start + taken,
+                    total
+                );
+                if partial_line {
                     return Ok(format!(
-                        "{body}\n[showing lines {}–{} of {}; call read_file with start/end for the rest]",
-                        start + 1,
-                        capped_end,
-                        total
+                        "{body}\n[line {} truncated at {READ_FILE_BYTE_CAP} bytes; {range}]",
+                        start + taken
                     ));
                 }
-                Ok(lines[start..end].join("\n"))
+                Ok(format!("{body}\n[{range}]"))
             }
             Tool::WriteFile(file, content) => {
                 tokio::fs::write(file, content)
@@ -987,26 +1026,102 @@ mod test {
         assert_eq!(tool.invoke(timeout()).await.unwrap(), "two\nthree");
     }
 
-    #[tokio::test]
-    async fn read_file_caps_a_full_read_to_the_head() {
-        let temp_dir = TestFiles::new();
-        let content = (0..300)
-            .map(|i| format!("line{i}"))
+    /// 79 content bytes + 1 newline = 80 bytes per line, so exactly 500 lines
+    /// fit the 40_000-byte budget and the cut point is checkable by hand.
+    fn wide_lines(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("line{i:04}{}", "x".repeat(71)))
             .collect::<Vec<_>>()
-            .join("\n");
-        temp_dir.file("big.txt", &content);
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn read_file_caps_a_full_read_by_bytes_not_lines() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("big.txt", &wide_lines(600));
         let file = temp_dir.path().join("big.txt");
 
         let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
         let result = tool.invoke(timeout()).await.unwrap();
 
-        assert!(result.starts_with("line0"), "should start at the head: {result}");
-        assert!(result.contains("line249"), "should include line 250 (index 249)");
-        assert!(!result.contains("line250"), "should not include line 251 (index 250)");
+        assert!(result.starts_with("line0000"), "should start at the head: {result}");
+        assert!(result.contains("line0499"), "500 lines of 80 bytes fill the budget");
+        assert!(!result.contains("line0500"), "should stop at the budget");
         assert!(
-            result.contains("[showing lines 1–250 of 300"),
+            result.contains("[showing lines 1–500 of 600"),
             "should have the cap note: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_file_caps_a_range_by_bytes() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("big.txt", &wide_lines(700));
+        let file = temp_dir.path().join("big.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(100), None);
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        assert!(result.starts_with("line0099"), "should start at the requested start: {result}");
+        assert!(result.contains("line0598"), "should take a full budget from the start");
+        assert!(!result.contains("line0599"), "should not exceed the budget");
+        assert!(
+            result.contains("[showing lines 100–599 of 700"),
+            "should have the cap note: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_a_whole_file_that_fits_the_budget() {
+        let temp_dir = TestFiles::new();
+        // 400 short lines: over the old 250-line cap, far under the byte budget.
+        let content = (0..400)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        temp_dir.file("small.txt", &content);
+        let file = temp_dir.path().join("small.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        assert_eq!(result, content, "should come back in one call, uncapped");
+        assert!(!result.contains("[showing"), "no cap note: {result}");
+    }
+
+    #[tokio::test]
+    async fn read_file_truncates_a_single_over_budget_line() {
+        let temp_dir = TestFiles::new();
+        temp_dir.file("wide.txt", &"x".repeat(50_000));
+        let file = temp_dir.path().join("wide.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        assert!(
+            result.starts_with(&"x".repeat(40_000)),
+            "should return the head of the line rather than nothing"
+        );
+        assert!(
+            result.contains("[line 1 truncated at 40000 bytes; showing lines 1–1 of 1"),
+            "should say the line itself was cut: {}",
+            &result[result.len().saturating_sub(120)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_cuts_an_over_budget_line_on_a_char_boundary() {
+        let temp_dir = TestFiles::new();
+        // 3-byte chars, so the 40_000-byte mark lands mid-character.
+        temp_dir.file("wide.txt", &"€".repeat(20_000));
+        let file = temp_dir.path().join("wide.txt");
+
+        let tool = Tool::ReadFile(file.to_string_lossy().into(), None, None);
+        let result = tool.invoke(timeout()).await.unwrap();
+
+        let body = result.split('\n').next().unwrap();
+        assert_eq!(body, "€".repeat(13_333), "should back off to the last whole char");
+        assert!(result.contains("truncated at 40000 bytes"));
     }
 
     #[tokio::test]
@@ -1030,28 +1145,6 @@ mod test {
                 .join("\n")
         );
         assert!(!result.contains("[showing"), "should not have the cap note: {result}");
-    }
-
-    #[tokio::test]
-    async fn read_file_caps_a_range_that_exceeds_the_cap() {
-        let temp_dir = TestFiles::new();
-        let content = (0..400)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        temp_dir.file("big.txt", &content);
-        let file = temp_dir.path().join("big.txt");
-
-        let tool = Tool::ReadFile(file.to_string_lossy().into(), Some(100), None);
-        let result = tool.invoke(timeout()).await.unwrap();
-
-        assert!(result.starts_with("line99"), "should start at the requested start: {result}");
-        assert!(result.contains("line348"), "should include 250 lines from the start");
-        assert!(!result.contains("line349"), "should not exceed the cap");
-        assert!(
-            result.contains("[showing lines 100–349 of 400"),
-            "should have the cap note: {result}"
-        );
     }
 
     #[tokio::test]
