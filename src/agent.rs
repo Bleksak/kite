@@ -203,21 +203,44 @@ impl Agent {
 
             let terminator = self.mode.lock().unwrap().terminator();
             if let Some(terminator) = terminator
-                && let Message::Assistant { tool_calls, .. } = &message
+                && let Message::Assistant { content, tool_calls, .. } = &message
                 && let Some(call) = tool_calls.iter().find(|c| c.function.name == terminator)
             {
-                self.context.messages.push(message.clone());
-                let tool = Tool::try_from(call.clone())?;
-                let body = match &tool {
-                    Tool::SubmitPlan(stages) => Some(crate::tool::plan_text(stages)),
-                    _ => None,
-                };
-                on_event(AgentEvent::ToolStarted {
-                    header: terminator.to_string(),
-                    body,
-                });
-                self.prune_file_refs();
-                return Ok(ChatOutcome::Terminated { tool });
+                match Tool::try_from(call.clone()) {
+                    Ok(tool) => {
+                        self.context.messages.push(message.clone());
+                        let body = match &tool {
+                            Tool::SubmitPlan(stages) => Some(crate::tool::plan_text(stages)),
+                            _ => None,
+                        };
+                        on_event(AgentEvent::ToolStarted {
+                            header: terminator.to_string(),
+                            body,
+                        });
+                        self.prune_file_refs();
+                        return Ok(ChatOutcome::Terminated { tool });
+                    }
+                    Err(error) => {
+                        self.context.messages.push(Message::Assistant {
+                            content: content.clone(),
+                            tool_calls: vec![call.clone()],
+                        });
+                        on_event(AgentEvent::ToolStarted {
+                            header: terminator.to_string(),
+                            body: None,
+                        });
+                        let feedback =
+                            format!("{error} Call {terminator} again with corrected arguments.");
+                        on_event(AgentEvent::ToolResult {
+                            header: terminator.to_string(),
+                            body: feedback.clone(),
+                        });
+                        self.context.messages.push(Message::Tool {
+                            tool_call_id: call.id.clone(),
+                            content: feedback,
+                        });
+                    }
+                }
             }
 
             match self.handle_response(message, on_event).await {
@@ -1843,5 +1866,89 @@ mod test {
                 if content.contains("submit_plan is not allowed in mode yolo"))
         });
         assert!(rejection);
+    }
+
+    fn sse_tool_call(id: &str, name: &str, arguments: &str) -> String {
+        let payload = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                }
+            }]
+        });
+        format!("data: {payload}\n\ndata: [DONE]\n\n")
+    }
+
+    #[tokio::test]
+    async fn a_malformed_submit_plan_is_reported_to_the_model_and_retried() {
+        let bad_inner = r#"[{"title":"step one","tasks":["do it"]}"#;
+        let bad_args = format!("{{\"stages\":{}}}", serde_json::to_string(bad_inner).unwrap());
+        let bad_sse = sse_tool_call("call_1", "submit_plan", &bad_args);
+        let good_sse = sse_tool_call(
+            "call_2",
+            "submit_plan",
+            r#"{"stages":[{"title":"step one","tasks":["do it"]}]}"#,
+        );
+        let (base_url, _requests) = mock_server(vec![bad_sse, good_sse]).await;
+        let mut agent = plan_agent(base_url);
+        let mut events = Vec::new();
+
+        let outcome = agent
+            .chat("plan this", &mut |event| events.push(event))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ChatOutcome::Terminated { .. }));
+        let reported = agent.context.messages.iter().any(|message| {
+            matches!(message, Message::Tool { content, .. }
+                if content.contains("invalid arguments for submit_plan")
+                && content.contains("Call submit_plan again with corrected arguments"))
+        });
+        assert!(reported);
+        let shown = events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolResult { header, .. } if header == "submit_plan")
+        });
+        assert!(shown);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_escalate_is_reported_to_the_model_and_retried() {
+        let bad_sse = sse_tool_call(
+            "call_1",
+            "escalate",
+            r#"{"findings":123}"#,
+        );
+        let good_sse = sse_tool_call(
+            "call_2",
+            "escalate",
+            r#"{"findings":"the build is broken"}"#,
+        );
+        let (base_url, _requests) = mock_server(vec![bad_sse, good_sse]).await;
+        let client =
+            OpenAI::with_config(openai_oxide::ClientConfig::new("local").base_url(base_url));
+        let mut agent = Agent::new(
+            client,
+            "test-model",
+            Arc::new(Mutex::new(crate::mode::Mode::Implement)),
+            10000,
+            Duration::from_secs(30),
+        );
+        let mut events = Vec::new();
+
+        let outcome = agent
+            .chat("implement it", &mut |event| events.push(event))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ChatOutcome::Terminated { .. }));
+        let reported = agent.context.messages.iter().any(|message| {
+            matches!(message, Message::Tool { content, .. }
+                if content.contains("invalid arguments for escalate")
+                && content.contains("Call escalate again with corrected arguments"))
+        });
+        assert!(reported);
     }
 }

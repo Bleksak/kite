@@ -102,19 +102,23 @@ pub fn plan_text(stages: &[PlanStage]) -> String {
         .join("\n\n")
 }
 
-pub fn parse_stages(arguments: &str) -> Vec<PlanStage> {
-    let value: serde_json::Value =
-        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+pub fn parse_stages(arguments: &str) -> Result<Vec<PlanStage>, String> {
+    let value: serde_json::Value = serde_json::from_str(arguments)
+        .map_err(|_| "arguments are not valid JSON".to_string())?;
 
     let stages_value = match value.get("stages") {
         Some(serde_json::Value::String(encoded)) => {
             let v = if let Ok(v) = serde_json::from_str::<serde_json::Value>(encoded) {
                 v
-            } else if let Some(array_part) = extract_json_array(encoded) {
-                serde_json::from_str::<serde_json::Value>(&array_part)
-                    .unwrap_or(serde_json::Value::String(encoded.clone()))
+            } else if let Some(array_part) = extract_json_array(encoded)
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&array_part)
+            {
+                v
             } else {
-                serde_json::Value::String(encoded.clone())
+                return Err(
+                    "stages must be a JSON array of stage objects, not a string; the string value is not valid JSON (check for a missing closing bracket or stray quotes)"
+                        .to_string(),
+                );
             };
             Some(v)
         }
@@ -127,7 +131,7 @@ pub fn parse_stages(arguments: &str) -> Vec<PlanStage> {
             .filter_map(|item| {
                 if let Some(title) = item.as_str() {
                     return Some(PlanStage {
-                        title: title.chars().take(40).collect(),
+                        title: title.to_string(),
                         tasks: vec![title.to_string()],
                     });
                 }
@@ -155,27 +159,25 @@ pub fn parse_stages(arguments: &str) -> Vec<PlanStage> {
                     return None;
                 }
                 Some(PlanStage {
-                    title: title.chars().take(40).collect(),
+                    title,
                     tasks,
                 })
             })
             .collect();
         if !parsed.is_empty() {
-            return parsed;
+            return Ok(parsed);
         }
+        return Err("no stage had a title and at least one task".to_string());
     }
 
     if let Some(plan) = value.get("plan").and_then(|p| p.as_str()) {
-        return vec![PlanStage {
+        return Ok(vec![PlanStage {
             title: "Plan".to_string(),
             tasks: vec![plan.to_string()],
-        }];
+        }]);
     }
 
-    vec![PlanStage {
-        title: "Plan".to_string(),
-        tasks: vec!["(the plan could not be parsed)".to_string()],
-    }]
+    Err("missing the 'stages' array".to_string())
 }
 
 fn extract_json_array(s: &str) -> Option<String> {
@@ -650,7 +652,13 @@ impl TryFrom<OpenAIToolCall> for Tool {
             "bg_run" => parse_args::<BashArgs>(&function.name, &function.arguments)
                 .map(|a| Tool::BgRun(a.command)),
             "submit_plan" => {
-                let stages = parse_stages(&function.arguments);
+                let stages = parse_stages(&function.arguments).map_err(|source| {
+                    ToolError::InvalidArguments {
+                        name: function.name.clone(),
+                        raw: function.arguments.clone(),
+                        source: serde::de::Error::custom(source),
+                    }
+                })?;
                 if stages
                     .iter()
                     .any(|s| s.title.trim().is_empty() || s.tasks.is_empty())
@@ -1633,19 +1641,19 @@ version: 3"#,
     }
 
     #[test]
-    fn try_from_submit_plan_empty_stages_falls_back_to_a_stage() {
-        let tool = Tool::try_from(call("submit_plan", r#"{"stages":[]}"#)).unwrap();
-        assert!(matches!(tool, Tool::SubmitPlan(_)));
+    fn try_from_submit_plan_empty_stages_is_an_error() {
+        let error = Tool::try_from(call("submit_plan", r#"{"stages":[]}"#)).unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
     }
 
     #[test]
-    fn try_from_submit_plan_stage_without_tasks_falls_back_to_a_stage() {
-        let tool = Tool::try_from(call(
+    fn try_from_submit_plan_stage_without_tasks_is_an_error() {
+        let error = Tool::try_from(call(
             "submit_plan",
             r#"{"stages":[{"title":"data","tasks":[]}]}"#,
         ))
-        .unwrap();
-        assert!(matches!(tool, Tool::SubmitPlan(_)));
+        .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
     }
 
     #[test]
@@ -1793,7 +1801,8 @@ version: 3"#,
     fn parse_stages_reads_the_stages_array() {
         let stages = parse_stages(
             r#"{"stages":[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "One");
         assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
@@ -1802,14 +1811,15 @@ version: 3"#,
 
     #[test]
     fn parse_stages_accepts_a_task_string_not_just_an_array() {
-        let stages = parse_stages(r#"{"stages":[{"title":"One","tasks":"just a string"}]}"#);
+        let stages =
+            parse_stages(r#"{"stages":[{"title":"One","tasks":"just a string"}]}"#).unwrap();
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].tasks, vec!["just a string".to_string()]);
     }
 
     #[test]
     fn parse_stages_accepts_bare_string_stages() {
-        let stages = parse_stages(r#"{"stages":["first step","second step"]}"#);
+        let stages = parse_stages(r#"{"stages":["first step","second step"]}"#).unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "first step");
         assert_eq!(stages[0].tasks, vec!["first step".to_string()]);
@@ -1817,7 +1827,7 @@ version: 3"#,
 
     #[test]
     fn parse_stages_falls_back_to_the_plan_field() {
-        let stages = parse_stages(r#"{"plan":"the whole plan as text"}"#);
+        let stages = parse_stages(r#"{"plan":"the whole plan as text"}"#).unwrap();
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].title, "Plan");
         assert_eq!(stages[0].tasks, vec!["the whole plan as text".to_string()]);
@@ -1827,7 +1837,7 @@ version: 3"#,
     fn parse_stages_accepts_a_double_encoded_stages_string() {
         let inner = r#"[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]"#;
         let args = format!("{{\"stages\":{}}}", serde_json::to_string(inner).unwrap());
-        let stages = parse_stages(&args);
+        let stages = parse_stages(&args).unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "One");
         assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
@@ -1839,7 +1849,7 @@ version: 3"#,
         let inner = r#"[{"title":"One","tasks":["a","b"]},{"title":"Two","tasks":["c"]}]"#;
         let with_garbage = format!("{inner}}}");
         let args = format!("{{\"stages\":{}}}", serde_json::to_string(&with_garbage).unwrap());
-        let stages = parse_stages(&args);
+        let stages = parse_stages(&args).unwrap();
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].title, "One");
         assert_eq!(stages[0].tasks, vec!["a".to_string(), "b".to_string()]);
@@ -1847,13 +1857,41 @@ version: 3"#,
     }
 
     #[test]
-    fn parse_stages_never_returns_the_raw_json() {
-        let stages = parse_stages(r#"{"stages":{"weird":"shape"}}"#);
-        assert_eq!(stages.len(), 1);
-        assert!(
-            !stages[0].tasks[0].contains('{'),
-            "must not leak raw json: {}",
-            stages[0].tasks[0]
+    fn parse_stages_keeps_long_titles_in_full() {
+        let long = "Skill model, discovery, and rendering (project and global, with overrides)";
+        let args = format!(
+            "{{\"stages\":[{{\"title\":{},\"tasks\":[\"a\"]}}]}}",
+            serde_json::to_string(long).unwrap()
         );
+        let stages = parse_stages(&args).unwrap();
+        assert_eq!(stages[0].title, long);
+    }
+
+    #[test]
+    fn parse_stages_rejects_a_weird_stages_shape_without_leaking_raw_json() {
+        let error = parse_stages(r#"{"stages":{"weird":"shape"}}"#).unwrap_err();
+        assert!(!error.contains('{'));
+    }
+
+    #[test]
+    fn parse_stages_rejects_a_truncated_double_encoded_stages_string() {
+        let inner = r#"[{"title":"One","tasks":["a","b"]}"#;
+        let args = format!("{{\"stages\":{}}}", serde_json::to_string(inner).unwrap());
+        assert!(parse_stages(&args).is_err());
+    }
+
+    #[test]
+    fn parse_stages_rejects_invalid_json_arguments() {
+        assert!(parse_stages("not json at all").is_err());
+    }
+
+    #[test]
+    fn parse_stages_rejects_missing_stages() {
+        assert!(parse_stages(r#"{"other":"value"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_stages_rejects_an_empty_stages_array() {
+        assert!(parse_stages(r#"{"stages":[]}"#).is_err());
     }
 }
