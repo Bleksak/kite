@@ -1042,10 +1042,16 @@ fn display_lines<'a>(
     scrollback: &'a [Line<'static>],
     blocks: &[BlockKind],
     width: usize,
+    start: usize,
+    height: usize,
 ) -> Vec<Line<'a>> {
-    scrollback
+    let end = (start + height).min(scrollback.len());
+    if start >= end {
+        return Vec::new();
+    }
+    scrollback[start..end]
         .iter()
-        .zip(blocks.iter())
+        .zip(blocks[start..end].iter())
         .map(|(line, block)| {
             let (text_background, block_background) = match block {
                 BlockKind::User => (None, Some(Color::Rgb(52, 53, 65))),
@@ -1188,8 +1194,9 @@ pub fn draw(frame: &mut Frame, state: &TuiState, start: usize) {
         session.renderer.scrollback(),
         session.renderer.blocks(),
         state.pane_width,
+        start,
+        chunks[1].height as usize,
     );
-    let display = &display[start.min(display.len())..];
     let main = Paragraph::new(display).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
@@ -3815,7 +3822,7 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
         renderer.on_event(text("ans"));
         renderer.finish();
 
-        let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
+        let display = display_lines(renderer.scrollback(), renderer.blocks(), 40, 0, renderer.scrollback().len());
         let user = &display[1];
         assert_eq!(user.width(), 40);
         assert_eq!(user.spans[0].style.bg, Some(Color::Rgb(52, 53, 65)));
@@ -3973,7 +3980,7 @@ fn codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
             body: "ok".into(),
         });
 
-        let display = display_lines(renderer.scrollback(), renderer.blocks(), 40);
+        let display = display_lines(renderer.scrollback(), renderer.blocks(), 40, 0, renderer.scrollback().len());
         assert_eq!(
             display[0].spans.last().unwrap().style.bg,
             Some(Color::Rgb(40, 40, 50))
