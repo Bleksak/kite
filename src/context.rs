@@ -1,11 +1,9 @@
 use std::borrow::Cow;
 
-use openai_oxide::types::chat::{ChatCompletionMessageParam, ToolCall};
+use openai_oxide::types::chat::ChatCompletionMessageParam;
 use serde::{Deserialize, Serialize};
 
 use crate::message::Message;
-
-const KEEP_RECENT_ROUNDS: usize = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Context {
@@ -54,11 +52,6 @@ impl Context {
             self.messages.len()
         };
 
-        let verbatim: std::collections::HashSet<usize> = self
-            .verbatim_tool_results(keep_from)
-            .into_iter()
-            .collect();
-
         self.messages
             .iter()
             .enumerate()
@@ -74,129 +67,9 @@ impl Context {
                     _ => None,
                 },
                 Message::Tool { .. } if index < keep_from => None,
-                Message::Tool {
-                    tool_call_id,
-                    content,
-                } if in_progress && !verbatim.contains(&index) => Some(Cow::Owned(Message::Tool {
-                    tool_call_id: tool_call_id.clone(),
-                    content: self.tool_result_stub(tool_call_id, content),
-                })),
                 _ => Some(Cow::Borrowed(message)),
             })
             .collect()
-    }
-
-    fn verbatim_tool_results(&self, keep_from: usize) -> Vec<usize> {
-        let round_boundaries: Vec<usize> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(index, message)| {
-                *index >= keep_from
-                    && matches!(message, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty())
-            })
-            .map(|(index, _)| index)
-            .collect();
-        let keep_rounds: std::collections::HashSet<usize> = round_boundaries
-            .iter()
-            .rev()
-            .take(KEEP_RECENT_ROUNDS)
-            .copied()
-            .collect();
-        let superseded = self.superseded_tool_results(keep_from);
-        let mut verbatim = Vec::new();
-        let mut current_boundary: Option<usize> = None;
-        for (index, message) in self.messages.iter().enumerate() {
-            if index < keep_from {
-                continue;
-            }
-            match message {
-                Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
-                    current_boundary = Some(index);
-                }
-                Message::Tool { .. } => {
-                    if let Some(boundary) = current_boundary
-                        && keep_rounds.contains(&boundary)
-                        && !superseded.contains(&index)
-                    {
-                        verbatim.push(index);
-                    }
-                }
-                _ => {}
-            }
-        }
-        verbatim
-    }
-
-    fn superseded_tool_results(&self, keep_from: usize) -> std::collections::HashSet<usize> {
-        type ReadKey = (String, Option<usize>, Option<usize>);
-        let mut reads: Vec<(usize, Option<ReadKey>)> = Vec::new();
-        for (index, message) in self.messages.iter().enumerate() {
-            if index < keep_from {
-                continue;
-            }
-            if let Message::Tool { tool_call_id, .. } = message {
-                let key = self
-                    .tool_call_for(tool_call_id)
-                    .filter(|call| call.function.name == "read_file")
-                    .and_then(|call| Self::read_file_range(&call.function.arguments));
-                reads.push((index, key));
-            }
-        }
-        let mut last_seen: std::collections::HashMap<ReadKey, usize> = std::collections::HashMap::new();
-        for (index, key) in &reads {
-            if let Some(key) = key {
-                last_seen.insert(key.clone(), *index);
-            }
-        }
-        reads
-            .into_iter()
-            .filter(|(index, key)| {
-                matches!(key, Some(k) if last_seen.get(k) != Some(index))
-            })
-            .map(|(index, _)| index)
-            .collect()
-    }
-
-    fn read_file_range(arguments: &str) -> Option<(String, Option<usize>, Option<usize>)> {
-        let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
-        let path = value.get("path")?.as_str()?.to_string();
-        let start = value.get("start").and_then(|v| v.as_u64()).map(|v| v as usize);
-        let end = value.get("end").and_then(|v| v.as_u64()).map(|v| v as usize);
-        Some((path, start, end))
-    }
-
-    fn tool_call_for(&self, tool_call_id: &str) -> Option<&ToolCall> {
-        self.messages.iter().rev().find_map(|message| match message {
-            Message::Assistant { tool_calls, .. } => {
-                tool_calls.iter().find(|call| call.id == tool_call_id)
-            }
-            _ => None,
-        })
-    }
-
-    fn tool_result_stub(&self, tool_call_id: &str, content: &str) -> String {
-        let lines = content.lines().count();
-        match self.tool_call_for(tool_call_id) {
-            Some(call) => format!(
-                "[{} {} — {} lines, pruned; re-run if needed]",
-                call.function.name,
-                Self::truncate_chars(&call.function.arguments, 80),
-                lines
-            ),
-            None => format!("[tool result pruned; {} lines; re-run if needed]", lines),
-        }
-    }
-
-    fn truncate_chars(text: &str, max: usize) -> String {
-        let mut count = 0;
-        for (index, _) in text.char_indices() {
-            if count == max {
-                return format!("{}…", &text[..index]);
-            }
-            count += 1;
-        }
-        text.to_string()
     }
 
     pub fn record_usage(&mut self, prompt: Option<u64>, completion: Option<u64>) {
@@ -535,160 +408,6 @@ mod test {
     }
 
     #[test]
-    fn current_turn_stubs_old_rounds_and_keeps_the_recent_rounds() {
-        let mut context = context();
-        context.messages.push(Message::User {
-            content: "plan it".into(),
-        });
-        context.messages.push(assistant_call("c1", "read_file", Some("reading a")));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c1".into(),
-            content: "AAAA\n".repeat(100).into(),
-        });
-        context.messages.push(assistant_call("c2", "read_file", Some("reading b")));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c2".into(),
-            content: "BBBB\n".repeat(100).into(),
-        });
-        context.messages.push(assistant_call("c3", "read_file", None));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c3".into(),
-            content: "CCCC\n".repeat(100).into(),
-        });
-
-        let json: Vec<String> = context
-            .build_messages()
-            .iter()
-            .map(|m| serde_json::to_string(m).unwrap())
-            .collect();
-        assert!(
-            json.iter().any(|j| j.contains("\"tool_call_id\":\"c1\"") && j.contains("pruned")),
-            "round 1 should be stubbed: {json:?}"
-        );
-        assert!(!json.iter().any(|j| j.contains("AAAA")), "round 1 content should be gone: {json:?}");
-        assert!(json.iter().any(|j| j.contains("BBBB")), "round 2 should be verbatim: {json:?}");
-        assert!(json.iter().any(|j| j.contains("CCCC")), "round 3 should be verbatim: {json:?}");
-    }
-
-    #[test]
-    fn a_round_with_many_tool_calls_is_never_partially_stubbed() {
-        let mut context = context();
-        context.messages.push(Message::User {
-            content: "plan it".into(),
-        });
-        context.messages.push(assistant_call("c1", "read_file", Some("old")));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c1".into(),
-            content: "OLD\n".repeat(50).into(),
-        });
-        context.messages.push(assistant_call("c2", "read_file", Some("mid")));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c2".into(),
-            content: "MID\n".repeat(50).into(),
-        });
-        let tool_calls = (0..5)
-            .map(|i| ToolCall {
-                id: format!("r{i}"),
-                type_: "function".into(),
-                function: FunctionCall {
-                    name: "read_file".into(),
-                    arguments: format!("{{\"path\":\"f{i}.rs\"}}"),
-                },
-            })
-            .collect();
-        context.messages.push(Message::Assistant {
-            content: None,
-            tool_calls,
-        });
-        for i in 0..5 {
-            context.messages.push(Message::Tool {
-                tool_call_id: format!("r{i}"),
-                content: format!("FILE{i}\n").repeat(50),
-            });
-        }
-
-        let json: Vec<String> = context
-            .build_messages()
-            .iter()
-            .map(|m| serde_json::to_string(m).unwrap())
-            .collect();
-        assert!(!json.iter().any(|j| j.contains("OLD")), "old round should be stubbed: {json:?}");
-        for i in 0..5 {
-            assert!(
-                json.iter().any(|j| j.contains(&format!("FILE{i}"))),
-                "round result {i} should be verbatim: {json:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn within_turn_pruning_bounds_the_total_payload() {
-        let mut context = context();
-        context.messages.push(Message::User {
-            content: "plan it".into(),
-        });
-        let file = "X\n".repeat(5000);
-        let unique = file.len() * 9;
-        let mut total_sent = 0usize;
-        for round in 0..9 {
-            let request = context.build_messages();
-            total_sent += request
-                .iter()
-                .map(|m| serde_json::to_string(m).unwrap().len())
-                .sum::<usize>();
-            context.messages.push(assistant_call(
-                &format!("c{round}"),
-                "read_file",
-                None,
-            ));
-            context.messages.push(Message::Tool {
-                tool_call_id: format!("c{round}"),
-                content: file.clone(),
-            });
-        }
-        let amplification = total_sent as f64 / unique as f64;
-        assert!(
-            amplification < 3.0,
-            "amplification {amplification:.2} should be bounded (total {total_sent} vs unique {unique})"
-        );
-    }
-
-    #[test]
-    fn dedup_stubs_the_earlier_read_of_the_same_path_even_in_the_recent_rounds() {
-        let mut context = context();
-        context.messages.push(Message::User {
-            content: "plan it".into(),
-        });
-        context.messages.push(read_call("c1", "b.rs"));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c1".into(),
-            content: "BBB\n".repeat(10).into(),
-        });
-        context.messages.push(read_call("c2", "a.rs"));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c2".into(),
-            content: "OLD\n".repeat(10).into(),
-        });
-        context.messages.push(read_call("c3", "a.rs"));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c3".into(),
-            content: "NEW\n".repeat(10).into(),
-        });
-
-        let json: Vec<String> = context
-            .build_messages()
-            .iter()
-            .map(|m| serde_json::to_string(m).unwrap())
-            .collect();
-        assert!(!json.iter().any(|j| j.contains("BBB")), "b.rs (round 1) should be stubbed: {json:?}");
-        assert!(
-            !json.iter().any(|j| j.contains("OLD")),
-            "earlier a.rs read should be stubbed by dedup: {json:?}"
-        );
-        assert!(json.iter().any(|j| j.contains("NEW")), "most recent a.rs read should be verbatim: {json:?}");
-    }
-
-    #[test]
     fn dedup_only_applies_to_read_file_not_bash() {
         let mut context = context();
         context.messages.push(Message::User {
@@ -767,20 +486,6 @@ mod test {
         }
     }
 
-    fn read_call(id: &str, path: &str) -> Message {
-        Message::Assistant {
-            content: None,
-            tool_calls: vec![ToolCall {
-                id: id.into(),
-                type_: "function".into(),
-                function: FunctionCall {
-                    name: "read_file".into(),
-                    arguments: format!("{{\"path\":\"{path}\"}}"),
-                },
-            }],
-        }
-    }
-
     fn bash_call(id: &str, command: &str) -> Message {
         Message::Assistant {
             content: None,
@@ -795,39 +500,4 @@ mod test {
         }
     }
 
-    #[test]
-    fn the_stub_is_descriptive_and_keeps_the_tool_call_id() {
-        let mut context = context();
-        context.messages.push(Message::User {
-            content: "plan it".into(),
-        });
-        context.messages.push(assistant_call("c1", "read_file", Some("a")));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c1".into(),
-            content: "x\n".repeat(3).into(),
-        });
-        context.messages.push(assistant_call("c2", "read_file", Some("b")));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c2".into(),
-            content: "y\n".repeat(3).into(),
-        });
-        context.messages.push(assistant_call("c3", "read_file", None));
-        context.messages.push(Message::Tool {
-            tool_call_id: "c3".into(),
-            content: "z\n".repeat(3).into(),
-        });
-
-        let json: Vec<String> = context
-            .build_messages()
-            .iter()
-            .map(|m| serde_json::to_string(m).unwrap())
-            .collect();
-        let stub = json
-            .iter()
-            .find(|j| j.contains("\"tool_call_id\":\"c1\""))
-            .expect("stubbed tool result present");
-        assert!(stub.contains("read_file"), "stub names the tool: {stub}");
-        assert!(stub.contains("3 lines"), "stub states the line count: {stub}");
-        assert!(stub.contains("pruned"), "stub says it was pruned: {stub}");
-    }
 }
